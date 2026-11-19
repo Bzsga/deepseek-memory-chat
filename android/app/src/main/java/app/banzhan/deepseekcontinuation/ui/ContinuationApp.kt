@@ -1,0 +1,1586 @@
+@file:OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+)
+
+package app.banzhan.deepseekcontinuation.ui
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import app.banzhan.deepseekcontinuation.core.*
+import app.banzhan.deepseekcontinuation.data.*
+import java.io.ByteArrayOutputStream
+import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+private data class AiRequest(
+    val archiveId: String,
+    val conversationId: String,
+    val branchId: String,
+    val selectedIds: Set<String>,
+    val messages: List<ChatMessage>,
+)
+
+@Composable
+fun ContinuationApp(
+    controller: AppController,
+    incomingImport: PendingIncomingImport? = null,
+    onIncomingImportConfirmed: (String) -> Unit = {},
+    onIncomingImportConsumed: (String) -> Unit = {},
+    onShareLinkReceived: (String) -> Unit = {},
+    automaticUpdateChecks: Boolean = true,
+) {
+    val state by controller.state.collectAsStateWithLifecycle()
+    val politicalState by controller.politicalExport.state.collectAsStateWithLifecycle()
+    val updates: AppUpdateViewModel = viewModel()
+    val updateState by updates.state.collectAsStateWithLifecycle()
+    val currentIncomingImport by rememberUpdatedState(incomingImport)
+    val context = LocalContext.current
+    val chatSession = remember(state.account.currentUser, state.account.loading, state.settings.companionUrl) {
+        ChatHandoff.account(context, state.account.currentUser?.id, state.settings.companionUrl)
+    }
+    val scope = rememberCoroutineScope()
+    val snackbars = remember { SnackbarHostState() }
+    val screenStates = rememberSaveableStateHolder()
+    var route by rememberSaveable { mutableStateOf("chat") }
+    var chatContinuation by remember { mutableStateOf(ChatHandoff.pending(context)) }
+    var conversationId by rememberSaveable { mutableStateOf("") }
+    var archiveId by rememberSaveable { mutableStateOf("") }
+    var batchIds by rememberSaveable { mutableStateOf(arrayListOf<String>()) }
+    var batchNumber by rememberSaveable { mutableIntStateOf(0) }
+    var selectionTargetId by rememberSaveable { mutableStateOf<String?>(null) }
+    var importTargetArchiveId by rememberSaveable { mutableStateOf<String?>(null) }
+    var advancedBranchId by rememberSaveable { mutableStateOf<String?>(null) }
+    var chatSettingsReturn by rememberSaveable { mutableStateOf<String?>(null) }
+    var accountReturn by rememberSaveable { mutableStateOf("settings") }
+    var settingsReturn by rememberSaveable { mutableStateOf("settings") }
+    var chatFragment by rememberSaveable { mutableStateOf("") }
+    var preparationError by rememberSaveable { mutableStateOf<String?>(null) }
+    var progressError by rememberSaveable { mutableStateOf<String?>(null) }
+    var submitting by remember { mutableStateOf(false) }
+    var pendingDocumentPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingDocumentMessage by rememberSaveable { mutableStateOf("") }
+    var exportArchive by remember { mutableStateOf<Archive?>(null) }
+    var politicalArchiveId by rememberSaveable { mutableStateOf<String?>(null) }
+    var repairArchiveId by rememberSaveable { mutableStateOf<String?>(null) }
+    var quickArchive by remember { mutableStateOf<Archive?>(null) }
+    var aiRequest by remember { mutableStateOf<AiRequest?>(null) }
+    var reorganizationPlan by remember { mutableStateOf<ReorganizationPlan?>(null) }
+    var reorganizationSourceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var reorganizationReturnRoute by rememberSaveable { mutableStateOf("result") }
+    var reorganizationLoading by remember { mutableStateOf(false) }
+    var reorganizationError by remember { mutableStateOf<String?>(null) }
+    var restoreConfirmation by remember { mutableStateOf(false) }
+    var getRecordsVisible by rememberSaveable { mutableStateOf(false) }
+    var shareInputVisible by rememberSaveable { mutableStateOf(false) }
+    var installPreparing by remember { mutableStateOf(false) }
+    var permissionPendingVersion by rememberSaveable { mutableStateOf<Int?>(null) }
+    var permissionLaunchResumeTick by rememberSaveable { mutableIntStateOf(-1) }
+    var resumeTick by rememberSaveable { mutableIntStateOf(0) }
+    val manualPasteDraft: ManualPasteDraft = viewModel()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, manualPasteDraft, automaticUpdateChecks) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) manualPasteDraft.flush()
+            if (event == Lifecycle.Event.ON_START && automaticUpdateChecks) updates.checkOnStart()
+            if (event == Lifecycle.Event.ON_RESUME) resumeTick++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val run: (suspend () -> Unit) -> Unit = { action ->
+        scope.launch {
+            try {
+                action()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                snackbars.showSnackbar(error.message ?: "操作未完成，请重试。")
+            }
+        }
+    }
+    fun continueHere(archive: Archive, text: String) {
+        val draft = ChatContinuationDraft(title = archive.title, text = text, sourceArchiveId = archive.id,
+            recipient = continuationRecipient(chatSession?.user?.id))
+        ChatHandoff.save(context, draft)
+        chatContinuation = draft
+        exportArchive = null
+        quickArchive = null
+        chatSettingsReturn = null
+        chatFragment = ""
+        route = "chat"
+    }
+    fun prepare(id: String) {
+        conversationId = id
+        preparationError = null
+        route = "prepare"
+    }
+    fun imported(ids: List<String>) {
+        batchIds = ArrayList(ids)
+        batchNumber++
+        val target = importTargetArchiveId?.takeIf { id -> state.archives.any { it.id == id } }
+        importTargetArchiveId = null
+        if (target != null) {
+            archiveId = target
+            selectionTargetId = target
+            advancedBranchId = null
+            if (ids.size == 1) {
+                conversationId = ids.first()
+                route = "selection"
+            } else route = "choose_incremental"
+        } else if (ids.size == 1) prepare(ids.first()) else route = "choose"
+    }
+    fun openRecord(id: String) {
+        archiveId = id
+        progressError = null
+        val record = controller.state.value.archives.firstOrNull { it.id == id }
+        val task = controller.state.value.tasks.firstOrNull { it.archiveId == id }
+        route =
+            if (task != null && task.status != "completed") "progress"
+            else if (
+                record?.generationMode == "summary" &&
+                    task == null &&
+                    record.entries.none { !it.deleted && it.text.isNotBlank() }
+            )
+                "progress"
+            else "result"
+    }
+    fun account(returnRoute: String) {
+        accountReturn = returnRoute
+        route = "account"
+    }
+    fun requireFreeAccount(returnRoute: String): Boolean {
+        val current = controller.state.value
+        if (current.organizationSettings.mode == "companion" && current.account.currentUser == null) {
+            account(returnRoute)
+            return false
+        }
+        return true
+    }
+    fun openPoliticalExport(id: String) {
+        val current = controller.state.value
+        val saved = controller.politicalExport.state.value.task?.takeIf { it.archiveId == id }
+        val requiresLogin = if (saved != null) saved.settings.mode == "companion" && saved.status != "completed"
+            else current.organizationSettings.mode == "companion"
+        if (requiresLogin && current.account.currentUser == null) account(route)
+        else politicalArchiveId = id
+    }
+    fun requestReorganization(id: String, confirmedScopes: List<ArchiveSourceScope>? = null) {
+        if (submitting || reorganizationLoading) return
+        if (!requireFreeAccount(route)) return
+        reorganizationLoading = true
+        reorganizationError = null
+        reorganizationSourceId = id
+        if (route in setOf("result", "archive")) reorganizationReturnRoute = route
+        if (reorganizationPlan?.archiveId != id) reorganizationPlan = null
+        run {
+            try {
+                val prepared = controller.prepareReorganization(id, confirmedScopes)
+                if (prepared.existingTargetArchiveId != null) {
+                    reorganizationPlan = null
+                    openRecord(prepared.existingTargetArchiveId)
+                } else {
+                    if (route in setOf("reorganization_choose", "reorganization_selection")) {
+                        archiveId = id
+                        route = reorganizationReturnRoute
+                    }
+                    reorganizationPlan = prepared
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (reorganizationPlan != null) reorganizationError = error.message ?: "暂时无法准备，请重试。"
+                else throw error
+            } finally {
+                reorganizationLoading = false
+            }
+        }
+    }
+    fun prepareCurrentRecord() {
+        val id =
+            controller.state.value.archives
+                .firstOrNull { it.id == archiveId }
+                ?.conversationIds
+                ?.firstOrNull()
+        if (id == null) route = "home" else prepare(id)
+    }
+    fun advancedConversation(id: String, target: String? = null, branch: String? = null) {
+        conversationId = id
+        selectionTargetId = target
+        advancedBranchId = branch
+        route = "selection"
+    }
+    fun openChatApiSettings(returnRoute: String) {
+        chatSettingsReturn = returnRoute
+        chatFragment = "#settings"
+        route = "chat"
+    }
+    fun returnFromChatApiSettings() {
+        val returnRoute = chatSettingsReturn ?: return
+        chatSettingsReturn = null
+        chatFragment = ""
+        route = returnRoute
+        preparationError = null
+        reorganizationPlan?.takeIf { it.archiveId == archiveId && returnRoute == reorganizationReturnRoute }?.let { plan ->
+            requestReorganization(plan.archiveId,
+                plan.sourceScopes.takeIf { plan.rangeOrigin == ReorganizationRangeOrigin.USER_SELECTION })
+        }
+    }
+    suspend fun openSettingsSection(section: NativeSettingsSection?, fromChat: Boolean) {
+        if (section == NativeSettingsSection.DEVELOPER) controller.verifyAdminAccess()
+        if (section == null) {
+            chatFragment = ""
+            route = "settings"
+            return
+        }
+        if (section == NativeSettingsSection.SERVICE) {
+            // Cached web bundles can still request this from the general settings tab.
+            if (fromChat) snackbars.showSnackbar("请在聊天设置中配置「聊天 API」。")
+            else openChatApiSettings(route)
+            return
+        }
+        settingsReturn = if (fromChat) "chat" else "settings"
+        if (fromChat) chatFragment = section.returnFragment
+        route = section.route
+    }
+    fun back() {
+        route =
+            when (route) {
+                "archive" -> "result"
+                "add_recent", "choose_incremental" -> "result"
+                "selection" -> if (selectionTargetId != null) "archive" else "prepare"
+                "reorganization_selection" -> {
+                    val original = state.archives.firstOrNull { it.id == reorganizationSourceId }
+                    if (state.conversations.count { it.id in original?.conversationIds.orEmpty() } > 1)
+                        "reorganization_choose"
+                    else {
+                        archiveId = reorganizationSourceId ?: archiveId
+                        reorganizationReturnRoute
+                    }
+                }
+                "reorganization_choose" -> {
+                    archiveId = reorganizationSourceId ?: archiveId
+                    reorganizationReturnRoute
+                }
+                "prepare" -> if (batchIds.size > 1) "choose" else "home"
+                "account" -> accountReturn
+                "developer", "about", "data" -> settingsReturn
+                "feedback" -> "about"
+                "settings" -> {
+                    if (chatSettingsReturn != null) {
+                        returnFromChatApiSettings()
+                        return
+                    }
+                    "chat"
+                }
+                "result",
+                "progress" -> "home"
+                else -> "home"
+            }
+    }
+    fun begin(conversation: ImportedConversation, choice: PreparationChoice, smart: Boolean) {
+        if (submitting) return
+        if (smart && !requireFreeAccount("prepare")) return
+        submitting = true
+        preparationError = null
+        progressError = null
+        run {
+            var createdId: String? = null
+            try {
+                if (smart) {
+                    val settings = controller.state.value.organizationSettings
+                    val configured = settings.mode == "companion" || settings.apiKey.isNotBlank()
+                    if (!configured) {
+                        openChatApiSettings("prepare")
+                        return@run
+                    }
+                    val blocker = controller.checkOrganizationAvailability()
+                    if (blocker != null) {
+                        preparationError = blocker
+                        return@run
+                    }
+                }
+                val id =
+                    controller.createArchive(
+                        choice.title,
+                        conversation,
+                        choice.branchId,
+                        choice.selectedIds,
+                        choice.background,
+                        includeRawEntries = !smart,
+                    )
+                createdId = id
+                archiveId = id
+                if (smart) {
+                    route = "progress"
+                    controller.organize(id, conversation.id, choice.branchId, choice.selectedIds)
+                } else route = "result"
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                val message = error.message ?: "这次整理没有开始，请检查后重试。"
+                if (createdId != null) {
+                    progressError = message
+                    route = "progress"
+                } else preparationError = message
+            } finally {
+                submitting = false
+            }
+        }
+    }
+    suspend fun stageDocument(content: String, message: String) {
+        pendingDocumentPath =
+            withContext(Dispatchers.IO) {
+                File(context.cacheDir, "pending-document.txt")
+                    .apply { writeText(content) }
+                    .absolutePath
+            }
+        pendingDocumentMessage = message
+    }
+    fun finishDocument(uri: Uri?) {
+        val path = pendingDocumentPath
+        val message = pendingDocumentMessage
+        pendingDocumentPath = null
+        if (path == null) return
+        run {
+            withContext(Dispatchers.IO) {
+                val file = File(path)
+                try {
+                    if (uri != null)
+                        context.contentResolver.openOutputStream(uri, "wt")?.use { output ->
+                            file.inputStream().use { input -> input.copyTo(output) }
+                        } ?: error("无法写入所选位置")
+                } finally { file.delete() }
+            }
+            if (uri != null) snackbars.showSnackbar(message)
+        }
+    }
+    BackHandler(enabled = route !in setOf("chat", "home", "archives")) { back() }
+    LaunchedEffect(state.notice) {
+        state.notice?.let {
+            controller.clearNotice()
+            snackbars.showSnackbar(it)
+        }
+    }
+    LaunchedEffect(route, state.developerPrefs.sessionToken) {
+        if (route == "developer" && state.developerPrefs.sessionToken.isEmpty()) back()
+    }
+    LaunchedEffect(route, state.account.currentUser?.id, resumeTick) {
+        if (state.account.currentUser != null && route in setOf("settings", "account", "developer")) {
+            run { controller.refreshAccount() }
+        }
+    }
+    LaunchedEffect(route, state.organizationSettings.mode, state.settings.companionUrl,
+        state.account.currentUser?.id, aiRequest?.archiveId) {
+        if (
+            state.organizationSettings.mode == "companion" && state.account.currentUser != null &&
+                (route in setOf("home", "prepare") || aiRequest != null)
+        ) {
+            run { controller.refreshQuota() }
+        }
+    }
+    val currentTask = state.tasks.firstOrNull { it.archiveId == archiveId }
+    LaunchedEffect(route, currentTask?.id, currentTask?.status) {
+        if (route == "progress" && currentTask?.status == "completed") route = "result"
+    }
+    val importLauncher =
+        rememberLauncherForActivityResult(ImportDocumentContract()) { uri ->
+            if (uri != null)
+                run {
+                    val document = withContext(Dispatchers.IO) { readDocument(context, uri) }
+                    imported(controller.importFile(document.second, document.first))
+                }
+            else importTargetArchiveId = null
+        }
+    val saveMarkdown =
+        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) {
+            finishDocument(it)
+        }
+    val saveContinuation =
+        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) {
+            finishDocument(it)
+        }
+    val saveBackup =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/json")
+        ) {
+            finishDocument(it)
+        }
+    val restoreLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null)
+                run {
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { controller.restoreBackup(it) }
+                            ?: error("无法读取所选备份")
+                    }
+                }
+        }
+    fun launchImport(targetArchiveId: String? = null) {
+        importTargetArchiveId = targetArchiveId
+        try {
+            importLauncher.launch(
+                arrayOf(
+                    "application/zip",
+                    "application/x-zip-compressed",
+                    "application/json",
+                    "text/json",
+                    "application/octet-stream",
+                )
+            )
+        } catch (_: android.content.ActivityNotFoundException) {
+            importTargetArchiveId = null
+            run { snackbars.showSnackbar("无法打开文件选择器，请从浏览器下载记录分享 ZIP 到本应用。") }
+        }
+    }
+    val import: () -> Unit = { launchImport() }
+    val fetchingSharedLink = incomingImport?.status == IncomingImportStatus.FETCHING
+    val importingSharedFile = incomingImport?.status == IncomingImportStatus.IMPORTING
+    val busy = state.busy || submitting || reorganizationLoading || importingSharedFile || fetchingSharedLink || installPreparing
+    val politicalRunning = politicalState.task?.status in setOf("queued", "running")
+    val existingModal = aiRequest != null || exportArchive != null || politicalArchiveId != null ||
+        quickArchive != null || repairArchiveId != null || restoreConfirmation || reorganizationPlan != null || reorganizationLoading || shareInputVisible
+    val incomingBlocked =
+        busy || existingModal || politicalRunning || state.tasks.any { it.status in setOf("queued", "running") }
+    fun installationBlocker(): String? {
+        val current = controller.state.value
+        return when {
+            controller.politicalExport.state.value.task?.status in setOf("queued", "running") -> "敏感内容检查正在进行，请完成后再安装更新。"
+            current.tasks.any { it.status in setOf("queued", "running") } -> "整理正在进行，请完成后再安装更新。"
+            currentIncomingImport != null -> "请先处理收到的聊天文件，再安装更新。"
+            current.busy || submitting || reorganizationLoading -> "当前操作完成后可安装更新。"
+            aiRequest != null ||
+                exportArchive != null ||
+                politicalArchiveId != null ||
+                quickArchive != null || repairArchiveId != null ||
+                reorganizationPlan != null ||
+                restoreConfirmation ||
+                getRecordsVisible || shareInputVisible -> "请先完成当前页面操作，再安装更新。"
+            route !in setOf("chat", "home", "archives", "settings", "about") -> "回到首页或关于页后可安装更新。"
+            !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) ->
+                "回到应用后可继续安装。"
+            else -> null
+        }
+    }
+    fun requestUpdateInstallation() {
+        if (installPreparing) return
+        val blocked = installationBlocker()
+        if (blocked != null) {
+            run { snackbars.showSnackbar(blocked) }
+            return
+        }
+        installPreparing = true
+        run {
+            try {
+                val verifiedFile = updates.verifiedFileForInstall()
+                val blocker = installationBlocker()
+                if (blocker != null) {
+                    snackbars.showSnackbar(blocker)
+                    return@run
+                }
+                if (AppUpdateInstaller.permissionRequired(context)) {
+                    permissionPendingVersion = updates.state.value.manifest?.versionCode
+                    permissionLaunchResumeTick = resumeTick
+                    context.startActivity(AppUpdateInstaller.permissionIntent(context))
+                } else {
+                    permissionPendingVersion = null
+                    context.startActivity(
+                        AppUpdateInstaller.installationIntent(context, verifiedFile)
+                    )
+                }
+            } catch (_: android.content.ActivityNotFoundException) {
+                permissionPendingVersion = null
+                snackbars.showSnackbar("系统暂时无法打开更新安装页面，请稍后再试。")
+            } catch (_: SecurityException) {
+                permissionPendingVersion = null
+                snackbars.showSnackbar("请允许本应用安装更新后重试。")
+            } finally {
+                installPreparing = false
+            }
+        }
+    }
+    LaunchedEffect(updates, automaticUpdateChecks) { if (automaticUpdateChecks) updates.checkOnStart() }
+    val installBlockedReason = if (installPreparing) "正在检查更新包，请稍候。" else installationBlocker()
+    val installPermissionRequired = AppUpdateInstaller.permissionRequired(context)
+    LaunchedEffect(resumeTick, permissionPendingVersion, updateState.status, installBlockedReason) {
+        val pendingVersion = permissionPendingVersion ?: return@LaunchedEffect
+        if (resumeTick <= permissionLaunchResumeTick || installPreparing) return@LaunchedEffect
+        if (AppUpdateInstaller.permissionRequired(context)) {
+            permissionPendingVersion = null
+            snackbars.showSnackbar("尚未允许安装更新，可以稍后再试。")
+        } else if (updateState.status == AppUpdateStatus.READY && installBlockedReason == null) {
+            permissionPendingVersion = null
+            if (updateState.manifest?.versionCode == pendingVersion) requestUpdateInstallation()
+        } else if (updateState.status == AppUpdateStatus.FAILED) {
+            permissionPendingVersion = null
+        }
+    }
+    LaunchedEffect(incomingImport?.id) { if (incomingImport != null) getRecordsVisible = false }
+    LaunchedEffect(incomingImport?.id, incomingImport?.status, incomingBlocked, route, state.accountInitialized) {
+        val pending = incomingImport ?: return@LaunchedEffect
+        when (pending.status) {
+            IncomingImportStatus.AWAITING_CONFIRMATION ->
+                if (pending.shareUrl == null && route in setOf("home", "chat") && !incomingBlocked) onIncomingImportConfirmed(pending.id)
+            IncomingImportStatus.COMPLETED -> {
+                if (pending.shareUrl != null) {
+                    imported(pending.conversationIds)
+                    onIncomingImportConsumed(pending.id)
+                } else if (state.accountInitialized) {
+                    if (pending.recipient != continuationRecipient(chatSession?.user?.id)) {
+                        onIncomingImportConsumed(pending.id)
+                        snackbars.showSnackbar("工作区已切换，请在原账号重新分享文件。")
+                    } else route = "chat"
+                }
+            }
+            else -> Unit
+        }
+    }
+    val themeOwner = continuationRecipient(chatSession?.user?.id)
+    NativeChatTheme(themeOwner) {
+        Scaffold(
+            topBar = {
+                if (route != "chat") {
+                TopAppBar(
+                    title = {
+                        Text(
+                            when (route) {
+                                "choose" -> "选择聊天"
+                                "prepare" -> "准备续聊"
+                                "progress" -> "整理进度"
+                                "chat" -> "DeepSeek 记忆聊天"
+                                "archives" -> "记忆"
+                                "home" -> "导入与资料"
+                                "result" -> "带着记忆继续聊"
+                                "selection" -> "调整范围与管理"
+                                "reorganization_choose" -> "选择重新整理的聊天"
+                                "reorganization_selection" -> "重新选择范围"
+                                "archive" -> "详细内容"
+                                "tasks" -> "整理进度"
+                                "about" -> "版本与更新"
+                                "paste" -> "粘贴聊天内容"
+                                "settings" -> "本机设置"
+                                "data" -> "本机记忆资料"
+                                "account" -> "账户"
+                                "developer" -> "开发者选项"
+                                "feedback" -> "意见信箱"
+                                else -> "DeepSeek 记忆聊天"
+                            },
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    },
+                    navigationIcon = {
+                        if (route !in setOf("chat", "home", "archives"))
+                            IconButton(onClick = { back() }) {
+                                Icon(Icons.Outlined.ArrowBack, "返回")
+                            }
+                    },
+                    actions = {
+                        if (route == "archives") IconButton(onClick = { route = "home" }) {
+                            Icon(Icons.Outlined.FileDownload, "导入与资料")
+                        }
+                        if (route != "tasks" && route != "progress")
+                            IconButton(onClick = { route = "tasks" }) {
+                                BadgedBox(
+                                    badge = {
+                                        val active =
+                                            state.tasks.count {
+                                                it.status in setOf("queued", "running", "paused")
+                                            }
+                                        if (active > 0) Badge { Text(active.toString()) }
+                                    }
+                                ) {
+                                    Icon(Icons.Outlined.Checklist, "整理进度")
+                                }
+                            }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Mist),
+                )
+                }
+            },
+            bottomBar = {
+                if (route in setOf("home", "archives"))
+                    NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                        NavigationBarItem(
+                            route == "chat",
+                            { chatSettingsReturn = null; chatFragment = ""; route = "chat" },
+                            icon = { Icon(Icons.Outlined.ChatBubbleOutline, null) },
+                            label = { Text("聊天") },
+                        )
+                        NavigationBarItem(
+                            route in setOf("archives", "home"),
+                            { route = "archives" },
+                            icon = { Icon(Icons.Outlined.FolderOpen, null) },
+                            label = { Text("记忆") },
+                        )
+                        NavigationBarItem(
+                            false,
+                            { chatSettingsReturn = null; chatFragment = "#settings"; route = "chat" },
+                            icon = { Icon(Icons.Outlined.Settings, null) },
+                            label = { Text("设置") },
+                        )
+                    }
+            },
+            snackbarHost = { SnackbarHost(snackbars) },
+        ) { padding ->
+            Column(Modifier.fillMaxSize().padding(padding)) {
+                if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (
+                    updateState.promptVisible &&
+                        route in setOf("chat", "home", "archives", "settings") &&
+                        incomingImport == null &&
+                        !existingModal &&
+                        !getRecordsVisible &&
+                        !WindowInsets.isImeVisible
+                ) {
+                    AppUpdateBanner(
+                        state = updateState,
+                        installBlockedReason = installBlockedReason,
+                        installPermissionRequired = installPermissionRequired,
+                        onDownload = { if (!installPreparing) updates.downloadUpdate() },
+                        onCancelDownload = updates::cancelDownload,
+                        onInstall = ::requestUpdateInstallation,
+                        onLater = updates::dismissPrompt,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                    )
+                }
+                incomingImport
+                    ?.takeIf { it.status == IncomingImportStatus.AWAITING_CONFIRMATION }
+                    ?.let { pending ->
+                        IncomingImportBar(
+                            pending.fileName,
+                            isShareLink = pending.shareUrl != null,
+                            blocked = incomingBlocked,
+                            onImport = { onIncomingImportConfirmed(pending.id) },
+                            onCancel = { onIncomingImportConsumed(pending.id) },
+                        )
+                    }
+                Box(Modifier.weight(1f)) {
+                    val screenKey =
+                        when (route) {
+                            "prepare",
+                            "selection" -> "$route:$conversationId"
+                            "reorganization_selection" -> "$route:$reorganizationSourceId:$conversationId"
+                            "reorganization_choose" -> "$route:$reorganizationSourceId"
+                            "result",
+                            "progress",
+                            "archive" -> "$route:$archiveId"
+                            "choose" -> "choose:$batchNumber"
+                            else -> route
+                        }
+                    screenStates.SaveableStateProvider(screenKey) {
+                        when (route) {
+                            "chat" -> if (state.accountInitialized) ChatScreen(
+                                session = chatSession,
+                                sharedImport = incomingImport?.takeIf { it.status == IncomingImportStatus.COMPLETED && it.shareUrl == null && it.recipient == continuationRecipient(chatSession?.user?.id) },
+                                sourceConversations = state.conversations,
+                                onImportSaved = { id, count ->
+                                    onIncomingImportConsumed(id)
+                                    scope.launch { snackbars.showSnackbar("$count 个会话已就绪，选择一个继续聊天。") }
+                                },
+                                continuation = chatContinuation?.takeIf { it.matchesAccount(chatSession?.user?.id) },
+                                onContinuationSaved = { id ->
+                                    ChatHandoff.acknowledge(context, id)
+                                    if (chatContinuation?.id == id) chatContinuation = null
+                                },
+                                onOrganize = { bytes, target ->
+                                    check(!busy) { "当前操作完成后可整理聊天。" }
+                                    val ids = controller.importFile(bytes, "本机聊天原文.json")
+                                    importTargetArchiveId = target?.takeIf { id -> controller.state.value.archives.any { it.id == id } }
+                                    imported(ids)
+                                },
+                                onMemories = { chatSettingsReturn = null; route = "archives" },
+                                onAccount = { account("chat") },
+                                onSettings = { section -> openSettingsSection(section, fromChat = true) },
+                                onChatProvider = controller::updateChatProvider,
+                                onThemePreference = { userId, preference ->
+                                    check(controller.state.value.account.currentUser?.id == userId)
+                                    NativeThemePreference.save(context, continuationRecipient(userId), preference)
+                                },
+                                initialFragment = chatFragment,
+                                onReturnFromSettings = if (chatSettingsReturn != null) ::returnFromChatApiSettings else null,
+                            )
+                            "home" ->
+                                HomeScreen(
+                                    state,
+                                    import,
+                                    { getRecordsVisible = true },
+                                    { route = "paste" },
+                                    {
+                                        run {
+                                            controller.loadDemo()
+                                            imported(
+                                                controller.state.value.lastImportedConversationIds
+                                            )
+                                        }
+                                    },
+                                    { openRecord(it) },
+                                    { imported(state.conversations.map { it.id }) },
+                                    { route = "tasks" },
+                                    onShareLink = { if (!busy && incomingImport == null) shareInputVisible = true },
+                                )
+                            "choose" ->
+                                ConversationPickerScreen(
+                                    state.conversations.filter { it.id in batchIds }
+                                ) {
+                                    prepare(it)
+                                }
+                            "add_recent", "choose_incremental" ->
+                                ConversationPickerScreen(
+                                    if (route == "choose_incremental") state.conversations.filter { it.id in batchIds }
+                                    else state.conversations,
+                                    title = "补入最近聊天",
+                                    detail = "仅整理新增消息，必要时参考此前已选原文。相同内容会跳过，保留你的修改。",
+                                    onImport = { launchImport(archiveId) },
+                                ) { advancedConversation(it, target = archiveId) }
+                            "reorganization_choose" -> {
+                                val original = state.archives.firstOrNull { it.id == reorganizationSourceId }
+                                val related = state.conversations.filter { it.id in original?.conversationIds.orEmpty() }
+                                if (related.isEmpty()) {
+                                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        NoticeCard("本机没有这份档案关联的聊天。请重新导入原始记录后，回到原档案重新整理。")
+                                        TextButton(onClick = {
+                                            reorganizationSourceId?.let { openRecord(it) }
+                                        }) { Text("返回原档案") }
+                                    }
+                                } else {
+                                    ConversationPickerScreen(
+                                        related,
+                                        title = "重新整理哪段聊天？",
+                                        detail = "这次只整理所选的一段聊天，原档案中的个人修改和设置会保留。",
+                                    ) {
+                                        conversationId = it
+                                        route = "reorganization_selection"
+                                    }
+                                }
+                            }
+                            "reorganization_selection" -> {
+                                val original = state.archives.firstOrNull { it.id == reorganizationSourceId }
+                                val conversation = state.conversations.firstOrNull {
+                                    it.id == conversationId && it.id in original?.conversationIds.orEmpty()
+                                }
+                                if (original == null || conversation == null) {
+                                    NoticeCard("原档案或关联聊天已不在本机，请返回后重新导入原始记录。", Modifier.padding(20.dp))
+                                } else {
+                                    SelectionScreen(
+                                        conversation,
+                                        emptyList(),
+                                        null,
+                                        busy,
+                                        scopeOnly = true,
+                                        selectionContextKey = "reorganization:${original.id}",
+                                    ) { _, branchId, selectedIds, _, _, _ ->
+                                        val orderedIds = conversation.branches.first { it.id == branchId }
+                                            .messages.filter { it.id in selectedIds }.map { it.id }
+                                        requestReorganization(original.id, listOf(
+                                            ArchiveSourceScope(conversation.id, branchId, orderedIds)
+                                        ))
+                                    }
+                                }
+                            }
+                            "prepare" -> {
+                                val conversation =
+                                    state.conversations.firstOrNull { it.id == conversationId }
+                                if (conversation == null)
+                                    NoticeCard("聊天正在载入，或已被清除。可以返回首页重新导入。", Modifier.padding(20.dp))
+                                else
+                                    PreparationScreen(
+                                        conversation,
+                                        state,
+                                        busy,
+                                        preparationError,
+                                        onStart = { begin(conversation, it, true) },
+                                        onOriginal = { begin(conversation, it, false) },
+                                        onQuick = { choice ->
+                                            run {
+                                                quickArchive = withContext(Dispatchers.Default) {
+                                                    QuickContinuation.fromSelection(conversation, choice.branchId,
+                                                        choice.selectedIds, choice.title, choice.background)
+                                                }
+                                            }
+                                        },
+                                        onService = { openChatApiSettings("prepare") },
+                                        onAccount = { account("prepare") },
+                                        onQuotaRefresh = { run { controller.refreshQuota() } },
+                                        estimateMessages = controller::estimateForCurrentService,
+                                        onAdvanced = {
+                                            advancedConversation(conversation.id, branch = it)
+                                        },
+                                        onSavedTask = { openRecord(it) },
+                                    )
+                            }
+                            "progress" ->
+                                OrganizationProgressScreen(
+                                    currentTask,
+                                    submitting,
+                                    progressError,
+                                    controller,
+                                    run,
+                                    onPrepare = { prepareCurrentRecord() },
+                                    onService = { openChatApiSettings("progress") },
+                                    needsLogin = currentTask?.serviceMode == "companion" && state.account.currentUser == null,
+                                    onAccount = { account("progress") },
+                                    onRebuild = {
+                                        run {
+                                            currentTask?.let { controller.cancelTask(it.id) }
+                                            val originalId = controller.state.value.archives
+                                                .firstOrNull { it.id == archiveId }?.rebuiltFromArchiveId
+                                            if (originalId != null) {
+                                                archiveId = originalId
+                                                route = "result"
+                                                requestReorganization(originalId)
+                                            } else prepareCurrentRecord()
+                                        }
+                                    },
+                                    onSavedContent = { route = "result" },
+                                    onOriginalArchive = state.archives.firstOrNull { it.id == archiveId }
+                                        ?.rebuiltFromArchiveId
+                                        ?.takeIf { id -> state.archives.any { it.id == id } }
+                                        ?.let { id -> { openRecord(id) } },
+                                )
+                            "result" -> {
+                                val archive = state.archives.firstOrNull { it.id == archiveId }
+                                if (archive == null)
+                                    NoticeCard("这份内容正在载入，或已被删除。", Modifier.padding(20.dp))
+                                else
+                                    ContinuationResultScreen(
+                                        archive,
+                                        currentTask,
+                                        conversations = state.conversations,
+                                        onSaveContinuity = { settings ->
+                                            controller.saveContinuitySettings(archive.id, settings)
+                                        },
+                                        onContinueHere = { text -> continueHere(archive, text) },
+                                        onCopyAndOpen = { text ->
+                                            run {
+                                                require(
+                                                    text.toByteArray(Charsets.UTF_8).size <=
+                                                        60 * 1024
+                                                ) {
+                                                    "内容较长，请保存为续聊文件。"
+                                                }
+                                                (context.getSystemService(Context.CLIPBOARD_SERVICE)
+                                                        as ClipboardManager)
+                                                    .setPrimaryClip(
+                                                        ClipData.newPlainText("续聊内容", text)
+                                                    )
+                                                openDeepSeek(context)
+                                            }
+                                        },
+                                        onSave = { text ->
+                                            run {
+                                                stageDocument(
+                                                    text,
+                                                    "续聊文件已保存。请在 DeepSeek 新对话中添加这个文件。",
+                                                )
+                                                saveContinuation.launch(
+                                                    safeFileName(archive.title) + ".txt"
+                                                )
+                                            }
+                                        },
+                                        onOpenDeepSeek = { run { openDeepSeek(context) } },
+                                        onDetails = { route = "archive" },
+                                        onPrepare = { prepareCurrentRecord() },
+                                        archives = state.archives,
+                                        tasks = state.tasks,
+                                        busy = busy,
+                                        onReorganize = { requestReorganization(archive.id) },
+                                        onOpenRecord = { openRecord(it) },
+                                        onPoliticalExport = { openPoliticalExport(archive.id) },
+                                        onRepair = { repairArchiveId = archive.id },
+                                        onAddRecent = { route = "add_recent" },
+                                    )
+                            }
+                            "paste" ->
+                                ManualPasteScreen(manualPasteDraft, busy, run) { title, messages ->
+                                    run {
+                                        val bytes =
+                                            withContext(Dispatchers.Default) {
+                                                manualPasteDocument(title, messages)
+                                            }
+                                        val ids = controller.importFile(bytes, "手动粘贴记录.json")
+                                        manualPasteDraft.reset()
+                                        imported(ids)
+                                    }
+                                }
+                            "archives" -> ArchivesScreen(
+                                state.archives, { openRecord(it) }, import,
+                                busy = busy,
+                                onDelete = { controller.deleteArchives(it) },
+                            )
+                            "selection" -> {
+                                val conversation =
+                                    state.conversations.firstOrNull { it.id == conversationId }
+                                if (conversation == null)
+                                    NoticeCard("会话尚未载入，请返回选择。", Modifier.padding(20.dp))
+                                else
+                                    SelectionScreen(
+                                        conversation,
+                                        state.archives,
+                                        selectionTargetId,
+                                        busy,
+                                        initialBranchId = advancedBranchId,
+                                    ) { title, branch, ids, background, target, ai ->
+                                        if (!submitting && (!ai || requireFreeAccount("selection"))) {
+                                            submitting = true
+                                            run {
+                                                try {
+                                                    var effectiveIds = ids
+                                                    val id =
+                                                        if (target == null)
+                                                            controller.createArchive(
+                                                                title,
+                                                                conversation,
+                                                                branch,
+                                                                ids,
+                                                                background,
+                                                                includeRawEntries = !ai,
+                                                            )
+                                                        else {
+                                                            val addition = controller.addConversation(
+                                                                target,
+                                                                conversation,
+                                                                branch,
+                                                                ids,
+                                                                includeRawEntries = !ai,
+                                                            )
+                                                            effectiveIds = addition.messageIds.toSet()
+                                                            if (addition.alreadyIncludedCount > 0)
+                                                                snackbars.showSnackbar(addition.notice)
+                                                            target
+                                                        }
+                                                    archiveId = id
+                                                    route = "archive"
+                                                    if (ai && effectiveIds.isNotEmpty())
+                                                        aiRequest =
+                                                            AiRequest(
+                                                                id,
+                                                                conversation.id,
+                                                                branch,
+                                                                effectiveIds,
+                                                                conversation.branches
+                                                                    .first { it.id == branch }
+                                                                    .messages
+                                                                    .filter { it.id in effectiveIds },
+                                                            )
+                                                } finally {
+                                                    submitting = false
+                                                }
+                                            }
+                                        }
+                                    }
+                            }
+                            "archive" -> {
+                                val archive = state.archives.firstOrNull { it.id == archiveId }
+                                if (archive == null)
+                                    NoticeCard("这份内容尚未载入或已被删除。", Modifier.padding(20.dp))
+                                else
+                                    ArchiveScreen(
+                                        archive,
+                                        state,
+                                        controller,
+                                        run,
+                                        { exportArchive = it },
+                                        { advancedConversation(it, archive.id) },
+                                        { route = "archives" },
+                                        onReorganize = { requestReorganization(archive.id) },
+                                        onOpenRecord = { openRecord(it) },
+                                        onPoliticalExport = { openPoliticalExport(archive.id) },
+                                        onRepair = { repairArchiveId = archive.id },
+                                        onAddRecent = { route = "add_recent" },
+                                    )
+                            }
+                            "settings" -> LocalSettingsIndex(state, onAccount = { account("settings") },
+                                onOpen = { section -> run { openSettingsSection(section, fromChat = false) } })
+                            "data" -> MemoryDataSettings(
+                                    busy,
+                                    run,
+                                    onBackup = {
+                                        run {
+                                            val file = controller.backupFile()
+                                            pendingDocumentPath = file.absolutePath
+                                            pendingDocumentMessage = "备份已保存。密钥与邀请凭证未导出。"
+                                            try {
+                                                saveBackup.launch("续聊助手备份-${System.currentTimeMillis()}.json")
+                                            } catch (error: Throwable) {
+                                                pendingDocumentPath = null
+                                                withContext(NonCancellable + Dispatchers.IO) { file.delete() }
+                                                throw error
+                                            }
+                                        }
+                                    },
+                                    onRestore = { restoreConfirmation = true },
+                                    onClearLocalData = {
+                                        manualPasteDraft.reset { controller.clearLocalData() }
+                                    },
+                                )
+                            "developer" -> if (state.developerPrefs.sessionToken.isNotEmpty()) key(state.account.currentUser?.id) { DeveloperScreen(state, controller, run) }
+                            "feedback" -> FeedbackScreen(state, controller, run)
+                            "tasks" -> TasksScreen(state.tasks, controller, run,
+                                onAccount = { account("tasks") }) { openRecord(it) }
+                            "account" -> AccountScreen(state, busy, controller, run,
+                                onSignedIn = { route = accountReturn })
+                            "about" ->
+                                AboutScreen(
+                                    updateState = updateState,
+                                    installBlockedReason = installBlockedReason,
+                                    installPermissionRequired = installPermissionRequired,
+                                    onCheckUpdates = {
+                                        if (!installPreparing) updates.checkForUpdates()
+                                    },
+                                    onDownloadUpdate = {
+                                        if (!installPreparing) updates.downloadUpdate()
+                                    },
+                                    onCancelUpdate = updates::cancelDownload,
+                                    onInstallUpdate = ::requestUpdateInstallation,
+                                    onFeedback = { route = "feedback" },
+                                )
+                        }
+                    }
+                }
+            }
+        }
+        if (getRecordsVisible)
+            GetRecordsDialog(
+                onDismiss = { getRecordsVisible = false },
+                onPaste = {
+                    getRecordsVisible = false
+                    route = "paste"
+                },
+                onImportFile = {
+                    getRecordsVisible = false
+                    import()
+                },
+                onOpenOfficialWebsite = {
+                    run {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse("https://chat.deepseek.com"))
+                        )
+                    }
+                },
+            )
+        quickArchive?.let { snapshot ->
+            val latest = state.archives.firstOrNull { it.id == snapshot.id } ?: snapshot
+            QuickContinuationDialog(
+                latest, state.conversations,
+                onDismiss = { quickArchive = null },
+                onContinueHere = { text -> continueHere(latest, text) },
+                onCopyAndOpen = { text -> run {
+                    require(text.toByteArray(Charsets.UTF_8).size <= 60 * 1024) { "内容较长，请保存文件。" }
+                    (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                        .setPrimaryClip(ClipData.newPlainText("快速续聊", text))
+                    openDeepSeek(context)
+                } },
+                onSave = { text -> run {
+                    stageDocument(text, "快速续聊文件已保存，请在 DeepSeek 新对话中添加。")
+                    saveContinuation.launch(safeFileName(latest.title) + "-快速续聊.txt")
+                } },
+            )
+        }
+        repairArchiveId?.let { id ->
+            val archive = state.archives.firstOrNull { it.id == id }
+            if (archive != null) ContinuityRepairDialog(
+                archive, state.conversations,
+                onDismiss = { repairArchiveId = null },
+                onCopy = { text -> run {
+                    require(text.toByteArray(Charsets.UTF_8).size <= 60 * 1024) { "修正内容过长，请精简补充内容。" }
+                    (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                        .setPrimaryClip(ClipData.newPlainText("续聊修正", text))
+                    snackbars.showSnackbar("修正内容已复制，请回到正在聊的 DeepSeek 会话粘贴。")
+                } },
+            ) else LaunchedEffect(id) { repairArchiveId = null }
+        }
+        politicalArchiveId?.let { id ->
+            val archive = state.archives.firstOrNull { it.id == id }
+            if (archive != null) PoliticalExportDialog(
+                archive = archive,
+                conversations = state.conversations,
+                controller = controller,
+                onDismiss = { politicalArchiveId = null },
+                onCopy = { text -> run {
+                    require(text.toByteArray(Charsets.UTF_8).size <= 60 * 1024) { "内容较长，请保存去除敏感内容后的文件。" }
+                    (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                        .setPrimaryClip(ClipData.newPlainText("去除敏感内容", text))
+                    snackbars.showSnackbar("已复制去除敏感内容后的文本，原档案未改动。")
+                } },
+                onSave = { text -> run {
+                    val checkedArchive = state.archives.firstOrNull { it.id == politicalState.task?.archiveId }
+                    stageDocument(text, "已保存去除敏感内容后的文本，原档案未改动。")
+                    saveContinuation.launch(safeFileName(checkedArchive?.title ?: archive.title) + "-去除敏感内容.txt")
+                } },
+            ) else LaunchedEffect(id) { politicalArchiveId = null }
+        }
+        exportArchive?.let { snapshot ->
+            val archive = state.archives.firstOrNull { it.id == snapshot.id } ?: return@let
+            ExportDialog(
+                archive,
+                state.conversations,
+                { exportArchive = null },
+                onSaveContinuity = { settings ->
+                    controller.saveContinuitySettings(archive.id, settings)
+                },
+                onContinueHere = { text -> continueHere(archive, text) },
+                onCopy = { text ->
+                    run {
+                        (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                            .setPrimaryClip(ClipData.newPlainText("续聊档案", text))
+                        snackbars.showSnackbar("Markdown 已复制。")
+                    }
+                },
+                onSave = { text ->
+                    run {
+                        stageDocument(text, "Markdown 已保存。")
+                        saveMarkdown.launch(safeFileName(archive.title) + ".md")
+                    }
+                },
+                onShare = { text ->
+                    run {
+                        val file =
+                            withContext(Dispatchers.IO) {
+                                File(context.cacheDir, "share")
+                                    .apply { mkdirs() }
+                                    .let { File(it, safeFileName(archive.title) + ".md") }
+                                    .apply { writeText(text) }
+                            }
+                        val uri =
+                            FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.files",
+                                file,
+                            )
+                        val intent =
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/markdown"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_SUBJECT, archive.title)
+                                clipData = ClipData.newRawUri("续聊档案", uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                        context.startActivity(Intent.createChooser(intent, "分享续聊档案"))
+                    }
+                },
+            )
+        }
+        reorganizationPlan?.takeIf {
+            route in setOf("result", "archive") && archiveId == it.archiveId
+        }?.let { plan ->
+            ReorganizationDialog(
+                plan = plan,
+                state = state,
+                busy = busy,
+                error = reorganizationError,
+                onDismiss = { reorganizationPlan = null; reorganizationError = null },
+                onConfirm = {
+                    if (!submitting && !reorganizationLoading) {
+                        submitting = true
+                        reorganizationError = null
+                        run {
+                            try {
+                                val started = controller.reorganizeArchive(plan)
+                                reorganizationPlan = null
+                                progressError = null
+                                openRecord(started.targetArchiveId)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                reorganizationError = error.message ?: "这次重新整理未能开始，请检查后重试。"
+                            } finally {
+                                submitting = false
+                            }
+                        }
+                    }
+                },
+                onSelectRange = {
+                    reorganizationSourceId = plan.archiveId
+                    reorganizationPlan = null
+                    reorganizationError = null
+                    val original = controller.state.value.archives.firstOrNull { it.id == plan.archiveId }
+                    val related = controller.state.value.conversations.filter { it.id in original?.conversationIds.orEmpty() }
+                    if (related.size == 1) {
+                        conversationId = related.first().id
+                        route = "reorganization_selection"
+                    } else route = "reorganization_choose"
+                },
+                onSettings = {
+                    archiveId = plan.archiveId
+                    openChatApiSettings(reorganizationReturnRoute)
+                },
+                onQuotaRefresh = { run { controller.refreshQuota() } },
+                onRefresh = {
+                    requestReorganization(plan.archiveId,
+                        plan.sourceScopes.takeIf { plan.rangeOrigin == ReorganizationRangeOrigin.USER_SELECTION })
+                },
+            )
+        }
+        aiRequest?.takeIf { route == "archive" }?.let { request ->
+            OrganizationDialog(
+                request.messages,
+                state,
+                controller,
+                { aiRequest = null },
+                onQuotaRefresh = { run { controller.refreshQuota() } },
+                onSettings = {
+                    if (state.organizationSettings.mode == "companion" && state.account.currentUser == null) account("archive")
+                    else openChatApiSettings("archive")
+                },
+            ) {
+                if (!submitting) {
+                    submitting = true
+                    run {
+                        try {
+                            val blocker = controller.checkOrganizationAvailability()
+                            require(blocker == null) { blocker.orEmpty() }
+                            controller.organize(
+                                request.archiveId,
+                                request.conversationId,
+                                request.branchId,
+                                request.selectedIds,
+                            )
+                            aiRequest = null
+                            archiveId = request.archiveId
+                            progressError = null
+                            route = "progress"
+                        } finally {
+                            submitting = false
+                        }
+                    }
+                }
+            }
+        }
+        if (shareInputVisible) ShareLinkInputDialog(
+            onDismiss = { shareInputVisible = false },
+            onRead = { link ->
+                shareInputVisible = false
+                importTargetArchiveId = null
+                onShareLinkReceived(link)
+            },
+        )
+        incomingImport?.takeIf { it.status == IncomingImportStatus.PREVIEW && !existingModal }?.let { pending ->
+            pending.preview?.let { preview ->
+                ShareImportPreviewDialog(
+                    preview,
+                    blocked = incomingBlocked,
+                    onSave = { onIncomingImportConfirmed(pending.id) },
+                    onDismiss = { onIncomingImportConsumed(pending.id) },
+                )
+            }
+        }
+        if (importingSharedFile || fetchingSharedLink)
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text(if (fetchingSharedLink) "正在读取分享" else "正在导入聊天") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(incomingImport?.fileName.orEmpty(), maxLines = 3)
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    if (fetchingSharedLink) TextButton(onClick = { incomingImport?.let { onIncomingImportConsumed(it.id) } }) { Text("取消") }
+                },
+            )
+        incomingImport
+            ?.takeIf { it.status == IncomingImportStatus.FAILED && !existingModal }
+            ?.let { pending ->
+                IncomingImportFailureDialog(
+                    error = pending.error,
+                    isShareLink = pending.shareUrl != null,
+                    blocked = incomingBlocked,
+                    onRetry = { onIncomingImportConfirmed(pending.id) },
+                    onChooseFile = {
+                        onIncomingImportConsumed(pending.id)
+                        import()
+                    },
+                    onDismiss = { onIncomingImportConsumed(pending.id) },
+                )
+            }
+        if (restoreConfirmation)
+            AlertDialog(
+                onDismissRequest = { restoreConfirmation = false },
+                title = { Text("从备份恢复") },
+                text = { Text("恢复会用备份替换本机的对话、续聊记录与历史版本。请先导出需要保留的当前数据。服务密钥需重新填写。") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            restoreConfirmation = false
+                            restoreLauncher.launch(
+                                arrayOf("application/json", "text/json", "application/octet-stream")
+                            )
+                        }
+                    ) {
+                        Text("选择备份文件")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { restoreConfirmation = false }) { Text("取消") }
+                },
+            )
+    }
+}
+
+@Composable
+private fun IncomingImportBar(
+    fileName: String,
+    isShareLink: Boolean = false,
+    blocked: Boolean,
+    onImport: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    Card(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(if (isShareLink) "收到 DeepSeek 分享链接" else "收到聊天文件", fontWeight = FontWeight.SemiBold)
+            Text(
+                fileName,
+                maxLines = 2,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+            if (isShareLink) Text("读取公开分享并预览，确认后才保存。持有链接的人也能查看分享内容。", style = MaterialTheme.typography.bodySmall)
+            if (blocked) Text("当前操作完成后可继续导入。", style = MaterialTheme.typography.bodySmall)
+            ActionRow {
+                Button(onClick = onImport, enabled = !blocked) { Text(if (isShareLink) "读取链接" else "导入") }
+                TextButton(onClick = onCancel) { Text("取消") }
+            }
+        }
+    }
+}
+
+private fun openDeepSeek(context: Context) {
+    try {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse("dpsk://chat/new")).setPackage("com.deepseek.chat")
+        )
+        return
+    } catch (_: android.content.ActivityNotFoundException) {
+        // Older versions may expose only the ordinary app launcher.
+    }
+    val launcher = context.packageManager.getLaunchIntentForPackage("com.deepseek.chat")
+    if (launcher != null) {
+        try {
+            context.startActivity(launcher)
+            return
+        } catch (_: android.content.ActivityNotFoundException) {}
+    }
+    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://chat.deepseek.com")))
+}
+
+@Composable
+private fun ExportDialog(
+    archive: Archive,
+    conversations: List<ImportedConversation>,
+    onDismiss: () -> Unit,
+    onSaveContinuity: suspend (ContinuitySettings) -> Unit,
+    onCopy: (String) -> Unit,
+    onSave: (String) -> Unit,
+    onShare: (String) -> Unit,
+    onContinueHere: (String) -> Unit,
+) {
+    var includeAllMemory by rememberSaveable(archive.id) { mutableStateOf(false) }
+    var hasReducedMemory by remember(archive, conversations) { mutableStateOf(false) }
+    var result by remember(archive, conversations, includeAllMemory) { mutableStateOf<Result<ExportResult>?>(null) }
+    var large by remember(archive, conversations) { mutableStateOf(false) }
+    var previewLimit by rememberSaveable(archive.id) { mutableIntStateOf(8000) }
+    LaunchedEffect(archive, conversations, includeAllMemory) {
+        val prepared = withContext(Dispatchers.Default) {
+            val export = runCatching { ContinuityLogic.export(archive, conversations, includeAllMemory = includeAllMemory) }
+            export to ((export.getOrNull()?.text?.toByteArray(Charsets.UTF_8)?.size ?: 0) > 60 * 1024)
+        }
+        large = prepared.second
+        result = prepared.first
+        if (!includeAllMemory) hasReducedMemory = (prepared.first.getOrNull()?.omittedCount ?: 0) > 0
+    }
+    AppDialog(
+        "带到下一段对话",
+        onDismiss,
+        actions = {
+            ActionRow {
+                TextButton(onClick = onDismiss) { Text("关闭") }
+                result?.getOrNull()?.let { export ->
+                    Button(onClick = { onContinueHere(export.text) }) { Text("在这里继续聊") }
+                    if (large) {
+                        Button(onClick = { onSave(export.text) }) { Text("保存文件") }
+                    } else {
+                        Button(onClick = { onCopy(export.text) }) { Text("复制续聊内容") }
+                        OutlinedButton(onClick = { onSave(export.text) }) { Text("保存文件") }
+                        TextButton(onClick = { onShare(export.text) }) { Text("系统分享") }
+                    }
+                }
+            }
+        },
+    ) {
+        ContinuitySetupCard(archive, conversations, onSaveContinuity)
+        if (hasReducedMemory || includeAllMemory) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = includeAllMemory, onCheckedChange = { includeAllMemory = it })
+                Text("带上全部记忆", style = MaterialTheme.typography.bodyMedium)
+            }
+            Text("仍遵循已保存的续聊设置；内容较多时可保存文件。", style = MaterialTheme.typography.bodySmall)
+        }
+        if (result == null) LinearProgressIndicator(Modifier.fillMaxWidth())
+        result?.fold(
+            onSuccess = { export ->
+                Text(
+                    "${export.text.length} 字符",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Blue,
+                )
+                if (export.omittedCount > 0) Text("本次未附带 ${export.omittedCount} 条自动内容，原档案仍完整保留。",
+                    style = MaterialTheme.typography.bodySmall)
+                if (export.pinnedOverflow)
+                    Text(
+                        "部分固定条目未被带入，请核对预览。",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                Text(
+                    if (large) "内容较长，请保存为文件后，在 DeepSeek 新对话中添加文件。"
+                    else "复制后，在 DeepSeek 新对话里粘贴，或添加保存的文件。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                HorizontalDivider()
+                SelectionContainer { Text(export.text.take(previewLimit), style = MaterialTheme.typography.bodySmall) }
+                if (export.text.length > previewLimit) {
+                    Text(
+                        if (large) "当前预览前 $previewLimit 字符，保存文件会包含全部 ${export.text.length} 字符。"
+                        else "当前预览前 $previewLimit 字符，复制和保存会包含全部 ${export.text.length} 字符。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = { previewLimit = (previewLimit + 8000).coerceAtMost(export.text.length) }) {
+                        Text("继续查看")
+                    }
+                }
+            },
+            onFailure = { Text(it.message ?: "暂时无法导出", color = MaterialTheme.colorScheme.error) },
+        )
+    }
+}
+
+@Composable
+private fun OrganizationDialog(
+    messages: List<ChatMessage>,
+    state: AppState,
+    controller: AppController,
+    onDismiss: () -> Unit,
+    onQuotaRefresh: () -> Unit,
+    onSettings: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val settings = state.organizationSettings
+    var estimate by remember { mutableStateOf<Result<OrganizationEstimate>?>(null) }
+    LaunchedEffect(messages, settings, state.quota) {
+        estimate = null
+        estimate =
+            withContext(Dispatchers.Default) {
+                runCatching { controller.estimateForCurrentService(messages) }
+            }
+    }
+    val configured =
+        if (settings.mode == "byok") settings.apiKey.isNotBlank() && settings.baseUrl.isNotBlank()
+        else settings.companionUrl.isNotBlank()
+    val needsLogin = settings.mode == "companion" && state.account.currentUser == null
+    val quotaReady =
+        settings.mode != "companion" ||
+            (!needsLogin && state.quota != null && !state.quotaLoading && state.quotaError == null)
+    AppDialog(
+        "确认 AI 整理",
+        onDismiss,
+        actions = {
+            ActionRow {
+                TextButton(onClick = onDismiss) { Text("返回档案") }
+                if (configured && estimate?.isSuccess == true && quotaReady)
+                    Button(onClick = onConfirm) { Text("确认并开始") }
+                else if (!configured || needsLogin)
+                    Button(onClick = onSettings) { Text(if (needsLogin) "登录后免费整理" else "配置聊天 API") }
+            }
+        },
+    ) {
+        Text(
+            when {
+                !configured -> "尚未配置聊天 API"
+                settings.mode == "byok" -> "聊天 API · ${settings.model}"
+                else -> "聊天 API · 免费服务"
+            },
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (configured) {
+            Text(
+                if (settings.mode == "byok") settings.baseUrl else settings.companionUrl,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text("将发送所选 ${messages.size} 条消息供整理。")
+        }
+        estimate?.fold(
+            onSuccess = { value ->
+                Text(
+                    "预计 ${value.chunks} 个分块 · 输入约 ${value.inputTokens} tokens · 输出预算 ${value.outputTokens} tokens",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (settings.mode == "companion")
+                    Text("免费使用，预计需要 ${state.quota.requestCountText(value.chunks)} 次模型请求，将按实际请求扣除个人次数。")
+                else Text("费用按聊天 API 服务商的实际用量计算。")
+            },
+            onFailure = { Text(it.message ?: "无法估算请求", color = MaterialTheme.colorScheme.error) },
+        )
+        if (settings.mode == "companion") FreeQuotaCard(state, onQuotaRefresh)
+    }
+}
+
+private fun safeFileName(value: String) =
+    value.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").take(80).ifBlank { "续聊档案" }
+
+private fun readDocument(
+    context: Context,
+    uri: Uri,
+    maxBytes: Int = 32 * 1024 * 1024,
+): Pair<String, ByteArray> {
+    var name = "import.json"
+    context.contentResolver
+        .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+        ?.use { cursor -> if (cursor.moveToFirst()) name = cursor.getString(0) ?: name }
+    val bytes =
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val buffer = ByteArray(32 * 1024)
+            val output = ByteArrayOutputStream()
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(output.size().toLong() + count <= maxBytes.toLong()) {
+                    "文件超过 ${maxBytes / 1024 / 1024} MB，无法读取。"
+                }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        } ?: error("无法读取所选文件")
+    return name to bytes
+}

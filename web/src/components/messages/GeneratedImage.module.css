@@ -1,0 +1,71 @@
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 512px;
+  margin: 12px 0;
+}
+
+.image {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-skeleton);
+  object-fit: contain;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.preview {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  cursor: zoom-in;
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+}
+
+.preview:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 3px;
+}
+
+.placeholder {
+  padding: 24px 16px;
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-skeleton);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 14px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.action {
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.action:hover {
+  color: var(--dsw-alias-brand-text);
+}
+
+.action:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 3px;
+}

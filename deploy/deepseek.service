@@ -1,0 +1,31 @@
+[Unit]
+Description=DeepSeek memory chat and continuation service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepseek-continuation
+Group=deepseek-continuation
+WorkingDirectory=/opt/deepseek/current/backend
+EnvironmentFile=/etc/deepseek/companion.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+LoadCredential=chat-provider:/etc/relationship-coach/config.json
+Environment=CHAT_PROVIDER_CONFIG=%d/chat-provider
+Environment=IMAGE_PROVIDER_CONFIG=/var/lib/deepseek/image-provider.json
+ExecStart=/opt/deepseek/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 3144 --workers 1 --no-access-log --no-proxy-headers
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+StateDirectory=deepseek
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deepseek
+
+[Install]
+WantedBy=multi-user.target

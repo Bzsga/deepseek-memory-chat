@@ -1,0 +1,124 @@
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 44px;
+}
+
+.toggle {
+  position: relative;
+  flex: 0 0 48px;
+  width: 48px;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.toggle::before {
+  position: absolute;
+  inset: 8px 0;
+  border-radius: 20px;
+  background: var(--dsw-alias-border-l2);
+  content: '';
+}
+
+.toggle::after {
+  position: absolute;
+  top: 10px;
+  left: 2px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 15%);
+  transition: transform var(--ds-transition-duration) var(--ds-ease-in-out);
+  content: '';
+}
+
+.toggle[aria-checked='true']::before {
+  background: var(--dsw-alias-button-primary-fill);
+}
+
+.toggle[aria-checked='true']::after {
+  transform: translateX(20px);
+}
+
+.toggle:focus-visible {
+  outline: 2px solid var(--dsw-alias-button-primary-fill);
+  outline-offset: 2px;
+}
+
+.toggle:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.description,
+.status,
+.error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 19px;
+  overflow-wrap: anywhere;
+}
+
+.description,
+.status {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.error {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.actions,
+.confirmActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.actions > button {
+  min-height: 44px;
+  height: auto;
+  max-width: 100%;
+  padding-block: 8px;
+  white-space: normal;
+}
+
+.confirmation {
+  width: 420px;
+}
+
+.confirmActions {
+  justify-content: flex-end;
+  width: 100%;
+}
+
+.confirmActions > button {
+  min-height: 44px;
+  height: auto;
+  max-width: 100%;
+  padding-block: 10px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.confirmText {
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+}
+
+.confirmText:last-child {
+  margin-bottom: 0;
+}

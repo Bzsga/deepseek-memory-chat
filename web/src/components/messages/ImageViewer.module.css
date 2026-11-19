@@ -1,0 +1,140 @@
+.viewer {
+  position: fixed;
+  inset: 0;
+  top: var(--app-viewport-top, 0px);
+  bottom: auto;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  height: var(--app-viewport-height, 100vh);
+  color: #f7f7f8;
+  background: #111214;
+  overscroll-behavior: none;
+}
+
+.header,
+.toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px max(12px, env(safe-area-inset-right)) 8px max(16px, env(safe-area-inset-left));
+}
+
+.header {
+  padding-top: max(8px, env(safe-area-inset-top));
+}
+
+.toolbar {
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+
+.name {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.control,
+.reset {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 6px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 25px;
+  cursor: pointer;
+}
+
+.control:hover,
+.reset:hover {
+  background: rgb(255 255 255 / 9%);
+}
+
+.control:focus-visible,
+.reset:focus-visible {
+  outline: 2px solid #91a5ff;
+  outline-offset: 1px;
+}
+
+.control:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.control svg {
+  width: 20px;
+  height: 20px;
+}
+
+.reset {
+  min-width: 64px;
+  font-size: 13px;
+}
+
+.zoom {
+  display: flex;
+  align-items: center;
+}
+
+.stage {
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.image {
+  display: block;
+  flex: 0 0 auto;
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  transform-origin: center;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.image[hidden] {
+  display: none;
+}
+
+.menuName {
+  margin: 0;
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.menuActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 100%;
+}
+
+.menuActions > button {
+  min-height: 44px;
+  height: auto;
+  max-width: 100%;
+  padding-block: 10px;
+  white-space: normal;
+}

@@ -1,0 +1,93 @@
+.frame {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  overflow: hidden;
+  background-color: var(--dsw-alias-bg-base);
+}
+
+.main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.saveError {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 16px;
+  color: var(--dsw-alias-label-primary);
+  background-color: var(--dsw-alias-bg-base);
+  font-size: 14px;
+}
+
+.loadingView {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.loadingState {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 14px;
+  text-align: center;
+}
+
+@media not all and (min-width: 768px) {
+  .frame {
+    position: fixed;
+    top: var(--app-viewport-top, 0px);
+    bottom: auto;
+    /* WebView 105-107 supports vh; dvh is only available from 108. */
+    height: var(--app-viewport-height, 100vh);
+  }
+
+  :global(html[data-chat-document-scroll] body),
+  :global(html[data-chat-document-scroll] #root) {
+    height: auto;
+    overflow: visible;
+  }
+
+  :global(html[data-chat-document-scroll]) {
+    height: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-color: var(--scroll-color) transparent;
+  }
+
+  :global(html[data-chat-document-scroll]) .frame {
+    position: relative;
+    top: auto;
+    height: auto;
+    min-height: var(--app-viewport-height, 100vh);
+    overflow: visible;
+  }
+
+  /* The mobile drawer remains on screen when the document is scrolled. */
+  :global(html[data-chat-document-scroll]) .frame > button,
+  :global(html[data-chat-document-scroll]) .frame > :global([aria-modal='true']) {
+    position: fixed;
+    top: var(--app-viewport-top, 0px);
+    bottom: auto;
+    height: var(--app-viewport-height, 100vh);
+  }
+}

@@ -1,0 +1,185 @@
+.entry {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 14px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 22px;
+  cursor: pointer;
+}
+
+.entry svg {
+  flex-shrink: 0;
+}
+.entry:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.entry:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 2px;
+}
+.dialog {
+  width: 560px;
+}
+.main {
+  color: var(--dsw-alias-label-primary);
+  padding-right: 6px;
+}
+.description {
+  margin: 0 0 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+.inputLabel {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+.input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 94px;
+  padding: 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  background: var(--dsw-specific-input-major);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  line-height: 22px;
+  resize: vertical;
+  overflow-wrap: anywhere;
+}
+.input:focus {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+.input::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+.hint,
+.error {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 21px;
+  overflow-wrap: anywhere;
+}
+.hint {
+  color: var(--dsw-alias-label-secondary);
+}
+.error {
+  color: var(--dsw-alias-state-error-primary);
+}
+.preview {
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 14px;
+}
+.previewTitle {
+  margin: 0;
+  font-size: 15px;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+}
+.metadata {
+  margin: 4px 0 8px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+}
+.scope {
+  margin: 0;
+  font-size: 13px;
+  line-height: 21px;
+}
+.warnings {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 20px;
+}
+.excerpts {
+  margin-top: 10px;
+  font-size: 13px;
+}
+.excerpts summary,
+.tutorial summary {
+  cursor: pointer;
+  padding: 5px 0;
+}
+.message {
+  margin-top: 12px;
+}
+.role {
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.message p {
+  margin: 4px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.imageMetadata {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--dsw-specific-selector);
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+}
+.sourceLink {
+  display: inline-block;
+  padding-top: 8px;
+  color: var(--dsw-alias-brand-text);
+  font-size: 12px;
+}
+.tutorial {
+  margin-top: 16px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+}
+.tutorial ol {
+  margin: 8px 0 0;
+  padding-left: 21px;
+}
+.tutorial li + li {
+  margin-top: 16px;
+}
+.tutorial p {
+  margin: 0 0 8px;
+}
+.tutorial img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  box-sizing: border-box;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 100%;
+}
+.actions button {
+  min-height: 44px;
+  height: auto;
+  white-space: normal;
+}
+
+@media (max-width: 767px) {
+  .dialog {
+    padding: 20px;
+  }
+  .input {
+    font-size: 16px;
+  }
+}

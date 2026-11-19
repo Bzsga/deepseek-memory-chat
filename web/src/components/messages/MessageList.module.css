@@ -1,0 +1,54 @@
+.container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  scrollbar-gutter: stable both-edges;
+  scrollbar-color: var(--scroll-color) transparent;
+}
+
+.scroll {
+  display: contents;
+}
+
+@media not all and (min-width: 768px) {
+  .container {
+    overflow: visible;
+    scrollbar-gutter: auto;
+    padding-bottom: calc(
+      var(--chat-composer-height, 172px) + var(--app-viewport-bottom-inset, 0px)
+    );
+  }
+
+  .scroll {
+    display: block;
+    min-height: 0;
+    overflow: visible;
+  }
+}
+
+.column {
+  width: calc(var(--message-list-max-width) - 2 * var(--message-list-padding-horizontal));
+  max-width: calc(100% - 40px);
+  margin: 0 auto;
+  padding-bottom: 24px;
+}
+
+.loadEarlier {
+  display: block;
+  min-height: 40px;
+  margin: 16px auto 8px;
+  padding: 8px 16px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 20px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.loadEarlier:hover {
+  color: var(--dsw-alias-brand-text);
+  border-color: var(--dsw-alias-brand-primary);
+}

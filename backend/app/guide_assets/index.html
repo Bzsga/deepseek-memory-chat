@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>获取 DeepSeek API Key</title>
+  <style>
+    :root { color-scheme: light dark; --ink:#192638; --muted:#516177; --line:#dce3ec; --blue:#2456c4; --paper:#fff; --panel:#f3f6fc }
+    @media(prefers-color-scheme:dark) { :root { --ink:#e8eef7; --muted:#afbdd1; --line:#354355; --blue:#a9c5ff; --paper:#171d26; --panel:#222b39 } }
+    * { box-sizing:border-box }
+    body { margin:0; background:var(--paper); color:var(--ink); font:1rem/1.65 system-ui,sans-serif }
+    main { max-width:40rem; margin:auto; padding:clamp(1.25rem,5vw,3rem) 1.25rem 3rem }
+    h1 { font-size:clamp(1.55rem,5vw,2.15rem); line-height:1.25; margin:0 }
+    h2 { font-size:1.12rem; margin:0 0 .25rem }
+    p { margin:.4rem 0 .8rem; color:var(--muted) }
+    a { color:var(--blue) }
+    .action { display:inline-block; background:#2456c4; color:white; padding:.55rem 1rem; border-radius:.65rem; text-decoration:none }
+    section { padding:1.1rem 0; border-bottom:1px solid var(--line) }
+    summary { cursor:pointer; width:fit-content; padding:.45rem .1rem; color:var(--blue) }
+    figure { margin:.5rem 0 1rem; padding:.65rem; border-radius:.75rem; background:var(--panel) }
+    img { display:block; width:100%; height:auto; margin:auto }
+    figcaption { margin-bottom:.45rem; color:var(--muted); font-size:.9rem }
+  </style>
+</head>
+<body><main>
+  <h1>获取 DeepSeek API Key</h1>
+  <p>使用个人 Key 时，DeepSeek 按实际用量从你的开放平台账户扣费。</p>
+  <a class="action" href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer">打开官方 API Keys 页面 ↗</a>
+  <section>
+    <h2>1. 登录开放平台</h2>
+    <p>点击上方按钮登录。也可以从 DeepSeek 官网选择「API 开放平台」进入。</p>
+    <details><summary>查看官网入口图示</summary>
+      <figure><figcaption>搜索时认准 DeepSeek｜深度求索。</figcaption><img loading="lazy" src="api-key-guide/step-1.jpg" alt="搜索结果中的 DeepSeek 官方入口"></figure>
+      <figure><figcaption>在官网首页点击「API 开放平台」。</figcaption><img loading="lazy" src="api-key-guide/step-2.jpg" alt="官网首页的 API 开放平台按钮"></figure>
+    </details>
+  </section>
+  <section>
+    <h2>2. 确认余额，创建 Key</h2>
+    <p>在「用量信息」确认余额，余额不足时按需充值。打开左上角菜单，选择「API keys」，点击「创建 API key」。</p>
+    <details><summary>查看余额和创建按钮图示</summary>
+      <figure><figcaption>用量信息页提供充值入口。</figcaption><img loading="lazy" src="api-key-guide/step-3.jpg" alt="左上角菜单与去充值按钮"></figure>
+      <figure><figcaption>菜单中选择「API keys」。</figcaption><img loading="lazy" src="api-key-guide/step-4.jpg" alt="开放平台侧边菜单中的 API keys"></figure>
+      <figure><figcaption>点击「创建 API key」。</figcaption><img loading="lazy" src="api-key-guide/step-5.jpg" alt="API keys 页中的创建按钮"></figure>
+    </details>
+  </section>
+  <section>
+    <h2>3. 复制并回到应用保存</h2>
+    <p>在创建成功窗口点击「复制」。完整 Key 只在创建时显示一次，请妥善保存。回到刚才的填写页面，粘贴个人 Key 并保存即可。</p>
+    <details><summary>查看复制按钮图示</summary>
+      <figure><img loading="lazy" src="api-key-guide/step-6.jpg" alt="创建成功窗口中的复制按钮"></figure>
+    </details>
+  </section>
+</main></body></html>

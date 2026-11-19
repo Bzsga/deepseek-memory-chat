@@ -1,0 +1,41 @@
+.session-bootstrap {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  color: #394257;
+  background: #fff;
+  font: 15px/1.6 system-ui, sans-serif;
+  text-align: center;
+}
+
+.session-bootstrap[hidden] {
+  display: none;
+}
+
+.session-bootstrap p {
+  margin: 0;
+}
+
+.session-bootstrap button {
+  min-height: 40px;
+  padding: 8px 22px;
+  border: 0;
+  border-radius: 10px;
+  background: #4d6bfe;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+@media (prefers-color-scheme: dark) {
+  .session-bootstrap {
+    color: #e5e7eb;
+    background: #292a2d;
+  }
+}
