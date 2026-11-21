@@ -5,10 +5,11 @@ import {
   getVisibleMessages,
   type MessageVersions,
 } from '../../services/chat/branches.js'
-import { selectMessageVersion } from '../../services/chat/store.js'
+import { branchToNewChat, selectMessageVersion } from '../../services/chat/store.js'
 import type { Session } from '../../services/chat/types.js'
 import { closeSearchPanel } from '../search/searchPanelState.js'
 import { ConversationShareDialog } from '../session/ConversationShareDialog.js'
+import { showConversationShareControls } from '../session/conversationShareVisibility.js'
 import { AssistantMessage } from './AssistantMessage.js'
 import { ScrollToBottomContext } from './scrollContext.js'
 import { UserMessage } from './UserMessage.js'
@@ -60,6 +61,9 @@ export const MessageList = ({
   const prependAnchorRef = useRef<{ messageId: string; top: number } | null>(null)
   const locateRef = useRef<string | null>(null)
   const [shareReplyId, setShareReplyId] = useState<string | null>(null)
+  const onBranch = useCallback((replyId: string) => branchToNewChat(
+    session.id, replyId, t('branchChatTitle', { title: session.title || t('untitledChat') })
+  ), [session.id, session.title, t])
   const importing = useChatStore(state => state.importingHistory)
   const [visibleCount, setVisibleCount] = useState(MESSAGE_PAGE_SIZE)
   const messages = getVisibleMessages(session)
@@ -122,8 +126,9 @@ export const MessageList = ({
       }
     }
     const observer = new ResizeObserver(measure)
-    observer.observe(header)
-    observer.observe(input)
+    // The reserved height includes padding, including changes to the mobile safe area.
+    observer.observe(header, { box: 'border-box' })
+    observer.observe(input, { box: 'border-box' })
     measure()
     return () => observer.disconnect()
   }, [isMobile, session.id])
@@ -356,8 +361,9 @@ export const MessageList = ({
                   sessionId={session.id}
                   message={message}
                   isLast={startIndex + index === lastIndex}
+                  onBranch={onBranch}
                   onShare={setShareReplyId}
-                  shareDisabled={importing}
+                  actionsDisabled={importing}
                   streaming={streaming && startIndex + index === lastIndex}
                   busy={streaming}
                   versions={versions.get(message.id) ?? EMPTY_VERSIONS}
@@ -369,7 +375,7 @@ export const MessageList = ({
         </div>
         {footer}
       </div>
-      {shareReplyId !== null ? (
+      {showConversationShareControls && shareReplyId !== null ? (
         <ConversationShareDialog
           session={session}
           replyId={shareReplyId}

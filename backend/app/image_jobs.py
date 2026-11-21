@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 class ImageJobError(Exception):
     def __init__(self, status, message, code):
         self.status, self.message, self.code = status, message, code
+
+
+@dataclass(frozen=True)
+class ImageEditSource:
+    content: bytes = field(repr=False)
+    mime_type: str
 
 
 def _utc(value):
@@ -127,7 +134,7 @@ class ImageJobs:
             previous = db.execute("SELECT * FROM image_jobs WHERE owner_id=? AND client_request_id=?", (owner, request_id)).fetchone()
             if previous:
                 if previous["prompt_hash"] and previous["prompt_hash"] != prompt_hash:
-                    raise ImageJobError(409, "此请求编号已用于其他图片描述，请为新描述新建任务。", "image_job_conflict")
+                    raise ImageJobError(409, "此请求编号已用于不同的图片描述或原图，请新建任务。", "image_job_conflict")
                 return dict(previous), False
             job_id = uuid.uuid4().hex
             db.execute("""INSERT INTO image_jobs(id,owner_id,client_request_id,prompt_hash,model,status,
@@ -135,10 +142,23 @@ class ImageJobs:
                 (job_id, owner, request_id, prompt_hash, model, now, now, now + self.ttl))
             return dict(db.execute("SELECT * FROM image_jobs WHERE id=?", (job_id,)).fetchone()), True
 
-    async def create(self, owner, request_id, prompt, token, provider):
+    async def create(self, owner, request_id, prompt, token, provider, *, sources: tuple[ImageEditSource, ...] = ()):
         if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
             raise ImageJobError(400, "生成请求编号无效，请重新打开输入框。", "image_job_invalid_id")
-        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8"))
+        prompt_hash = prompt_digest.hexdigest()
+        if len(sources) == 1:
+            # Preserve fingerprints for jobs created before multiple images were supported.
+            edit_digest = hashlib.sha256(prompt_digest.digest())
+            edit_digest.update(sources[0].content)
+            prompt_hash = "edit:" + edit_digest.hexdigest()
+        elif sources:
+            edit_digest = hashlib.sha256(prompt_digest.digest())
+            for source in sources:
+                # Frame each image so different boundaries cannot share a fingerprint.
+                edit_digest.update(len(source.content).to_bytes(8, "big"))
+                edit_digest.update(source.content)
+            prompt_hash = "edit-multi:" + edit_digest.hexdigest()
         async with self._submit_lock:
             if not self._started or self._stopping or self.generator is None:
                 raise ImageJobError(503, "图片生成服务正在启动，请稍后重试。", "image_job_unavailable")
@@ -149,7 +169,7 @@ class ImageJobs:
                     raise
             else:
                 if previous["prompt_hash"] and previous["prompt_hash"] != prompt_hash:
-                    raise ImageJobError(409, "此请求编号已用于其他图片描述，请为新描述新建任务。", "image_job_conflict")
+                    raise ImageJobError(409, "此请求编号已用于不同的图片描述或原图，请新建任务。", "image_job_conflict")
                 return await self.get(owner, request_id), False
             if provider is None:
                 raise ImageJobError(503, "生图服务尚未配置，请联系管理员。", "image_provider_disabled")
@@ -164,15 +184,15 @@ class ImageJobs:
                 with anyio.CancelScope(shield=True):
                     row, created = await creation
                     if created:
-                        self._schedule(row, token, provider, prompt)
+                        self._schedule(row, token, provider, prompt, sources)
                 raise
             if created:
-                self._schedule(row, token, provider, prompt)
+                self._schedule(row, token, provider, prompt, sources)
             return self._metadata(row), created
 
-    def _schedule(self, row, token, provider, prompt):
+    def _schedule(self, row, token, provider, prompt, sources):
         job_id = row["id"]
-        task = asyncio.create_task(self._run(row, token, provider, prompt))
+        task = asyncio.create_task(self._run(row, token, provider, prompt, sources))
         self._tasks[job_id] = task
 
         def finished(done):
@@ -216,14 +236,15 @@ class ImageJobs:
             temporary.unlink(missing_ok=True)
         return hashlib.sha256(raw).hexdigest()
 
-    async def _run(self, row, token, provider, prompt):
+    async def _run(self, row, token, provider, prompt, sources):
         job_id, written = row["id"], False
         checksum = None
         try:
             async with self._semaphore:
                 if not await asyncio.to_thread(self._running, job_id):
                     return
-                result = await self.generator(token, row["owner_id"], provider, prompt)
+                edit = {"sources": sources} if sources else {}
+                result = await self.generator(token, row["owner_id"], provider, prompt, **edit)
                 writing = asyncio.create_task(asyncio.to_thread(self._write_result, job_id, result))
                 try:
                     checksum = await asyncio.shield(writing)

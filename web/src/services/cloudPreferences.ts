@@ -1,4 +1,5 @@
 import { ApiError, request } from './api/client.js'
+import { legacyReplyTone } from './replyPreferences.js'
 import { API_ORIGIN, accountStorageKey } from './runtime.js'
 import {
   applyCloudPreferences,
@@ -65,6 +66,25 @@ const setPending = (key: string, value: string | null) => {
     volatilePending.delete(key)
   } catch {
     volatilePending.set(key, value)
+  }
+}
+
+/** The account changed scope without interrupting preference consent. */
+export function advancePendingPreferences(previous: number, generation: number) {
+  for (const name of preferenceNames) {
+    const key = pendingKey(name)
+    const text = getPending(key)
+    if (!text) {
+      continue
+    }
+    try {
+      const pending = JSON.parse(text)
+      if (pending?.generation === previous && validPreference(name, pending.value)) {
+        setPending(key, JSON.stringify({ generation, value: pending.value }))
+      }
+    } catch {
+      // The sync cycle will discard damaged pending entries.
+    }
   }
 }
 export function watchPreferenceChanges(generation: () => number | undefined, schedule: () => void) {
@@ -140,7 +160,11 @@ export async function syncPreferences(
           signal
         )
       } catch (error) {
-        if (attempt < 2 && error instanceof ApiError && error.status === 409 && live()) {
+        if (
+          attempt < 2 && error instanceof ApiError && error.status === 409 && live() &&
+          error.code !== 'sync_generation_changed' && error.code !== 'sync_disabled' &&
+          error.code !== 'sync_scope_disabled'
+        ) {
           continue
         }
         throw error
@@ -164,6 +188,12 @@ export async function syncPreferences(
     }
     applying = true
     try {
+      // Older preference documents express the chosen style solely through their custom text.
+      const toneKey = pendingKey('replyTone')
+      if (desired.replyTone === undefined && updates.persona !== undefined &&
+          getPending(toneKey) === sent.get('replyTone')) {
+        updates.replyTone = legacyReplyTone(updates.persona)
+      }
       if (Object.keys(updates).length > 0) {
         applyCloudPreferences(updates)
       }

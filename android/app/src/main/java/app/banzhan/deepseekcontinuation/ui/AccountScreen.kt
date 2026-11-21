@@ -37,6 +37,7 @@ internal fun AccountScreen(
         onLogout = controller::logoutAccount,
         onRefresh = controller::refreshAccount,
         onSignedIn = onSignedIn,
+        readSelfServiceRegistration = controller::selfServiceRegistrationOpen,
     )
 }
 
@@ -47,20 +48,35 @@ internal fun AccountScreenContent(
     busy: Boolean,
     run: (suspend () -> Unit) -> Unit,
     onLogin: suspend (String, String) -> Unit,
-    onRegister: suspend (String, String) -> Unit,
+    onRegister: suspend (String, String, String) -> Unit,
     onLogout: suspend () -> Unit,
     onRefresh: suspend () -> Unit,
     onSignedIn: () -> Unit = {},
+    readSelfServiceRegistration: suspend () -> Boolean = { false },
 ) {
     var registering by rememberSaveable { mutableStateOf(false) }
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var invitationCode by remember { mutableStateOf("") }
     var revealPassword by remember { mutableStateOf(false) }
     var pending by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
     var hideAccountError by remember(state.account.error) { mutableStateOf(false) }
     val working = busy || pending || state.account.loading
     val user = state.account.currentUser
+    val service = state.settings.companionUrl
+    var selfService by remember(service) { mutableStateOf(false) }
+    LaunchedEffect(service, user?.id) {
+        if (user == null) {
+            selfService = try {
+                readSelfServiceRegistration()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
     fun execute(action: suspend () -> Unit) {
         if (busy || pending || state.account.loading) return
         pending = true
@@ -102,7 +118,16 @@ internal fun AccountScreenContent(
                 )
             }
         } else {
-            item { SectionTitle("登录或注册", "登录后可在设置中配置 API。") }
+            item {
+                SectionTitle(
+                    if (registering) "创建账号" else "登录账号",
+                    when {
+                        !registering -> "登录后可在聊天设置中开启多端同步。"
+                        selfService -> "普通账号可使用基础同步，邀请码可领取配套服务。"
+                        else -> "此服务目前采用邀请码注册。"
+                    },
+                )
+            }
             item {
                 ActionRow {
                     listOf(false to "登录", true to "注册").forEach { (register, label) ->
@@ -111,6 +136,7 @@ internal fun AccountScreenContent(
                             onClick = {
                                 registering = register
                                 password = ""
+                                invitationCode = ""
                                 revealPassword = false
                                 problem = null
                                 hideAccountError = true
@@ -142,7 +168,10 @@ internal fun AccountScreenContent(
                     singleLine = true,
                     enabled = !working,
                     visualTransformation = if (revealPassword) VisualTransformation.None else PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        imeAction = if (registering) ImeAction.Next else ImeAction.Done,
+                    ),
                     trailingIcon = {
                         IconButton(onClick = { revealPassword = !revealPassword }) {
                             Icon(if (revealPassword) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
@@ -150,6 +179,18 @@ internal fun AccountScreenContent(
                         }
                     },
                 )
+            }
+            if (registering) {
+                item {
+                    OutlinedTextField(
+                        invitationCode, { invitationCode = it },
+                        modifier = Modifier.fillMaxWidth().testTag("account-invitation-code"),
+                        label = { Text(if (selfService) "邀请码（选填）" else "邀请码") },
+                        singleLine = true,
+                        enabled = !working,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, autoCorrectEnabled = false, imeAction = ImeAction.Done),
+                    )
+                }
             }
             (problem ?: state.account.error.takeUnless { hideAccountError })?.let {
                 item { NoticeCard(it) }
@@ -160,20 +201,24 @@ internal fun AccountScreenContent(
                         val register = registering
                         val suppliedUsername = username.trim()
                         val suppliedPassword = password
+                        val suppliedInvitationCode = invitationCode.trim()
                         password = ""
                         revealPassword = false
                         execute {
-                            if (register) onRegister(suppliedUsername, suppliedPassword)
-                            else onLogin(suppliedUsername, suppliedPassword)
+                            if (register) {
+                                onRegister(suppliedUsername, suppliedPassword, suppliedInvitationCode)
+                                invitationCode = ""
+                            } else onLogin(suppliedUsername, suppliedPassword)
                             onSignedIn()
                         }
                     },
                     enabled = !working && username.isNotBlank() && password.isNotEmpty() &&
-                        (!registering || password.length in 8..128),
+                        (!registering || password.codePointCount(0, password.length) in 8..128 &&
+                            (selfService || invitationCode.isNotBlank())),
                     modifier = Modifier.testTag("account-submit"),
                 ) { Text(if (working) "请稍候…" else if (registering) "注册并登录" else "登录账户") }
                 Text(
-                    "使用自己的 API 整理本机原文无需登录。",
+                    "本机聊天和个人 API 可以直接使用。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

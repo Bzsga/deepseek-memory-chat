@@ -1,6 +1,6 @@
 import { personalEndpoint, type PersonalEndpoint } from './providerEndpoint.js'
 import { create } from 'zustand'
-import { accountStorageKey, getRuntime, isSessionActive, isGuestWorkspace } from './runtime.js'
+import { accountStorageKey, getRuntime, isSessionActive, isGuestWorkspace, subscribeRuntimeUser } from './runtime.js'
 import { setChatProviderApiKey, useSettings } from './settings.js'
 import {
   readPersonalApiKey,
@@ -30,9 +30,13 @@ export const CHAT_PROVIDER_CHANGED = 'deepseek-chat-provider-changed'
 const MODE_KEY = accountStorageKey('chat-provider-mode')
 const OWNER = getRuntime().user.id
 const MANAGED_SCOPE = accountStorageKey('managed-provider')
-const MISSING = '请填写个人 API Key，或用邀请码开通免费服务。'
-const NO_ACCESS = '当前账号没有免费资格，请填写个人 API Key 或兑换邀请码。'
-const initialEligibility = getRuntime().user.managed_eligible === true
+const missingKey = () => getRuntime().user.invite_redeemable
+  ? '请填写个人 API Key，或使用邀请码。'
+  : '请填写个人聊天 API Key。'
+const unavailableChat = () => getRuntime().user.invite_redeemable
+  ? '当前账号未开通配套聊天 API，可填写个人 API Key 或使用邀请码。'
+  : '当前账号未开通配套聊天 API，可填写个人 API Key。'
+const initialEligibility = getRuntime().user.permissions.chat_api
 const unreadable = '无法读取本机服务设置，请重新保存服务选择。'
 let initialMode: ChatProviderMode = initialEligibility ? 'managed' : 'personal',
   preferredMode: string | null = null,
@@ -79,13 +83,13 @@ const keyValue = (value: string): string => {
 }
 const changed = () => window.dispatchEvent(new Event(CHAT_PROVIDER_CHANGED))
 const stopPreviousActivity = async () => {
-  const [{ suspendReply, useChatStore }, { stopReadAloud }] = await Promise.all([
+  const [{ suspendChatReply, useChatStore }, { stopReadAloud }] = await Promise.all([
     import('./chat/store.js'),
     import('./speech/readAloud.js'),
   ])
   assertOwner()
   for (const id of Object.keys(useChatStore.getState().streaming)) {
-    suspendReply(id)
+    suspendChatReply(id)
   }
   stopReadAloud()
   changed()
@@ -93,7 +97,7 @@ const stopPreviousActivity = async () => {
 const publish = (mode: ChatProviderMode, keyConfigured: boolean, error = '') => {
   if (mode === 'managed' && !useChatProvider.getState().managedEligible) {
     mode = 'personal'
-    error = NO_ACCESS
+    error = unavailableChat()
   }
   setChatProviderApiKey(error ? null : mode === 'personal' ? personalKey || null : 'server-managed')
   useChatProvider.setState({ mode, loading: false, keyConfigured, error })
@@ -163,7 +167,7 @@ export const configureChatProvider = async ({
   }
   const previous = useChatProvider.getState()
   if (mode === 'managed' && !previous.managedEligible) {
-    throw new ChatProviderError(NO_ACCESS)
+    throw new ChatProviderError(unavailableChat())
   }
   const target = endpoint ? personalEndpoint(endpoint.baseUrl, endpoint.model) : previous.endpoint
   const destinationChanged = target.baseUrl !== previous.endpoint.baseUrl
@@ -198,7 +202,7 @@ export const configureChatProvider = async ({
           : saved
       assertOwner()
       if (!credential) {
-        throw new ChatProviderError(MISSING)
+        throw new ChatProviderError(missingKey())
       }
       const key = keyValue(credential.apiKey)
       await stopPreviousActivity()
@@ -244,13 +248,15 @@ export const updateManagedEligibility = (eligible: boolean) => {
   if (!eligible && current.mode === 'managed') {
     personalKey = ''
     personalScope = ''
-    publish('personal', current.keyConfigured, NO_ACCESS)
+    publish('personal', current.keyConfigured, unavailableChat())
     void stopPreviousActivity().catch(() => {})
   } else if (eligible && preferredMode !== 'personal' && !initialError && !configuring) {
     publish('managed', current.keyConfigured)
     changed()
   }
 }
+
+subscribeRuntimeUser((user) => updateManagedEligibility(user.permissions.chat_api))
 
 export const clearPersonalApiKey = async (): Promise<void> => {
   assertOwner()

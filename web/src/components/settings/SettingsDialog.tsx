@@ -31,6 +31,7 @@ import { useChatStore } from '../../services/chat/store.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
   isChineseBrowser,
+  setAutoReadAloud,
   setLocale,
   setLocation,
   setThemePreference,
@@ -54,9 +55,11 @@ import { AboutSoftware } from './AboutSoftware.js'
 import { ConversationSyncSetting } from './ConversationSyncSetting.js'
 import { AccountLoginButton } from './AccountLoginButton.js'
 import { ChatProviderSetting } from './ChatProviderSetting.js'
+import { GuestHistoryCopyEntry } from './GuestHistoryMigration.js'
 import { ReplyPreferenceSetting } from './ReplyPreferenceSetting.js'
 import { useConversationSync } from '../../services/conversationSync.js'
 import { ConversationShareDialog } from '../session/ConversationShareDialog.js'
+import { showConversationShareControls } from '../session/conversationShareVisibility.js'
 import styles from './Settings.module.css'
 
 /**
@@ -142,16 +145,6 @@ const SettingsContent = () => {
         <div role="tabpanel" key={section} className={styles.content}>
           {section === 'general' ? (
             <>
-              {guest ? (
-                <SettingCell
-                  label={t('localGuest')}
-                  description={t('guestDeviceData')}
-                  status={null}
-                  action={<AccountLoginButton />}
-                />
-              ) : (
-                <AccountSetting native={native !== 'web'} />
-              )}
               <ChatProviderSetting />
               <ImageProviderSetting />
               <ReplyPreferenceSetting />
@@ -162,7 +155,13 @@ const SettingsContent = () => {
               <ThemeSetting />
               <LocaleSetting />
               <TtsVoiceSetting />
+              <AutoReadAloudSetting />
               <LocationSetting />
+              {guest ? (
+                <SettingCell label={t('accountAndSync')} status={null} action={<AccountLoginButton />} />
+              ) : (
+                <AccountSetting native={native !== 'web'} />
+              )}
             </>
           ) : section === 'about' ? (
             <>
@@ -171,6 +170,15 @@ const SettingsContent = () => {
               ) : (
                 <AboutSoftware />
               )}
+              <SettingCell
+                label={t('aboutChangelog')}
+                status={null}
+                action={
+                  <Button variant="outlined" size="m" onClick={() => window.location.assign('./changelog.html')}>
+                    {t('aboutViewChangelog')}
+                  </Button>
+                }
+              />
               {administrator && native === 'sections' ? (
                 <NativeSetting section="developer" label="nativeDeveloperSettings" />
               ) : null}
@@ -198,34 +206,40 @@ const SettingsContent = () => {
               {guest ? (
                 <SettingCell
                   label={t('conversationSyncTitle')}
+                  description={t('signInToSync')}
                   status={null}
-                  action={<AccountLoginButton label="signInToSync" />}
+                  action={<AccountLoginButton label="conversationSyncEnableConfirm" resumeSync />}
                 />
               ) : (
-                <ConversationSyncSetting disabled={historyBusy} />
+                <>
+                  <ConversationSyncSetting disabled={historyBusy} />
+                  <GuestHistoryCopyEntry />
+                </>
               )}
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
-              <SettingCell
-                label={t('conversationShareManage')}
-                description={guest ? undefined : t('conversationShareManageHint')}
-                status={null}
-                action={
-                  guest ? (
-                    <AccountLoginButton label="signInToManage" />
-                  ) : (
-                    <Button
-                      variant="outlined"
-                      size="m"
-                      className={styles.cellButton}
-                      disabled={historyBusy}
-                      onClick={() => setManagingShares(true)}
-                    >
-                      {t('conversationShareManageAction')}
-                    </Button>
-                  )
-                }
-              />
+              {showConversationShareControls ? (
+                <SettingCell
+                  label={t('conversationShareManage')}
+                  description={guest ? undefined : t('conversationShareManageHint')}
+                  status={null}
+                  action={
+                    guest ? (
+                      <AccountLoginButton label="signInToManage" />
+                    ) : (
+                      <Button
+                        variant="outlined"
+                        size="m"
+                        className={styles.cellButton}
+                        disabled={historyBusy}
+                        onClick={() => setManagingShares(true)}
+                      >
+                        {t('conversationShareManageAction')}
+                      </Button>
+                    )
+                  }
+                />
+              ) : null}
               <SettingCell
                 label={t('deleteAllSessions')}
                 status={null}
@@ -247,7 +261,9 @@ const SettingsContent = () => {
       </Modal>
       {historyImport.file ? <ImportConfirm historyImport={historyImport} /> : null}
       {historyDelete.opened ? <DeleteAllConfirm historyDelete={historyDelete} /> : null}
-      {managingShares ? <ConversationShareDialog onClose={() => setManagingShares(false)} /> : null}
+      {showConversationShareControls && managingShares ? (
+        <ConversationShareDialog onClose={() => setManagingShares(false)} />
+      ) : null}
     </>
   )
 }
@@ -319,7 +335,7 @@ const AccountSetting = ({ native }: { native: boolean }) => {
 
   return (
     <SettingCell
-      label={t('loginAccount')}
+      label={t('accountAndSync')}
       description={getRuntime().user.username}
       status={null}
       action={
@@ -338,7 +354,7 @@ const DeleteAllConfirm = ({
   historyDelete: ReturnType<typeof useHistoryDelete>
 }) => {
   const t = useTranslate()
-  const syncEnabled = useConversationSync((state) => state.enabled)
+  const syncEnabled = useConversationSync((state) => state.enabled && state.scopes.conversations)
   return (
     <Modal
       title={t('deleteAllSessionsModalTitle')}
@@ -515,6 +531,29 @@ const TtsVoiceSetting = () => {
   )
 }
 
+const AutoReadAloudSetting = () => {
+  const t = useTranslate()
+  const enabled = useSettings((state) => state.autoReadAloud)
+  return (
+    <SettingCell
+      label={t('settingsAutoReadAloud')}
+      description={t('settingsAutoReadAloudDescription')}
+      status={null}
+      action={
+        <Select
+          ariaLabel={t('settingsAutoReadAloud')}
+          value={enabled ? 'on' : 'off'}
+          options={[
+            { value: 'off', label: t('settingsAutoReadAloudOff') },
+            { value: 'on', label: t('settingsAutoReadAloudOn') },
+          ]}
+          onChange={(value) => setAutoReadAloud(value === 'on')}
+        />
+      }
+    />
+  )
+}
+
 /** 覆盖导入的二次确认，叠在设置弹窗上 */
 const ImportConfirm = ({
   historyImport,
@@ -522,7 +561,7 @@ const ImportConfirm = ({
   historyImport: ReturnType<typeof useHistoryImport>
 }) => {
   const t = useTranslate()
-  const syncEnabled = useConversationSync((state) => state.enabled)
+  const syncEnabled = useConversationSync((state) => state.enabled && state.scopes.conversations)
   return (
     <Modal
       title={t('historyImportConfirmTitle')}

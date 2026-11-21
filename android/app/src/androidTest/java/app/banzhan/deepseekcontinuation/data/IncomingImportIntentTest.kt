@@ -12,7 +12,15 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.banzhan.deepseekcontinuation.core.DeepSeekImporter
 import java.io.File
 import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -272,6 +280,76 @@ class IncomingImportIntentTest {
                 assertNotNull(expected.message)
             }
         } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun confirmedSendImportsOfficialZipWithASessionIndex() = runBlocking {
+        val databaseName = "official-share-${UUID.randomUUID()}.db"
+        val directory = File(application.cacheDir, "share").apply { mkdirs() }
+        val file = File(directory, "official-${UUID.randomUUID()}.zip")
+        val store = ViewModelStore()
+        lateinit var controller: AppController
+        lateinit var viewModel: IncomingImportViewModel
+        try {
+            ZipOutputStream(file.outputStream()).use { zip ->
+                mapOf(
+                    "manifest.json" to """{"export_format_version":3}""",
+                    "chat_sessions/synthetic.json" to """{
+                        "id":"synthetic","title":"合成会话","current_message_id":2,
+                        "messages":[
+                            {"id":1,"parent_id":null,"role":"USER","fragments":[{"type":"REQUEST","content":"合成问题"}]},
+                            {"id":2,"parent_id":1,"role":"ASSISTANT","fragments":[{"type":"RESPONSE","content":"合成回答"}]}
+                        ]
+                    }""",
+                    "chat_session_index.json" to """[{
+                        "id":"synthetic","title":"合成会话","inserted_at":"2026-11-20T00:00:00Z",
+                        "updated_at":"2026-11-20T00:00:01Z","message_count":2,"pinned":false
+                    }]""",
+                ).forEach { (path, body) ->
+                    zip.putNextEntry(ZipEntry(path))
+                    zip.write(body.toByteArray())
+                    zip.closeEntry()
+                }
+            }
+            val sharedUri = FileProvider.getUriForFile(application, "${application.packageName}.files", file)
+            val intent = Intent(Intent.ACTION_SEND).setType("application/zip")
+                .putExtra(Intent.EXTRA_STREAM, sharedUri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            instrumentation.runOnMainSync {
+                controller = AppController(application, databaseName)
+                viewModel = IncomingImportViewModel(application, SavedStateHandle())
+                store.put("controller", controller)
+                store.put("incoming", viewModel)
+            }
+            withTimeout(10_000) { controller.revisions("wait-for-startup") }
+            instrumentation.runOnMainSync {
+                assertNull(viewModel.receive(intent))
+                val pending = requireNotNull(viewModel.pending)
+                assertEquals(IncomingImportStatus.AWAITING_CONFIRMATION, pending.status)
+                assertTrue(controller.state.value.conversations.isEmpty())
+                viewModel.confirm(pending.id, controller)
+                assertEquals(IncomingImportStatus.IMPORTING, viewModel.pending?.status)
+            }
+            val terminal = setOf(IncomingImportStatus.COMPLETED, IncomingImportStatus.FAILED)
+            val completed = withTimeoutOrNull(10_000) {
+                var receipt = withContext(Dispatchers.Main) { viewModel.pending }
+                while (receipt == null || receipt.status !in terminal) {
+                    delay(40)
+                    receipt = withContext(Dispatchers.Main) { viewModel.pending }
+                }
+                receipt
+            } ?: error(withContext(Dispatchers.Main) {
+                "Import did not finish: status=${viewModel.pending?.status}, busy=${controller.state.value.busy}"
+            })
+            assertEquals(completed.error.orEmpty(), IncomingImportStatus.COMPLETED, completed.status)
+            val conversation = controller.state.value.conversations.single()
+            assertEquals(listOf(conversation.id), completed.conversationIds)
+            assertEquals("合成会话", conversation.title)
+            assertEquals(listOf("合成问题", "合成回答"), conversation.branches.single().messages.map { it.content })
+        } finally {
+            instrumentation.runOnMainSync { store.clear() }
+            application.deleteDatabase(databaseName)
             file.delete()
         }
     }

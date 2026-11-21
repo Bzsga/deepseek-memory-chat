@@ -1,4 +1,7 @@
-import { isEffort, isTemperature, MAX_PERSONA_LENGTH, type ReplyPreferences } from './replyPreferences.js'
+import {
+  defaultReplyTuning, isEffort, isReplyApproach, isReplyDetail, isReplyTone, isReplyTuning, isTemperature, legacyReplyTone, MAX_PERSONA_LENGTH,
+  replyTuningNames, type ReplyPreferences,
+} from './replyPreferences.js'
 import { create } from 'zustand'
 import type { TtsVoice } from './api/speech.js'
 import { normalizeLocation, type UserLocation } from './location.js'
@@ -16,12 +19,21 @@ type Settings = ReplyPreferences & {
   themePreference: ThemePreference
   location: UserLocation | null
   ttsVoice: TtsVoice
+  autoReadAloud: boolean
   thinking: boolean
   search: boolean
   siderCollapsed: boolean
 }
 
 const KEYS = {
+  replyTone: accountStorageKey('reply-tone'),
+  replyDetail: accountStorageKey('reply-detail'),
+  replyApproach: accountStorageKey('reply-approach'),
+  replyWarmth: accountStorageKey('reply-warmth'),
+  replyEnthusiasm: accountStorageKey('reply-enthusiasm'),
+  replyEmojis: accountStorageKey('reply-emojis'),
+  replyVisuals: accountStorageKey('reply-visuals'),
+  replyStructure: accountStorageKey('reply-structure'),
   persona: accountStorageKey('persona'),
   reasoningEffort: accountStorageKey('reasoning-effort'),
   temperature: accountStorageKey('temperature'),
@@ -29,6 +41,7 @@ const KEYS = {
   location: accountStorageKey('location'),
   themePreference: accountStorageKey('theme-preference'),
   ttsVoice: accountStorageKey('tts-voice'),
+  autoReadAloud: accountStorageKey('auto-read-aloud'),
   thinking: accountStorageKey('thinking'),
   search: accountStorageKey('search'),
   siderCollapsed: accountStorageKey('sider-collapsed'),
@@ -94,15 +107,31 @@ const initialTtsVoice = (): TtsVoice => (read(KEYS.ttsVoice) === 'tide' ? 'tide'
 // 兼容上游内部调用签名；此值不是凭据，也不会发送到 API。
 const storedEffort = read(KEYS.reasoningEffort)
 const storedTemperature = read(KEYS.temperature)
+const storedTone = read(KEYS.replyTone)
+const storedDetail = read(KEYS.replyDetail)
+const storedApproach = read(KEYS.replyApproach)
+const storedPersona = (read(KEYS.persona) ?? '').slice(0, MAX_PERSONA_LENGTH)
+const storedReplyTuning = { ...defaultReplyTuning }
+for (const name of replyTuningNames) {
+  const value = read(KEYS[name])
+  if (isReplyTuning(value)) {
+    storedReplyTuning[name] = value
+  }
+}
 export const useSettings = create<Settings>(() => ({
   apiKey: null,
-  persona: (read(KEYS.persona) ?? '').slice(0, MAX_PERSONA_LENGTH),
+  ...storedReplyTuning,
+  replyTone: isReplyTone(storedTone) ? storedTone : legacyReplyTone(storedPersona),
+  replyDetail: isReplyDetail(storedDetail) ? storedDetail : 'default',
+  replyApproach: isReplyApproach(storedApproach) ? storedApproach : 'default',
+  persona: storedPersona,
   reasoningEffort: isEffort(storedEffort) ? storedEffort : '',
   temperature: isTemperature(storedTemperature) ? storedTemperature : '',
   locale: initialLocale(),
   location: initialLocation(),
   themePreference: initialThemePreference(),
   ttsVoice: initialTtsVoice(),
+  autoReadAloud: read(KEYS.autoReadAloud) === 'true',
   thinking: read(KEYS.thinking) === 'true',
   search: read(KEYS.search) === 'true',
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
@@ -134,6 +163,11 @@ export const setTtsVoice = (ttsVoice: TtsVoice) => {
   useSettings.setState({ ttsVoice })
 }
 
+export const setAutoReadAloud = (autoReadAloud: boolean) => {
+  write(KEYS.autoReadAloud, autoReadAloud ? 'true' : null)
+  useSettings.setState({ autoReadAloud })
+}
+
 export const setThinking = (thinking: boolean) => {
   write(KEYS.thinking, String(thinking))
   useSettings.setState({ thinking })
@@ -150,6 +184,12 @@ export const setSiderCollapsed = (siderCollapsed: boolean) => {
 }
 
 export function setReplyPreferences(values: ReplyPreferences) {
+  write(KEYS.replyTone, values.replyTone)
+  write(KEYS.replyDetail, values.replyDetail === 'default' ? null : values.replyDetail)
+  write(KEYS.replyApproach, values.replyApproach === 'default' ? null : values.replyApproach)
+  for (const name of replyTuningNames) {
+    write(KEYS[name], values[name] === 'default' ? null : values[name])
+  }
   write(KEYS.persona, values.persona || null)
   write(KEYS.reasoningEffort, values.reasoningEffort || null)
   write(KEYS.temperature, values.temperature || null)
@@ -157,6 +197,10 @@ export function setReplyPreferences(values: ReplyPreferences) {
 }
 
 export const preferenceNames = [
+  'replyTone',
+  'replyDetail',
+  'replyApproach',
+  ...replyTuningNames,
   'persona',
   'reasoningEffort',
   'temperature',
@@ -170,14 +214,39 @@ export const preferenceNames = [
 export type PreferenceName = (typeof preferenceNames)[number]
 export type CloudPreferences = Pick<Settings, PreferenceName>
 
-export const readCloudPreferences = (): CloudPreferences => {
-  const { locale, themePreference, ttsVoice, thinking, search, siderCollapsed, persona, reasoningEffort, temperature } =
-    useSettings.getState()
-  return { locale, themePreference, ttsVoice, thinking, search, siderCollapsed, persona, reasoningEffort, temperature }
+export const readCloudPreferences = (): Partial<CloudPreferences> => {
+  const state = useSettings.getState()
+  const { locale, themePreference, ttsVoice, thinking, search, siderCollapsed, replyTone, replyDetail, replyApproach,
+    persona, reasoningEffort, temperature } =
+    state
+  const preferences: Partial<CloudPreferences> = {
+    locale, themePreference, ttsVoice, thinking, search, siderCollapsed, persona, reasoningEffort, temperature,
+    ...(replyTone !== legacyReplyTone(persona) ? { replyTone } : {}),
+    ...(replyDetail !== 'default' ? { replyDetail } : {}),
+    ...(replyApproach !== 'default' ? { replyApproach } : {}),
+  }
+  for (const name of replyTuningNames) {
+    if (state[name] !== 'default') {
+      preferences[name] = state[name]
+    }
+  }
+  return preferences
 }
 
 export const validPreference = (name: PreferenceName, value: unknown): boolean => {
   switch (name) {
+    case 'replyTone':
+      return isReplyTone(value)
+    case 'replyDetail':
+      return isReplyDetail(value)
+    case 'replyApproach':
+      return isReplyApproach(value)
+    case 'replyWarmth':
+    case 'replyEnthusiasm':
+    case 'replyEmojis':
+    case 'replyVisuals':
+    case 'replyStructure':
+      return isReplyTuning(value)
     case 'persona':
       return typeof value === 'string' && value.length <= MAX_PERSONA_LENGTH
     case 'reasoningEffort':

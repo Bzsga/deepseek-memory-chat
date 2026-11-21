@@ -294,6 +294,37 @@
   }
 }
 
+.imageReferences {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 12px 0;
+  list-style: none;
+  cursor: default;
+}
+
+.imageReference {
+  width: 44px;
+  height: 44px;
+  border-radius: 9px;
+
+  .remove {
+    top: 2px;
+    right: 2px;
+  }
+
+  .remove:focus-visible {
+    outline: 2px solid var(--dsw-alias-brand-primary);
+  }
+
+  .remove:disabled {
+    opacity: .6;
+    cursor: default;
+  }
+}
+
 .right {
   display: flex;
   flex-shrink: 0;
@@ -347,11 +378,16 @@
 
 .modeTabs {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 2px;
   padding: 3px;
   border-radius: 12px;
   background: var(--dsw-alias-bg-layer-3);
+}
+
+.modeTabs .modeTab {
+  white-space: nowrap;
 }
 
 .modeTab {
@@ -372,6 +408,7 @@
   svg {
     width: 15px;
     height: 15px;
+    flex-shrink: 0;
   }
   &:disabled {
     opacity: 0.5;
@@ -383,6 +420,36 @@
   background: var(--dsw-alias-bg-base);
   color: var(--dsw-alias-brand-text);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
+}
+
+.imageCount {
+  flex-shrink: 0;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+@media not all and (min-width: 768px) {
+  .modeRow {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: 4px;
+  }
+
+  .modeRow > .imageHint {
+    flex-basis: 100%;
+    padding: 0;
+  }
+
+  .imageCount {
+    margin-inline-start: auto;
+  }
 }
 
 .addButton {
@@ -461,6 +528,13 @@
   }
   .modeRow {
     padding-inline: 10px;
+  }
+  .modeTabs .modeTab {
+    gap: 4px;
+    padding-inline: 6px;
+  }
+  .imageCount {
+    padding-inline: 4px;
   }
   .imageHint {
     font-size: 10px;

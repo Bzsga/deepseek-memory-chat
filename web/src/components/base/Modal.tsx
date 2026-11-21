@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { useEffect, useId, useRef, type ReactNode } from 'react'
+import { useId, useLayoutEffect, useRef, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { useMobileViewport } from '../../app/viewport.js'
 import { useTranslate } from '../../i18n/index.js'
@@ -8,7 +8,7 @@ import { IconButton } from './IconButton.js'
 import styles from './Modal.module.css'
 
 /** 当前打开的弹窗，后打开的在末尾；叠放时 Esc 只关闭最上层 */
-const openModals: object[] = []
+const openModals: HTMLDivElement[] = []
 
 /** 遮罩 + 居中卡片，Esc / 点遮罩关闭 */
 export const Modal = ({
@@ -19,6 +19,7 @@ export const Modal = ({
   requireBackdropPointerDown = false,
   className,
   mainClassName,
+  returnFocusTo,
   onClose,
 }: {
   title: ReactNode
@@ -31,20 +32,26 @@ export const Modal = ({
   className?: string
   /** 内容区的 class */
   mainClassName?: string
+  /** A trigger that is disabled by the same update that opens this dialog. */
+  returnFocusTo?: RefObject<HTMLElement>
   onClose: () => void
 }) => {
   const t = useTranslate()
   const titleId = useId()
-  const overlayRef = useMobileViewport(true)
+  const overlayRef = useMobileViewport(true, { followVisualViewport: true })
   const contentRef = useRef<HTMLDivElement>(null)
   const backdropPressed = useRef(false)
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
-  useEffect(() => {
-    const token = {}
-    const previousFocus =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
-    openModals.push(token)
+  useLayoutEffect(() => {
+    const overlay = overlayRef.current
+    if (!overlay) {
+      return
+    }
+    const previousFocus = returnFocusTo?.current ??
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null)
+    openModals.at(-1)?.setAttribute('data-modal-obscured', '')
+    openModals.push(overlay)
     const focusFrame = requestAnimationFrame(() => {
       const first = contentRef.current?.querySelector<HTMLElement>(
         'input:not(:disabled), textarea:not(:disabled), select:not(:disabled), button:not(:disabled), a[href]'
@@ -52,10 +59,10 @@ export const Modal = ({
       ;(first ?? contentRef.current)?.focus({ preventScroll: true })
     })
     const onKeyDown = (event: KeyboardEvent) => {
-      if (openModals.at(-1) !== token) {
+      if (openModals.at(-1) !== overlay) {
         return
       }
-      if (event.key === 'Escape' && openModals.at(-1) === token) {
+      if (event.key === 'Escape') {
         onCloseRef.current()
       } else if (event.key === 'Tab') {
         const targets = Array.from(
@@ -88,14 +95,21 @@ export const Modal = ({
     }
     document.addEventListener('keydown', onKeyDown)
     return () => {
-      openModals.splice(openModals.indexOf(token), 1)
+      const wasTop = openModals.at(-1) === overlay
+      openModals.splice(openModals.indexOf(overlay), 1)
       cancelAnimationFrame(focusFrame)
       document.removeEventListener('keydown', onKeyDown)
-      if (previousFocus?.isConnected) {
-        previousFocus.focus({ preventScroll: true })
+      if (wasTop) {
+        const revealed = openModals.at(-1)
+        revealed?.removeAttribute('data-modal-obscured')
+        requestAnimationFrame(() => {
+          if (openModals.at(-1) === revealed && previousFocus?.isConnected) {
+            previousFocus.focus({ preventScroll: true })
+          }
+        })
       }
     }
-  }, [])
+  }, [overlayRef, returnFocusTo])
 
   return createPortal(
     <div

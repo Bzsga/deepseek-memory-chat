@@ -70,7 +70,11 @@ data class UserUsage(
     val weeklyLimitOverride: Int? = null,
     val enabled: Boolean = true,
     val managedEligible: Boolean = false,
-)
+    val permissions: ServicePermissions? = null,
+    val inviteRedeemable: Boolean? = null,
+) {
+    val servicePermissions: ServicePermissions get() = permissions ?: ServicePermissions.fromLegacy(managedEligible)
+}
 
 data class AdminUsersPage(val limit: Int, val offset: Int, val total: Long, val users: List<UserUsage>,
     val week: String? = null, val resetAt: String? = null)
@@ -82,6 +86,7 @@ data class AdminRegistrationInvite(
     val createdAt: String = "",
     val usedAt: String? = null,
     val usedBy: String? = null,
+    val permissions: ServicePermissions = ServicePermissions.All,
 )
 
 /** Returned once to the active administrator UI; never persisted in AppState or backups. */

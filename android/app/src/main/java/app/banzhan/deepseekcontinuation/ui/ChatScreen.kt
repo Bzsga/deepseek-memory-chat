@@ -5,13 +5,16 @@ package app.banzhan.deepseekcontinuation.ui
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.ClipData
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.MediaStore
+import android.view.LayoutInflater
 import android.webkit.*
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import app.banzhan.deepseekcontinuation.R
 import app.banzhan.deepseekcontinuation.data.*
 import app.banzhan.deepseekcontinuation.core.ImportedConversation
 import kotlinx.coroutines.CompletableDeferred
@@ -46,12 +50,14 @@ internal fun ChatScreen(
     onContinuationSaved: (String) -> Unit,
     onOrganize: suspend (ByteArray, String?) -> Unit,
     onMemories: () -> Unit,
-    onAccount: () -> Unit,
+    onAccount: (resumeSyncSettings: Boolean) -> Unit,
     onSettings: suspend (NativeSettingsSection?) -> Unit,
     onChatProvider: suspend (String, String, String?, String?, String?) -> Unit,
     onThemePreference: (String?, String) -> Unit,
     initialFragment: String = "",
     onReturnFromSettings: (() -> Unit)? = null,
+    webViewMajor: Int,
+    webViewHandlesIme: Boolean,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -80,13 +86,20 @@ internal fun ChatScreen(
     val chooseFile = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val capture = capturePath?.let(::File)
         capturePath = null
+        val callback = fileResult
+        fileResult = null
         val selected = if (capture != null) {
-            if (result.resultCode == Activity.RESULT_OK && capture.isFile && capture.length() > 0 && fileResult != null)
+            if (result.resultCode == Activity.RESULT_OK && capture.isFile && capture.length() > 0 && callback != null)
                 arrayOf(FileProvider.getUriForFile(context, "${context.packageName}.files", capture))
             else { capture.delete(); null }
-        } else WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-        fileResult?.onReceiveValue(selected)
-        fileResult = null
+        } else {
+            parseChatFilePickerResult(result.resultCode, result.data, context.packageName).also {
+                if (it == null && callback != null && result.resultCode == Activity.RESULT_OK) {
+                    Toast.makeText(context, "未能读取所选文件，请换一个文件来源后重试。", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        callback?.onReceiveValue(selected)
     }
     val recordAudio = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         audioPermissionPending = false
@@ -126,7 +139,6 @@ internal fun ChatScreen(
         }
     }
 
-    val webViewMajor = remember { WebView.getCurrentWebViewPackage()?.versionName?.substringBefore('.')?.toIntOrNull() ?: 0 }
     if (webViewMajor in 1..104) {
         if (initialFragment.isNotEmpty()) {
             LaunchedEffect(Unit) { currentSettings(null) }
@@ -194,7 +206,8 @@ internal fun ChatScreen(
             if (cancelled is kotlinx.coroutines.TimeoutCancellationException) error = "聊天列表保存超时，请重新加载以继续。" else throw cancelled
         } catch (failure: Exception) { error = failure.message ?: "聊天列表导入失败，请重新加载。" }
     }
-    Column(Modifier.fillMaxSize().imePadding()) {
+    val keyboardPadding = if (webViewHandlesIme) Modifier else Modifier.imePadding()
+    Column(Modifier.fillMaxSize().then(keyboardPadding)) {
         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
         error?.let { message ->
             Surface(color = MaterialTheme.colorScheme.errorContainer) {
@@ -222,18 +235,26 @@ internal fun ChatScreen(
                             if (returnsToMemory) returnFromSettings?.invoke()
                         },
                         onLoading = { loading = it },
-                        onMessage = { raw, active, reply ->
+                        personalImageSessionActive = {
+                            session?.token == liveSession?.token && session?.user?.id == liveSession?.user?.id
+                        },
+                        onMessage = { raw, active, reply, personalImages ->
                             scope.launch {
                                 var id = ""
                                 var safeError: String? = "聊天消息格式无效。"
                                 try {
-                                    if (!active() || session != liveSession) return@launch
+                                    if (!active()) return@launch
                                     require(raw.toByteArray().size <= CHAT_BRIDGE_LIMIT) { "传递内容过大。" }
                                     val message = Json.parseToJsonElement(raw).jsonObject
+                                    val type = message["type"]?.jsonPrimitive?.content
+                                    if (type?.startsWith("image.") == true) {
+                                        personalImages.message(type, message, raw.length)
+                                        return@launch
+                                    }
+                                    if (session != liveSession) return@launch
                                     require(message["version"]?.jsonPrimitive?.int == 1) { "聊天连接版本不匹配。" }
                                     id = message["id"]?.jsonPrimitive?.content.orEmpty()
                                     require(id.isNotBlank() && id.length <= 100) { "请求标识无效。" }
-                                    val type = message["type"]?.jsonPrimitive?.content
                                     safeError = if (type == "chat.provider" || type == "chat.theme") "未能同步聊天设置。" else null
                                     when (type) {
                                         "archive.ready" -> {
@@ -266,7 +287,9 @@ internal fun ChatScreen(
                                             currentOrganize(bytes, target)
                                         }
                                         "memory.open" -> currentMemories()
-                                        "account.open" -> currentAccount()
+                                        "account.open" -> currentAccount(
+                                            (message["payload"] as? JsonObject)?.stringField("section") == "data"
+                                        )
                                         "settings.open" -> currentSettings(NativeSettingsSection.fromPayload(message["payload"]))
                                         "share.link" -> {
                                             val link = chatShareLink(message["payload"]!!.jsonObject)
@@ -292,7 +315,7 @@ internal fun ChatScreen(
                             }
                         },
                         onExport = ::stageExport,
-                        onAccount = { currentAccount() },
+                        onAccount = { currentAccount(false) },
                         onChooseFile = { callback, params ->
                             fileResult?.onReceiveValue(null)
                             capturePath?.let(::File)?.delete(); capturePath = null
@@ -343,16 +366,25 @@ internal fun ChatScreen(
                     browser = managed; web = managed.view
                     managed.continuation(continuation)
                     managed.load(session, initialFragment)
-                    managed.view
+                    managed.view.apply { tag = managed }
                 },
                 onRelease = { released ->
-                    browser?.takeIf { it.view === released }?.close()
+                    (released.tag as? ChatBrowser)?.close()
+                    released.tag = null
                     if (web === released) { web = null; browser = null }
                     released.destroy()
                 },
             )
         }
     }
+}
+
+internal fun parseChatFilePickerResult(resultCode: Int, data: Intent?, packageName: String): Array<Uri>? {
+    // WebView's default parser reads only Intent.data. Gallery and Files can return ClipData instead.
+    return ActivityResultContracts.GetMultipleContents().parseResult(resultCode, data)
+        .filter { it.scheme == ContentResolver.SCHEME_CONTENT && it.host != null && it.host != "$packageName.files" }
+        .takeIf { it.isNotEmpty() }
+        ?.toTypedArray()
 }
 
 private fun JsonObject.stringField(name: String): String? = (get(name) as? JsonPrimitive)?.takeIf { it.isString }?.content
@@ -368,21 +400,24 @@ internal fun trustedChatPage(url: String): Boolean = runCatching {
         uri.userInfo == null && uri.path == "/deepseek/"
 }.getOrDefault(false)
 
-@SuppressLint("SetJavaScriptEnabled")
+@SuppressLint("SetJavaScriptEnabled", "InflateParams")
 private class ChatBrowser(
     private val context: Context,
     private val onError: (String) -> Unit,
     private val onLoading: (Boolean) -> Unit,
     private val onHistory: (String, Boolean) -> Unit,
-    private val onMessage: (String, () -> Boolean, (String) -> Unit) -> Unit,
+    private val personalImageSessionActive: () -> Boolean,
+    private val onMessage: (String, () -> Boolean, (String) -> Unit, PersonalImageChannel) -> Unit,
     private val onExport: (File, String, String) -> Unit,
     private val onAccount: () -> Unit,
     private val onChooseFile: (ValueCallback<Array<Uri>>, WebChromeClient.FileChooserParams) -> Unit,
     private val onMicrophone: (PermissionRequest) -> Unit,
     private val onMicrophoneCanceled: (PermissionRequest) -> Unit,
 ) {
-    val view = WebView(context)
+    // Chromium reads contentSensitivity during WebView initialization.
+    val view = LayoutInflater.from(context).inflate(R.layout.chat_webview, null, false) as WebView
     private var port: WebMessagePort? = null
+    private var personalImages: PersonalImageChannel? = null
     private var pending: ChatContinuationDraft? = null
     private var sentId: String? = null
     private var exportPort: WebMessagePort? = null
@@ -428,7 +463,8 @@ private class ChatBrowser(
             override fun onPageFinished(web: WebView, url: String) {
                 onLoading(false)
                 onHistory(url, web.canGoBack())
-                if (!disposed && trustedChatPage(url) && trustedChatPage(web.url.orEmpty())) connect()
+                // Same-document history updates can also finish. Keep the active channels for this page.
+                if (port == null && !disposed && trustedChatPage(url) && trustedChatPage(web.url.orEmpty())) connect()
             }
             override fun onReceivedError(web: WebView, request: WebResourceRequest, error: WebResourceError) {
                 if (request.isForMainFrame) { onLoading(false); onError("聊天暂时无法连接，请检查网络后重试。") }
@@ -501,18 +537,23 @@ private class ChatBrowser(
 
     private fun connect() {
         val channels = view.createWebMessageChannel()
-        port = channels[0]
         val local = channels[0]
+        port = local
+        val active = { !disposed && local === port && trustedChatPage(view.url.orEmpty()) }
+        val images = PersonalImageChannel(
+            active = { active() && personalImageSessionActive() },
+            post = { local.postMessage(WebMessage(it)) },
+        )
+        personalImages = images
         local.setWebMessageCallback(object : WebMessagePort.WebMessageCallback() {
             override fun onMessage(received: WebMessagePort, message: WebMessage) {
-                val active = { !disposed && received === port && trustedChatPage(view.url.orEmpty()) }
-                if (active())
-                    onMessage(message.data.orEmpty(), active) { reply ->
+                if (received === local && active())
+                    onMessage(message.data.orEmpty(), active, { reply ->
                         if (active()) runCatching { received.postMessage(WebMessage(reply)) }
-                    }
+                    }, images)
             }
         })
-        view.postWebMessage(WebMessage("{\"type\":\"deepseek.connect\",\"version\":1,\"settingsSections\":true,\"archiveImport\":true,\"chatProvider\":true,\"themePreference\":true,\"organizationUsesChatProvider\":true}", arrayOf(channels[1])), Uri.parse(CHAT_ORIGIN))
+        view.postWebMessage(WebMessage("{\"type\":\"deepseek.connect\",\"version\":1,\"settingsSections\":true,\"archiveImport\":true,\"chatProvider\":true,\"themePreference\":true,\"organizationUsesChatProvider\":true,\"imageOverlayHistory\":true,\"personalImage\":true}", arrayOf(channels[1])), Uri.parse(CHAT_ORIGIN))
         sendPending()
         connectExport()
     }
@@ -574,6 +615,7 @@ private class ChatBrowser(
     private fun resetPorts() {
         archiveReady = false
         frameAck?.second?.cancel(); frameAck = null
+        personalImages?.close(); personalImages = null
         runCatching { port?.close() }; port = null; sentId = null
         runCatching { exportPort?.close() }; exportPort = null
         transfer?.cancel(); transfer = null

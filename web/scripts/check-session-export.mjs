@@ -23,14 +23,15 @@ try {
   )
   assert.equal(compile.status, 0, compile.stdout + compile.stderr)
   globalThis.__API_ORIGIN__ = '/deepseek-api/chat'
-  globalThis.window = { dispatchEvent() {} }
+  globalThis.window = new EventTarget()
+  globalThis.localStorage = { getItem: () => null }
   const load = (name) => import(pathToFileURL(join(output, 'src', name)))
   const runtime = await load('services/runtime.js')
   runtime.initializeRuntime({
     provider: 'DeepSeek',
     model: 'synthetic',
     features: {},
-    user: { id: 'synthetic-export-owner', username: 'synthetic', role: 'user' },
+    user: { id: 'synthetic-export-owner', username: 'synthetic', role: 'user', managed_eligible: true },
   })
   const { createSessionExport, sessionExportToArchive, saveSessionExport, MAX_SESSION_JSON_BYTES } =
     await load('services/chat/sessionExport.js')
@@ -128,6 +129,13 @@ try {
   const jpeg = normalizeUploadFiles([new File([png], '', { type: 'image/jpg' })])[0]
   assert.equal(jpeg.name, 'image.jpg')
   assert.equal(jpeg.type, 'image/jpeg')
+  const album = normalizeUploadFiles([
+    new File([png], 'gallery.PNG', { type: 'application/octet-stream' }),
+  ])[0]
+  assert.equal(album.type, 'image/png')
+  assert.equal(album.name, 'gallery.PNG')
+  assert.equal(validateFiles([album], 0), null)
+  assert.deepEqual(Buffer.from(await album.arrayBuffer()), png)
 
   const now = 1700000000000
   const uploaded = {
@@ -177,8 +185,8 @@ try {
       {
         id: 'u2',
         role: 'user',
-        content: '再画一张',
-        files: [],
+        content: '把这张照片改成海边日出',
+        files: [uploaded],
         createdAt: now + 2,
         parentId: 'a2',
         selectedChildId: 'a3',
@@ -186,6 +194,7 @@ try {
       {
         ...reply('a3', '', 'u2'),
         imageGeneration: true,
+        imageOrigin: 'edit',
         imageModel: 'synthetic-image',
         blocks: [generated],
       },
@@ -244,6 +253,10 @@ try {
     const restored = toLocalSession(data)
     assert.equal(restored.session.messages.length, 5)
     assert.deepEqual(restored.session.continuity, session.continuity)
+    const [restoredSource, restoredEdit] = restored.session.messages.slice(-2)
+    assert.equal(restoredEdit.imageOrigin, 'edit')
+    assert.equal(restoredEdit.parentId, restoredSource.id)
+    assert.notEqual(restoredEdit.blocks[0].id, restoredSource.files[0].id)
     assert.equal(restored.images.size, 2)
     for (const path of restored.images.keys()) {
       assert.deepEqual(Buffer.from(await entries.get(path).arrayBuffer()), png)
@@ -287,14 +300,16 @@ try {
   globalThis.fetch = async (_url, init) => {
     requests += 1
     assert.equal(init.credentials, 'same-origin')
+    assert.equal(init.body.get('file').type, 'image/png')
+    assert.equal(init.body.has('purpose'), false)
     return new Response(JSON.stringify({ error: { message: 'synthetic upload busy' } }), {
       status: 503,
       headers: { 'Content-Type': 'application/json' },
     })
   }
-  const first = uploadAttachment('', 'synthetic-upload', normalized, normalized.name, true)
-  assert.equal(uploadAttachment('', 'synthetic-upload', normalized, normalized.name, true), first)
-  await assert.rejects(first)
+  const first = uploadAttachment('server-managed', 'synthetic-upload', album, album.name, true)
+  assert.equal(uploadAttachment('server-managed', 'synthetic-upload', album, album.name, true), first)
+  await assert.rejects(first, (error) => error instanceof ApiError && error.status === 503)
   assert.equal(requests, 1)
   assert.deepEqual(
     describeReply({
@@ -310,7 +325,7 @@ try {
   await assert.rejects(() => createSessionExport(session, 'zip'))
   for (const id of [uploaded.id, generated.id]) releaseGeneratedImage(id)
   console.log(
-    'Session export and upload checks passed: branch/memory/image roundtrip, safe JSON import, camera naming, single dispatch, image error and account invalidation.'
+    'Session export and upload checks passed: branch/memory/image roundtrip, safe JSON import, camera and album normalization, single dispatch, image error and account invalidation.'
   )
 } finally {
   if (!output.startsWith(root + sep)) throw new Error('Temporary output escaped project')

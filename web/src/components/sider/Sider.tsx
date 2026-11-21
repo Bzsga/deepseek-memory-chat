@@ -15,7 +15,7 @@ import {
   sendNative,
   subscribeNativeBridge,
 } from '../../services/nativeBridge.js'
-import { isGuestWorkspace } from '../../services/runtime.js'
+import { getRuntime, subscribeRuntimeUser } from '../../services/runtime.js'
 import { setSiderCollapsed } from '../../services/settings.js'
 import { groupSessions } from '../../services/chat/sessionGroups.js'
 import { newChat, removeSession, useChatStore } from '../../services/chat/store.js'
@@ -24,7 +24,6 @@ import { Button } from '../base/Button.js'
 import { IconButton } from '../base/IconButton.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
-import { AccountLoginButton } from '../settings/AccountLoginButton.js'
 import { openSettings } from '../settings/settingsDialogState.js'
 import { closeMobileSider, useMobileSider } from './mobileSiderState.js'
 import { SessionItem } from './SessionItem.js'
@@ -33,11 +32,13 @@ import styles from './Sider.module.css'
 /** 展开的侧边栏：名称与收起按钮、开启新对话、按时间分组的会话列表、底部设置；移动端放在抽屉里，收起按钮关闭抽屉 */
 export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   const t = useTranslate()
-  const guest = isGuestWorkspace()
   const quota = useWeeklyQuota((state) => state.quota)
   const personalProvider = useChatProvider((state) => state.mode === 'personal')
-  const managedEligible = useChatProvider((state) => state.managedEligible)
-  const syncEnabled = useConversationSync((state) => state.enabled)
+  const hasManagedQuota = useSyncExternalStore(subscribeRuntimeUser, () => {
+    const { chat_api, image_api } = getRuntime().user.permissions
+    return chat_api || image_api
+  })
+  const syncEnabled = useConversationSync((state) => state.enabled && state.scopes.conversations)
   const sessions = useChatStore((state) => state.sessions)
   const activeId = useChatStore((state) => state.activeId)
   const [now, setNow] = useState(Date.now)
@@ -97,8 +98,7 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   return (
     <div className={clsx(styles.sider, mobile && styles.mobile)}>
       <div className={styles.top}>
-        <div className={styles.appName}>{guest ? t('localGuest') : t('appName')}</div>
-        {guest ? <AccountLoginButton /> : null}
+        <div className={styles.appName} title={t('appName')}>{t('appName')}</div>
         <IconButton
           size="m"
           icon={<IconPanelLeftOutline16 />}
@@ -151,7 +151,7 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
         </div>
       </div>
       <div className={styles.bottom}>
-        {quota && managedEligible ? (
+        {quota && hasManagedQuota ? (
           <div
             className={styles.weeklyQuota}
             title={t(personalProvider ? 'managedWeeklyResetDescription' : 'weeklyResetDescription')}

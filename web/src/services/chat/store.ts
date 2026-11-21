@@ -1,6 +1,7 @@
 import { activeImageProvider, imageConfigurationIdentity, requestPersonalImage } from '../imageProvider.js'
 import { create } from 'zustand'
 import { createId } from '../../utils/id.js'
+import { openChatProviderForIssue, type ChatProviderIssue } from '../../components/settings/settingsDialogState.js'
 import { ApiError, streamMessage } from '../api/client.js'
 import {
   cancelRemoteImageJob, createImageJob, getImageJob, getImageJobResult,
@@ -10,12 +11,13 @@ import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
 import { getChatProviderScope, isFileProviderScope } from '../chatProvider.js'
-import { modelParameters } from '../replyPreferences.js'
+import { IMAGE_EDIT_ACCEPT, MAX_IMAGE_EDIT_MB, resolveImageEditSources } from '../imageEditSource.js'
+import { modelParameters, replyStylePrompt } from '../replyPreferences.js'
 import { useSettings } from '../settings.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
 import { validateSharedSource } from './sharedSource.js'
-import { filterImageActionEvent, finishImageActionText, imageActionPrompt, imageActionSystem,
+import { filterImageActionEvent, finishImageActionText, imageActionPrompt, imageActionSystem, isDirectImageEditRequest,
   imageActionTrace, newImageActionNonce, newImageActionStream } from './imageAction.js'
 import {
   clearAllDrafts,
@@ -64,6 +66,7 @@ import {
   type SessionSummary,
   type UserMessage,
 } from './types.js'
+import { buildReplyView } from './view.js'
 
 /** deepseek-flash 同时支持深度思考与图片输入 */
 const MODEL: ChatModel = 'deepseek-flash'
@@ -150,6 +153,8 @@ const saveLocalSession = async (session: Session, files: db.StoredFile[] = []): 
 }
 /** 保存失败时保留原件，重试成功后才释放。 */
 const pendingFiles = new Map<string, db.StoredFile[]>()
+export const loadMessageFile = async (sessionId: string, fileId: string) =>
+  pendingFiles.get(sessionId)?.find((file) => file.id === fileId)?.blob ?? db.loadFile(fileId)
 const deletingSessions = new Set<string>()
 const deletionTasks = new Set<Promise<boolean>>()
 const continuationTasks = new Map<string, Promise<void>>()
@@ -658,6 +663,50 @@ export const appendNativeArchiveChat = async (session: Session, live: () => bool
   set(state => ({sessions: sortSessions([...state.sessions.filter(item => item.id !== saved.id), toSessionSummary(saved)])}))
 }
 
+export const branchToNewChat = async (sessionId: string, replyId: string, title: string) => {
+  const source = getSession(sessionId)
+  if (!source || !get().ready || get().activeId !== sessionId) {throw new Error('Conversation unavailable')}
+  const inWorkspace = captureConversationDataGuard(getRuntime().user.id, sessionId)
+  const canWrite = () => inWorkspace() && get().activeId === sessionId &&
+    getSession(sessionId) === source && !getStreamController(sessionId)
+  const path = getVisibleMessages(source)
+  const end = path.findIndex((message) => message.id === replyId && message.role === 'assistant' && message.status === 'done')
+  if (end === -1 || !canWrite()) {throw new Error('Reply unavailable')}
+
+  const messages = path.slice(0, end + 1).map((message): Message =>
+    message.role === 'assistant' && (message.imageJob || message.status === 'pending' || message.status === 'streaming')
+      ? { ...message, imageJob: undefined, prefix: false,
+          status: message.status === 'done' ? 'done' : 'stopped' }
+      : message
+  )
+  const messageIds = new Set(messages.map((message) => message.id))
+  const comesFromPrefix = ({ sourceIds }: { sourceIds: string[] }) => sourceIds.every((id) => messageIds.has(id))
+  const memory = source.longMemory
+  const shared = source.sharedSource
+  const now = Date.now()
+  const branch = normalizeSession({
+    id: createId(), title, createdAt: now, updatedAt: now, messages,
+    ...(source.continuity ? { continuity: source.continuity } : {}),
+    ...(shared?.messageIds?.length && shared.messageIds.every((id) => messageIds.has(id))
+      ? { sharedSource: shared } : {}),
+    ...(memory ? { longMemory: { ...memory, entries: memory.entries.filter(comesFromPrefix),
+      segments: memory.segments.filter(comesFromPrefix).map((segment) =>
+        segment.status === 'started' ? { ...segment, status: 'interrupted' as const } : segment
+      ) } } : {}),
+  })
+  const pending = pendingFiles.get(sessionId)
+  if (pending?.length) {await saveLocalSession(source, pending)}
+  const saved = await db.appendSession(branch, canWrite)
+  if (!canWrite()) {return}
+  touchSession(saved.id)
+  set((state) => ({
+    sessions: sortSessions([toSessionSummary(saved), ...state.sessions]),
+    sessionCache: { ...state.sessionCache, [saved.id]: saved },
+    activeId: saved.id,
+  }))
+  trimSessionCache()
+}
+
 export const appendImportedSession = (incoming: Session, expectedAccountId: string,
   files: db.StoredFile[] = [], externalGuard: () => boolean = () => true): Promise<string> => {
   if (!isSessionActive() || getRuntime().user.id !== expectedAccountId) {
@@ -848,6 +897,12 @@ const removeSessionData = async (id: string): Promise<boolean> => {
 /** Account or host teardown stops local waiting while durable jobs remain recoverable. */
 export const suspendReply = (sessionId: string) => getStreamController(sessionId)?.abort()
 
+export const suspendChatReply = (sessionId: string) => {
+  if (!imageWatches.has(sessionId)) {
+    suspendReply(sessionId)
+  }
+}
+
 export const stopReply = (sessionId: string) => {
   const watch = imageWatches.get(sessionId)
   if (watch) {
@@ -931,9 +986,12 @@ export const sendMessage = (targetSessionId: string | null) => {
   return true
 }
 
-/** An explicit text-to-image action. This path never retries an uncertain or failed request. */
-export const sendImageMessage = (targetSessionId: string | null, count = 1): boolean => {
+/** An explicit image generation or original-image edit. */
+export const sendImageMessage = (targetSessionId: string | null, count = 1, sources?: readonly File[]): boolean => {
   if (!activeImageProvider() || !Number.isInteger(count) || count < 1 || count > 5) {return false}
+  const selection = sources ? resolveImageEditSources(sources) : null
+  if (selection && (!('sources' in selection) || count !== 1)) {return false}
+  const originals = selection?.sources ?? []
   const draft = getDraft(targetSessionId)
   if (
     !get().ready ||
@@ -975,11 +1033,15 @@ export const sendImageMessage = (targetSessionId: string | null, count = 1): boo
   if (!session) {
     return false
   }
+  const attachments: FileAttachment[] = originals.map((original) => ({
+    id: createId(), serverId: null, name: original.name, size: original.size,
+    isImage: true, mimeType: original.type,
+  }))
   const question: UserMessage = {
     id: createId(),
     role: 'user',
     content: draft.text,
-    files: [],
+    files: attachments,
     createdAt: now,
   }
   const reply: AssistantMessage = {
@@ -987,9 +1049,16 @@ export const sendImageMessage = (targetSessionId: string | null, count = 1): boo
     imageGeneration: true,
     imageJob: newLocalImageJob(Array(count).fill(question.content)),
     imagePrompt: question.content,
+    ...(attachments.length ? { imageOrigin: 'edit' as const } : {}),
     thinking: false,
     search: false,
     prefix: false,
+  }
+  if (attachments.length) {
+    pendingFiles.set(sessionId, [
+      ...(pendingFiles.get(sessionId) ?? []),
+      ...attachments.map(({ id }, index) => ({ id, blob: originals[index] })),
+    ])
   }
   updateSession(sessionId, (current) => ({
     ...appendBranch(current, getVisibleMessages(current).at(-1)?.id ?? null, [question, reply]),
@@ -1077,6 +1146,18 @@ async function readBatchImage(id: string, prompt: string, mode: 'create' | 'resu
 }
 
 /** A user submission or completed custom-tool request creates once. Recovery uses GET. */
+const loadImageEditSources = async (session: Session, reply: AssistantMessage) => {
+  const parent = session.messages.find((message) => message.id === reply.parentId)
+  if (parent?.role !== 'user' || parent.files.some((file) => !file.isImage)) {return undefined}
+  const files = await Promise.all(parent.files.map(async (original) => {
+    const blob = await loadMessageFile(session.id, original.id)
+    if (!blob) {throw new Error('Reference image unavailable')}
+    return new File([blob], original.name, { type: original.mimeType || blob.type })
+  }))
+  const selection = resolveImageEditSources(files)
+  return 'sources' in selection ? selection.sources : undefined
+}
+
 const generateImageReply = async (
   sessionId: string,
   messageId: string,
@@ -1107,6 +1188,19 @@ const generateImageReply = async (
     await saveLocalSession(snapshot, pendingFiles.get(sessionId))
     controller.signal.throwIfAborted()
     if (!live()) {return}
+    let sources: File[] | undefined
+    if (mode === 'create' && initial.imageOrigin === 'edit') {
+      sources = await loadImageEditSources(snapshot, initial).catch(() => undefined)
+      controller.signal.throwIfAborted()
+      if (!live()) {return}
+      if (!sources) {
+        updateImageJob(sessionId, messageId, { state: 'failed', error: {
+          code: 'image_edit_original_missing', message: '无法读取用于编辑的参考图，请重新选择图片后发送。',
+        } }, 'error')
+        terminal = true
+        return
+      }
+    }
     const saveResult = async (result: ReturnType<typeof decodeGeneratedImages>) => {
       const current = imageReply(sessionId, messageId)
       const session = getSession(sessionId)
@@ -1140,7 +1234,7 @@ const generateImageReply = async (
         pendingFiles.delete(sessionId)
       }
     }
-    if (job.prompts?.length) {
+    if (initial.imageOrigin !== 'edit' && job.prompts?.length) {
       const prompts = job.prompts
       if (prompts.length > 5) {throw new Error('每轮最多可生成五张图片。')}
       const personal = job.provider === 'personal'
@@ -1193,7 +1287,7 @@ const generateImageReply = async (
     if (job.provider === 'personal') {
       if (mode !== 'create' || !creationPrompt) {throw new Error('个人生图请求已中断，请在服务商后台查看此次生成记录。')}
       if (imageConfig !== imageConfigurationIdentity()) {throw new Error('个人生图配置已变化，请重新提交。')}
-      const result = await requestPersonalImage(creationPrompt, controller.signal)
+      const result = await requestPersonalImage(creationPrompt, controller.signal, sources)
       controller.signal.throwIfAborted()
       if (live()) {await saveResult(result)}
       terminal = true
@@ -1209,12 +1303,19 @@ const generateImageReply = async (
       }
       if (!creationPrompt || job.cancelRequested) {throw new Error('图片任务提交状态无效。')}
       try {
-        remote = await createImageJob(job.clientRequestId, creationPrompt, controller.signal)
+        remote = await createImageJob(job.clientRequestId, creationPrompt, controller.signal, sources)
       } catch (error) {
         controller.signal.throwIfAborted()
         if (!live()) {return}
         // The POST may have succeeded. Only query that same ID after losing its response.
-        if (error instanceof ApiError && error.status && error.status !== 408 && error.status !== 429 && error.status < 500) {throw error}
+        if (error instanceof ApiError && error.status && error.status !== 408 && error.status !== 429 && error.status < 500) {
+          if (initial.imageOrigin !== 'edit') {throw error}
+          updateImageJob(sessionId, messageId, { state: 'failed', error: {
+            code: error.code ?? 'image_edit_submit_failed', message: error.message,
+          } }, 'error')
+          terminal = true
+          return
+        }
       }
     }
     if (mode === 'cancel') {
@@ -1278,6 +1379,11 @@ const generateImageReply = async (
       if (job.provider === 'personal') {
         const message = error instanceof TypeError || controller.signal.aborted ? '个人生图连接已中断，服务商可能已受理。请查看生成记录。' : error instanceof Error ? error.message : '个人生图失败，请检查服务配置。'
         updateImageJob(sessionId, messageId, {state: 'failed', cancelRequested: undefined, error: {code: 'personal_image_failed', message}}, 'error')
+        terminal = true
+      } else if (error instanceof ApiError && error.code === 'image_ineligible') {
+        updateImageJob(sessionId, messageId, {
+          state: 'failed', cancelRequested: undefined, error: { code: error.code, message: error.message },
+        }, 'error')
         terminal = true
       } else if (current?.imageJob && !(controller.signal.aborted && current.imageJob.cancelRequested)) {
         const expired = error instanceof ApiError && error.status === 410
@@ -1428,11 +1534,12 @@ export const editMessage = (sessionId: string, messageId: string, content: strin
     (path[index + 1] as AssistantMessage).imageGeneration === true &&
     (path[index + 1] as AssistantMessage).imageOrigin !== 'chat' &&
     !(path[index + 1] as AssistantMessage).imageAction
-  if (imageGeneration && !activeImageProvider()) {return false}
+  if (imageGeneration && (!activeImageProvider() || !text || text.length > 8000)) {return false}
   const originalReply = path[index + 1]
   if (originalReply?.role === 'assistant' && originalReply.imageJob && recoverableImage(originalReply)) {return false}
   const reply: AssistantMessage = imageGeneration
     ? { ...createReply(), imageGeneration: true, imageJob: newLocalImageJob(originalReply?.role === 'assistant' ? priorImagePrompts(originalReply).map(() => question.content) : undefined), imagePrompt: question.content,
+        ...(originalReply?.role === 'assistant' && originalReply.imageOrigin === 'edit' ? { imageOrigin: 'edit' as const } : {}),
         thinking: false, search: false, prefix: false }
     : createReply()
   updateSession(sessionId, (s) => ({
@@ -1875,16 +1982,21 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   const owner = getRuntime().user.id
   const epoch = historyEpoch
   const preferences = useSettings.getState()
-  const persona = preferences.persona.trim()
-  const baseSystem = persona
-    ? `${SYSTEM_PROMPT}\n\n用户指定的回复风格与角色偏好：\n${persona}`
+  const replyStyle = replyStylePrompt(preferences)
+  const baseSystem = replyStyle
+    ? `${SYSTEM_PROMPT}\n\n用户指定的回复风格与角色偏好：\n${replyStyle}`
     : SYSTEM_PROMPT
   const parameters = modelParameters(preferences, initial.thinking === true)
   const plannedImageProvider = imageConfigurationIdentity()
   const allowImageAction = !!plannedImageProvider && !request.prefix
+  const original = request.question.files.length === 1 ? request.question.files[0] : undefined
+  const canEditSource = allowImageAction && !!original?.isImage && original.size > 0 &&
+    original.size <= MAX_IMAGE_EDIT_MB * 1024 * 1024 && IMAGE_EDIT_ACCEPT.split(',').includes(original.mimeType) &&
+    isDirectImageEditRequest(request.question.content)
   const planningNonce = newImageActionNonce()
   const questionSignature = sourceSignature([request.question])
   let imageHandoff: string | undefined
+  let providerIssue: ChatProviderIssue | undefined
   if (!getSession(sessionId)?.title) {
     titleRequests.add(controller)
   }
@@ -1902,7 +2014,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
     let context
     try {
       context = await prepareMemoryContext(sessionId, request, controller,
-        allowImageAction ? imageActionSystem(baseSystem, planningNonce) : baseSystem)
+        allowImageAction ? imageActionSystem(baseSystem, planningNonce, canEditSource) : baseSystem)
       controller.signal.throwIfAborted()
       request = { ...request, history: context.history }
     } catch (error) {
@@ -2009,7 +2121,9 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         }
         controller.signal.throwIfAborted()
         reply = settleReply(reply, 'done', Date.now())
-        const prompt = imageActionPrompt(imageActions, allowImageAction && plannedImageProvider === imageConfigurationIdentity())
+        const prompt = imageActionPrompt(
+          imageActions, allowImageAction && plannedImageProvider === imageConfigurationIdentity(), canEditSource
+        )
         saveActionEvidence()
         // Older histories used receipt-like prose. Repeating that prose cannot create an image job.
         if (prompt === undefined && allowImageAction && reply.stopReason === 'end_turn' &&
@@ -2029,7 +2143,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
               path[questionIndex + 1]?.id !== initial.id) {
             throw new Error('会话或账号状态已变化，请在当前会话重新发送绘图要求。')
           }
-          reply = { ...reply, imageGeneration: true, imageOrigin: 'chat', imageJob: newLocalImageJob(imageActions.prompts), imagePrompt: prompt,
+          reply = { ...reply, imageGeneration: true, imageOrigin: imageActions.editSource ? 'edit' : 'chat',
+            imageJob: newLocalImageJob(imageActions.prompts), imagePrompt: prompt,
             status: 'pending', prefix: false }
           imageHandoff = prompt
           if (!current?.title) {
@@ -2080,11 +2195,16 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             kind: 'protocol', message: '绘图请求中断，图片尚未开始生成。请重新发送绘图要求。',
           })
         } else if (error instanceof ApiError) {
+          if (error.code === 'personal_auth') {
+            providerIssue = 'chatProviderPersonalAuth'
+          } else if (error.code === 'managed_chat_unavailable') {
+            providerIssue = 'chatProviderManagedSetupFailed'
+          }
           reply = settleReply(reply, 'error', Date.now(), {
             kind: error.kind,
             message: error.message,
             status: error.status,
-            localMessage: error.localMessage,
+            localMessage: providerIssue ? { key: providerIssue } : error.localMessage,
           })
         } else {
           reply = settleReply(reply, 'error', Date.now(), {
@@ -2106,11 +2226,31 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       ),
     }))
     persist(sessionId)
+    if (providerIssue && !controller.signal.aborted && epoch === historyEpoch && isSessionActive() &&
+        getRuntime().user.id === owner && get().activeId === sessionId && !get().importingHistory &&
+        !deletingSessions.has(sessionId)) {
+      openChatProviderForIssue(providerIssue)
+    }
     if (imageHandoff !== undefined && !controller.signal.aborted && epoch === historyEpoch &&
         isSessionActive() && getRuntime().user.id === owner && !get().importingHistory && !deletingSessions.has(sessionId)) {
       void generateImageReply(sessionId, reply.id, 'create', imageHandoff)
     } else {
       resumeSessionImageJobs(sessionId)
+      if (useSettings.getState().autoReadAloud && reply.status === 'done' && reply.stopReason !== 'refusal') {
+        const stillCurrent = () => {
+          const session = getSession(sessionId)
+          return !controller.signal.aborted && epoch === historyEpoch && isSessionActive() &&
+            getRuntime().user.id === owner && get().activeId === sessionId && !get().importingHistory &&
+            !deletingSessions.has(sessionId) && !getStreamController(sessionId) && Boolean(session &&
+              getVisibleMessages(session).at(-1)?.id === reply.id)
+        }
+        const text = buildReplyView(reply, false).answer?.text.trim()
+        if (text && stillCurrent()) {
+          void import('../speech/readAloud.js').then(({ autoReadAloudReply }) =>
+            autoReadAloudReply(reply.id, text, stillCurrent)
+          ).catch(() => {})
+        }
+      }
     }
   }
 }

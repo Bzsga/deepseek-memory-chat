@@ -4,6 +4,7 @@ import { readMessageEvent } from './parseEvent.js'
 import { readServerSentEvents } from './sse.js'
 import {
   API_ORIGIN,
+  denyRuntimePermission,
   getRuntime,
   invalidateSession,
   isSessionActive,
@@ -11,7 +12,6 @@ import {
 } from '../runtime.js'
 import {
   captureChatProvider,
-  updateManagedEligibility,
   type ChatProviderSnapshot,
 } from '../chatProvider.js'
 import type {
@@ -88,11 +88,14 @@ export const request = async (url: string, init: RequestInit): Promise<Response>
   }
   if (!response.ok) {
     const error = await readErrorResponse(response)
-    if (
-      response.status === 403 &&
-      (error.code === 'managed_ineligible' || error.code === 'sync_invitation_required')
-    ) {
-      updateManagedEligibility(false)
+    if (response.status === 403) {
+      if (error.code === 'managed_ineligible') {
+        denyRuntimePermission('chat_api')
+      } else if (error.code === 'image_ineligible') {
+        denyRuntimePermission('image_api')
+      } else if (error.code === 'sync_invitation_required') {
+        denyRuntimePermission('cloud_sync')
+      }
     }
     throw error
   }

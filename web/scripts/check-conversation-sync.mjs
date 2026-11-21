@@ -24,11 +24,11 @@ try {
     export const loadSyncStates=async()=>structuredClone([...states.values()]);
     export const loadSyncControl=async()=>structuredClone(control);
     export const prepareSyncRecords=async()=>{for(const s of rows.values())if(!states.has(s.id))dirty(s)};
-    export const saveSyncControl=async(v,g)=>{if(!g()||control?.generation>v.generation)return false;control={...v,cursor:control?.generation===v.generation?Math.max(control.cursor,v.cursor):v.cursor};return true};
+    export const saveSyncControl=async(v,g)=>{if(!g()||control?.generation>v.generation)return false;const previous=control?.generation===v.generation?control:undefined;control={...previous,...v,cursor:Math.max(previous?.cursor??0,v.cursor)};return true};
     export const rebaseMissingSyncRecords=async(ids,sequence,generation,guard)=>{if(!guard())return;for(const s of states.values())if(s.revision>0&&s.revision<=sequence&&!ids.has(s.id)){s.revision=0;s.dirty=!s.deleted}};
     export const acknowledgeSync=async(id,uploaded,revision,generation,guard)=>{const s=states.get(id);if(!guard()||!s||s.revision!==uploaded.revision||control.generation!==generation)return false;s.revision=revision;s.dirty=s.version!==uploaded.version;return true};
     export const createSyncConflictCopy=s=>({...structuredClone(s),id:'conflict-'+(++copies),title:s.title+'（冲突副本）'});
-    export const applySyncedSession=async(o)=>{const p=states.get(o.id);if(!o.guard()||(p?.version??0)!==o.expectedVersion||(p?.revision??0)!==o.expectedRevision||control.generation!==o.generation)return false;if(o.conflictCopy)dirty(o.conflictCopy);for(const f of o.files)files.set(f.id,f.blob);if(o.session)rows.set(o.id,structuredClone(o.session));else rows.delete(o.id);states.set(o.id,{id:o.id,version:(p?.version??0)+1,revision:o.revision,dirty:false,deleted:!o.session,mutationId:'remote'});return true};
+    export const applySyncedSession=async(o)=>{const p=states.get(o.id);if(!o.guard()||(p?.version??0)!==o.expectedVersion||(p?.revision??0)!==o.expectedRevision||control.generation!==o.generation)return false;if(o.conflictCopy)dirty(o.conflictCopy);for(const f of o.files)files.set(f.id,f.blob);if(o.session)rows.set(o.id,structuredClone(o.session));else rows.delete(o.id);states.set(o.id,{id:o.id,version:(p?.version??0)+1,revision:o.revision,dirty:false,deleted:!o.session,mutationId:'remote-'+o.id+'-'+o.revision});return true};
   `)
   writeFileSync(join(output, 'src/services/chat/store.js'), `
     import {create} from 'zustand';
@@ -43,7 +43,8 @@ try {
   const load = path => import(pathToFileURL(join(output, 'src', path)))
   const runtime = await load('services/runtime.js')
   runtime.initializeRuntime({ provider: 'synthetic', model: 'deepseek-flash', features: {},
-    user: { id: 'synthetic-owner', username: 'synthetic', role: 'user', managed_eligible: true } })
+    user: { id: 'synthetic-owner', username: 'synthetic', role: 'user', managed_eligible: false,
+      permissions: { chat_api: false, image_api: false, cloud_sync: true } } })
   const sync = await load('services/conversationSync.js')
   const db = await load('services/chat/db.js')
   const codec = await load('services/chat/syncCodec.js')
@@ -55,12 +56,19 @@ try {
   const blobs = new Map()
   const mutations = new Map()
   let eligible = false, enabled = false, generation = 0, sequence = 0
+  const both = { conversations: true, preferences: true, attachments: true }
+  let scopes = { ...both }
+  let reportsScopes = false, reportsAttachments = false
+  let loseNextSettingsPatch = false, changeScopeDuringPrefs = false
   let loseNextPut = false
   let conflictNextPut = false
   let missingBlobNextPut = false
   let gateGet
   const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
-  const status = () => ({ eligible, enabled, generation, sequence })
+  const status = () => ({ eligible, enabled, generation, sequence, ...(reportsScopes ? {
+    scopes: reportsAttachments ? scopes : { conversations: scopes.conversations, preferences: scopes.preferences },
+  } : {}) })
+  const visibleSession = row => ({ ...row, generation, files: scopes.attachments ? row.files : [] })
   const checksum = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
   const publish = (snapshot, files = [], deleted = false) => {
     const row = { generation, id: snapshot.session.id, revision: ++sequence, deleted,
@@ -81,16 +89,34 @@ try {
       const body = JSON.parse(init.body)
       if (body.enabled) {assert.equal(eligible, true)}
       if (body.expected_generation !== generation) {return json({ error: { message: 'generation changed' } }, 409)}
-      if (enabled !== body.enabled) {enabled = body.enabled; generation++}
+      if (body.scopes) {
+        assert.equal(reportsScopes, true)
+        assert.equal('attachments' in body.scopes, reportsAttachments)
+      }
+      const nextScopes = { ...scopes, ...body.scopes }
+      if (enabled !== body.enabled || JSON.stringify(nextScopes) !== JSON.stringify(scopes)) {
+        enabled = body.enabled
+        scopes = nextScopes
+        generation++
+      }
+      if (loseNextSettingsPatch) {loseNextSettingsPatch = false; throw new TypeError('synthetic settings response lost')}
       return json(status())
     }
     if (!path && init.method === 'DELETE') {
       enabled = false; generation++; remote.clear(); blobs.clear(); mutations.clear()
+      preferences = null; preferenceRevision = 0
       return json(status())
     }
     assert.equal(eligible, true, 'Ineligible users must not send sync data requests')
     if (!enabled) {return json({ error: { message: 'disabled' } }, 409)}
     if (path === '/preferences') {
+      assert.equal(scopes.preferences, true)
+      if (changeScopeDuringPrefs) {
+        changeScopeDuringPrefs = false
+        scopes = { ...scopes, conversations: true, preferences: false }
+        generation++
+        return json({error:{message:'Preference scope turned off',code:'sync_scope_disabled'}}, 409)
+      }
       if (init.method === 'PUT') {
         const body = JSON.parse(init.body)
         if (changePreferenceDuringWrite) {
@@ -99,18 +125,21 @@ try {
         }
         assert.equal(body.expected_revision, preferenceRevision)
         const allowed = ['locale', 'themePreference', 'ttsVoice', 'thinking', 'search', 'siderCollapsed',
+          'replyTone', 'replyDetail', 'replyApproach', 'replyWarmth', 'replyEnthusiasm', 'replyEmojis', 'replyVisuals', 'replyStructure',
           'persona', 'reasoningEffort', 'temperature']
         assert.ok(Object.keys(body.value).every(key => allowed.includes(key)))
         preferences = body.value; preferenceRevision++
       }
       return json({generation,revision:preferenceRevision,value:preferences})
     }
+    assert.equal(scopes.conversations, true)
     if (path === '/index') {
       const after = Number(parsed.searchParams.get('after'))
       const rows = [...remote.values()].filter(row => row.revision > after).sort((a, b) => a.revision - b.revision)
       return json({ generation, entries: rows.map(({ id, revision, deleted, content_hash }) => ({ id, revision, deleted, content_hash })), cursor: rows.at(-1)?.revision ?? after, has_more: false })
     }
     if (path.startsWith('/blobs/')) {
+      assert.equal(scopes.attachments, true)
       const key = path.split('/').at(-1)
       if (init.method === 'PUT') {
         const bytes = Buffer.from(await init.body.arrayBuffer())
@@ -124,7 +153,7 @@ try {
     const id = decodeURIComponent(path.split('/').at(-1))
     if (init.method === 'GET') {
       if (gateGet) {await gateGet()}
-      return remote.has(id) ? json({ ...remote.get(id), generation }) : json({ error: { message: 'missing' } }, 404)
+      return remote.has(id) ? json(visibleSession(remote.get(id))) : json({ error: { message: 'missing' } }, 404)
     }
     const body = JSON.parse(init.body)
     assert.equal(body.generation, generation)
@@ -143,12 +172,19 @@ try {
     if (body.files?.some(file => !blobs.has(file.sha256))) {
       return json({ error: { message: 'original missing', code: 'sync_blob_missing' } }, 409)
     }
-    assert.ok(!mutations.has(body.mutation_id), 'Unknown results must be reconciled before any changed replay')
+    const mutation = `${generation}:${body.mutation_id}`
+    assert.ok(!mutations.has(mutation), 'Unknown results must be reconciled before any changed replay')
     const snapshot = init.method === 'DELETE' ? { version: 1, session: { id } } : body.snapshot
-    const row = publish(snapshot, body.files ?? [], init.method === 'DELETE')
-    mutations.set(body.mutation_id, row.revision)
+    let files = body.files ?? []
+    if (!scopes.attachments && init.method !== 'DELETE') {
+      assert.deepEqual(files, [], 'Paused attachments must not send a blob manifest')
+      const referenced = new Set(codec.referencedSyncFiles(snapshot.session).map(file => file.id))
+      files = (previous?.files ?? []).filter(file => referenced.has(file.id))
+    }
+    const row = publish(snapshot, files, init.method === 'DELETE')
+    mutations.set(mutation, row.revision)
     if (loseNextPut) {loseNextPut = false; throw new TypeError('synthetic response lost')}
-    return json(row)
+    return json(visibleSession(row))
   }
   const session = (id, title) => ({ id, title, createdAt: 1794931200000, updatedAt: 1794931200001,
     rootMessageId: `user-${id}`, messages: [
@@ -160,27 +196,52 @@ try {
   assert.equal(remote.size, 0)
   assert.deepEqual(calls.map(call => [call.method, call.path]), [['GET', '']])
   assert.equal(sync.useConversationSync.getState().eligible, false)
-  await assert.rejects(sync.setConversationSyncEnabled(true), /邀请码/)
+  await assert.rejects(sync.setConversationSyncEnabled(true), /未开通云同步/)
   assert.ok(calls.every(call => call.method === 'GET' && !call.path))
   eligible = true
+  await assert.rejects(sync.setConversationSyncEnabled(true, { ...both, conversations: false }), /暂不支持/)
+  assert.ok(calls.every(call => call.method === 'GET' && !call.path), 'Old services are not allowed to enable an unsupported selection')
   await sync.setConversationSyncEnabled(true)
+  assert.deepEqual(sync.useConversationSync.getState().scopes, both)
   await sync.syncConversationsNow()
   const prefs = await load('services/settings.js')
   const syncPrefs = await load('services/cloudPreferences.js')
+  const { defaultReplyTuning } = await load('services/replyPreferences.js')
   const detach = syncPrefs.watchPreferenceChanges(() => generation, () => {})
   prefs.setChatProviderApiKey('SYNTHETIC_NEVER_SYNC_THIS')
   // Existing cloud documents predate reply preferences.
-  for (const name of ['persona', 'reasoningEffort', 'temperature']) {delete preferences[name]}
+  for (const name of ['replyTone', 'persona', 'reasoningEffort', 'temperature']) {delete preferences[name]}
   prefs.setSearch(true); changePreferenceDuringWrite = true
   await sync.syncConversationsNow()
   assert.equal(preferences.search, true); assert.equal(preferences.ttsVoice, 'tide')
   assert.equal(prefs.useSettings.getState().ttsVoice, 'tide')
   assert.equal(prefs.useSettings.getState().apiKey, 'SYNTHETIC_NEVER_SYNC_THIS')
   assert.ok(!JSON.stringify(calls).includes('SYNTHETIC_NEVER_SYNC_THIS'))
-  const replies = { persona: '先给结论。', reasoningEffort: 'high', temperature: '0.6' }
+  preferences.persona = '旧版自定义语气'
+  preferenceRevision++
+  await sync.syncConversationsNow()
+  assert.equal(prefs.useSettings.getState().replyTone, 'custom')
+  assert.equal(prefs.useSettings.getState().replyWarmth, 'default')
+  assert.equal(prefs.useSettings.getState().replyDetail, 'default')
+  assert.equal(prefs.useSettings.getState().replyApproach, 'default')
+  const replies = { ...defaultReplyTuning, replyTone: 'warm', replyWarmth: 'more', replyVisuals: 'less',
+    replyDetail: 'deep', replyApproach: 'compare', persona: '先给结论。', reasoningEffort: 'high', temperature: '0.6' }
   prefs.setReplyPreferences(replies)
   await sync.syncConversationsNow()
-  for (const [name, value] of Object.entries(replies)) {assert.equal(preferences[name], value)}
+  for (const [name, value] of Object.entries(replies)) {
+    if (value !== 'default') {assert.equal(preferences[name], value)}
+  }
+  preferences.persona = '另一设备修改的自定义语气'
+  preferences.replyVisuals = 'default'
+  preferences.replyApproach = 'default'
+  preferenceRevision++
+  await sync.syncConversationsNow()
+  assert.equal(prefs.useSettings.getState().persona, preferences.persona)
+  assert.equal(prefs.useSettings.getState().replyTone, 'warm')
+  assert.equal(prefs.useSettings.getState().replyWarmth, 'more')
+  assert.equal(prefs.useSettings.getState().replyVisuals, 'default')
+  assert.equal(prefs.useSettings.getState().replyDetail, 'deep')
+  assert.equal(prefs.useSettings.getState().replyApproach, 'default')
   const expectedPrefs = {...preferences}
   const pendingName = runtime.accountStorageKey('sync-pref-search')
   storage.set(pendingName, '{damaged')
@@ -315,6 +376,87 @@ try {
   assert.equal(db.rows.has('delayed'), false)
   assert.equal(sync.useConversationSync.getState().enabled, false)
 
+  reportsScopes = true
+  const preferencesOnly = { ...both, conversations: false }
+  const conversationsOnly = { ...both, preferences: false }
+  const startScopes = calls.length
+  await assert.rejects(sync.setConversationSyncEnabled(true, { ...both, conversations: false, preferences: false }), /至少/)
+  assert.equal(calls.length, startScopes)
+  await assert.rejects(sync.setConversationSyncEnabled(true, { ...both, attachments: false }, generation), /不支持单独关闭/)
+  await assert.rejects(sync.setConversationSyncEnabled(true, preferencesOnly, generation - 1), /重新选择/)
+  assert.ok(calls.slice(startScopes).every(call => call.method === 'GET' && !call.path), 'Stale drafts cannot overwrite account choices')
+  loseNextSettingsPatch = true
+  await sync.setConversationSyncEnabled(true, preferencesOnly, generation)
+  assert.deepEqual(sync.useConversationSync.getState().scopes, preferencesOnly)
+  const retained = session('opted-out', '仅保存在本机的会话')
+  db.dirty(retained)
+  const store = await load('services/chat/store.js')
+  store.useChatStore.setState({ ready: false })
+  const prefsStart = calls.length
+  await sync.syncConversationsNow()
+  assert.ok(calls.slice(prefsStart).some(call => call.path === '/preferences'))
+  assert.ok(calls.slice(prefsStart).every(call => !call.path || call.path === '/preferences'))
+  assert.equal(db.states.get(retained.id).dirty, true)
+  assert.equal(remote.has(retained.id), false)
+  store.useChatStore.setState({ ready: true })
+  const keepPreference = syncPrefs.watchPreferenceChanges(() => generation, () => {})
+  const newTheme = prefs.useSettings.getState().themePreference === 'dark' ? 'light' : 'dark'
+  prefs.setThemePreference(newTheme)
+  await sync.setConversationSyncEnabled(true, both, generation)
+  await sync.syncConversationsNow()
+  keepPreference()
+  assert.equal(preferences.themePreference, newTheme, 'A pending preference survives a generation change when its consent is continuous')
+  assert.equal(remote.get(retained.id).snapshot.session.title, retained.title)
+  const raceScopeStart = calls.length
+  changeScopeDuringPrefs = true
+  await sync.syncConversationsNow()
+  assert.deepEqual(sync.useConversationSync.getState().scopes, conversationsOnly)
+  assert.equal(calls.slice(raceScopeStart).filter(call => call.path === '/preferences').length, 1)
+  assert.ok(!calls.slice(raceScopeStart).some(call => call.path.startsWith('/index')))
+  const syncConversationsStart = calls.length
+  await sync.syncConversationsNow()
+  assert.ok(calls.slice(syncConversationsStart).some(call => call.path.startsWith('/index')))
+  assert.ok(calls.slice(syncConversationsStart).every(call => call.path !== '/preferences'))
+  assert.ok(calls.every(call => call.path !== '/key-envelope'), 'The encrypted Key backup remains an explicit action')
+
+  // Attachments paused on a newer account leave local originals and sync metadata intact.
+  reportsAttachments = true
+  const textOnly = { ...conversationsOnly, attachments: false }
+  await sync.setConversationSyncEnabled(true, textOnly, generation)
+  const offlineOriginal = session('offline-original', '只同步聊天正文的会话')
+  offlineOriginal.messages[0].files.push({
+    id: 'original-paused', name: '合成.txt', size: attachment.size, isImage: false, mimeType: 'text/plain',
+  })
+  db.files.set('original-paused', attachment)
+  db.dirty(offlineOriginal)
+  const whilePaused = calls.length
+  await sync.syncConversationsNow()
+  assert.deepEqual(remote.get(offlineOriginal.id).files, [])
+  assert.equal(remote.get(offlineOriginal.id).snapshot.session.messages[0].files[0].id, 'original-paused')
+  assert.equal(db.states.get(offlineOriginal.id).dirty, false)
+  assert.equal(await db.files.get('original-paused').text(), await attachment.text())
+  assert.ok(calls.slice(whilePaused).every(call => !call.path.startsWith('/blobs/')))
+
+  // Enabling originals uploads the files of unchanged conversations once.
+  await sync.setConversationSyncEnabled(true, conversationsOnly, generation)
+  await sync.syncConversationsNow()
+  assert.equal(remote.get(offlineOriginal.id).files[0].id, 'original-paused')
+  const attachmentSynced = calls.length
+  await sync.syncConversationsNow()
+  assert.ok(calls.slice(attachmentSynced).every(call => call.method !== 'PUT'))
+
+  // A new device can sync the same cloud revision without originals, then fill them after opting in.
+  await sync.setConversationSyncEnabled(true, textOnly, generation)
+  db.reset()
+  await sync.syncConversationsNow()
+  const textRevision = db.states.get(offlineOriginal.id).revision
+  assert.equal(db.files.has('original-paused'), false)
+  assert.equal(db.rows.get(offlineOriginal.id).title, offlineOriginal.title)
+  await sync.setConversationSyncEnabled(true, conversationsOnly, generation)
+  await sync.syncConversationsNow()
+  assert.equal(await db.files.get('original-paused').text(), await attachment.text())
+  assert.equal(db.states.get(offlineOriginal.id).revision, textRevision)
+
   await sync.setConversationSyncEnabled(true)
   const beforeRevocation = calls.length
   eligible = false
@@ -327,9 +469,9 @@ try {
   assert.ok(calls.slice(beforeRevocation).every(call => call.method === 'GET' && !call.path))
   await sync.clearCloudConversations()
   assert.equal(remote.size, 0)
-  assert.equal(db.rows.size, localCount)
+  assert.ok(db.rows.has(retained.id))
   assert.ok(calls.every(call => call.method !== 'POST'))
-  console.log('Conversation synchronization checks passed: invitation gate, revocation and privacy purge, default-off, merge, originals, conflicts, deletions, unknown results, CAS race, pause/clear, stale generation; zero model calls.')
+  console.log('Conversation synchronization checks passed: invitation gate, selectable scopes, attachment pause and restore, stale choices, legacy compatibility, revocation and privacy purge, merge, originals, conflicts, deletions, unknown results, CAS race, pause and clear; zero model calls.')
 } finally {
   rmSync(output, { recursive: true, force: true })
 }

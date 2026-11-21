@@ -42,6 +42,9 @@ export const describeReply = (reply: AssistantMessage): Notice | null => {
     if (reply.imageGeneration && message) {
       return { text: message }
     }
+    if (localMessage?.key === 'chatProviderPersonalAuth' || localMessage?.key === 'chatProviderManagedSetupFailed') {
+      return { text: message }
+    }
     switch (classifyStatus(status)) {
       case 'unauthorized':
         return { text: translate('replyInvalidApiKey') }

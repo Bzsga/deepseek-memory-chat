@@ -59,6 +59,14 @@ try {
   assert.deepEqual(referencedSyncFiles(session), [
     { id: 'picture-original', mimeType: 'image/png' }, { id: 'document-original', mimeType: 'text/plain' },
   ])
+  const imageEdit = structuredClone(session)
+  imageEdit.messages[0].files.pop()
+  imageEdit.messages[2].imageOrigin = 'edit'
+  delete imageEdit.messages[2].imageAction
+  const restoredEdit = decodeSyncSnapshot(encodeSyncSnapshot(imageEdit), imageEdit.id)
+  assert.equal(restoredEdit.messages[2].imageOrigin, 'edit')
+  assert.equal(restoredEdit.messages[2].parentId, restoredEdit.messages[0].id)
+  assert.equal(restoredEdit.messages[0].files[0].id, 'picture-original')
 
   const withTools = structuredClone(session)
   withTools.messages[2].blocks.push(

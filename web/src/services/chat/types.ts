@@ -90,8 +90,8 @@ export type AssistantMessage = MessageBranch & {
   imageJob?: LocalImageJob
   /** Frozen dispatch prompt, retained for same-ID recovery and explicit regeneration. */
   imagePrompt?: string
-  /** Editing a normal-chat request must ask the model again, including after regeneration. */
-  imageOrigin?: 'chat'
+  /** A chat tool action or an explicit edit using the parent message's original image. */
+  imageOrigin?: 'chat' | 'edit'
   /** Original application action, excluded from visible text and model history. */
   imageAction?: ImageActionTrace
   imageGeneration?: boolean

@@ -164,12 +164,12 @@ class AccountPersistenceTest {
     @Test fun storedSessionRestoresWithoutLoginAnd401CannotCreateAnonymousFallback() = runBlocking<Unit> {
         val name = "account-expiry-${UUID.randomUUID()}.db"
         val network = FakeOrganization()
-        val accounts = FakeAccounts()
+        val accounts = FakeAccounts().apply { managedEligibility = false }
         val first = controller(name, network, accounts)
         var second: Pair<ViewModelStore, AppController>? = null
         try {
             initialize(first.second)
-            first.second.registerAccount("ownerA", "synthetic-password")
+            first.second.loginAccount("ownerA", "synthetic-password")
             assertFalse(first.second.state.value.account.currentUser!!.managedEligible)
             // A web redemption updates the server before the native profile cache.
             accounts.managedEligibility = true
@@ -195,6 +195,33 @@ class AccountPersistenceTest {
         } finally {
             second?.let { close(it.first) }
             close(first.first)
+        }
+    }
+
+    @Test fun invitedRegistrationDefaultsToManagedAndLaterLoginRestoresPersonalChoice() = runBlocking<Unit> {
+        val username = "new-user-${UUID.randomUUID().toString().take(8)}"
+        val invitation = "SYN-REGISTER-123456"
+        val accounts = FakeAccounts()
+        val (store, controller) = controller("invited-registration-${UUID.randomUUID()}.db", FakeOrganization(), accounts)
+        try {
+            initialize(controller)
+            controller.registerAccount(username, "synthetic-password", invitation)
+            assertEquals(invitation, accounts.registrationCode)
+            assertEquals("invitation", controller.state.value.account.currentUser?.registrationKind)
+            assertTrue(controller.state.value.account.currentUser?.managedEligible == true)
+            assertEquals("managed", controller.state.value.chatProvider?.mode)
+            assertEquals("companion", controller.state.value.organizationSettings.mode)
+
+            controller.updateChatProvider("id-$username", "personal", "synthetic-byok-key",
+                "https://api.synthetic.invalid/compatible", "synthetic-personal-model")
+            controller.logoutAccount()
+            controller.loginAccount(username, "synthetic-password")
+            assertEquals("personal", controller.state.value.chatProvider?.mode)
+            assertEquals("synthetic-personal-model", controller.state.value.organizationSettings.model)
+        } finally {
+            controller.logoutAccount()
+            SecureCredentials(application).put("chat-provider:user:id-$username", "")
+            close(store)
         }
     }
 
@@ -230,15 +257,19 @@ class AccountPersistenceTest {
     private inner class FakeAccounts : AccountTransport {
         var role = "user"
         var managedEligibility: Boolean? = null
+        var registrationCode: String? = null
         val logins = AtomicInteger()
-        override suspend fun register(serviceUrl: String, username: String, password: String): AccountAuthentication {
+        override suspend fun register(serviceUrl: String, username: String, password: String, invitationCode: String): AccountAuthentication {
+            registrationCode = invitationCode
             val created = login(serviceUrl, username, password)
-            return created.copy(session = created.session.copy(user = created.session.user.copy(managedEligible = false)))
+            val user = created.session.user.copy(registrationKind = "invitation", managedEligible = true)
+            return created.copy(session = created.session.copy(user = user))
         }
         override suspend fun login(serviceUrl: String, username: String, password: String): AccountAuthentication {
             val count = logins.incrementAndGet()
             return AccountAuthentication(AccountSession(serviceUrl, "account-token-$count", "2099-01-01T00:00:00+08:00",
-                AccountUser("id-$username", username, "public", "2026-11-14T00:00:00+08:00")), quota)
+                AccountUser("id-$username", username, "public", "2026-11-14T00:00:00+08:00",
+                    managedEligible = managedEligibility ?: true)), quota)
         }
         override suspend fun me(session: AccountSession) = AccountProfile(
             session.user.copy(role = role, managedEligible = managedEligibility ?: session.user.managedEligible), quota)

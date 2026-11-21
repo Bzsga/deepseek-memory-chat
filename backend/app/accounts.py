@@ -23,6 +23,33 @@ REGISTRATION_WINDOW_SECONDS = 60 * 60
 MAX_FAILED_LOGINS_PER_USER = 5
 MAX_FAILED_LOGINS_PER_IP = 20
 MAX_REGISTRATIONS_PER_IP = 10
+PERMISSION_NAMES = ("chat_api", "image_api", "cloud_sync")
+
+
+def account_permissions(row, open_permissions=None):
+    if row is None or (open_permissions is not None and row["disabled"]):
+        return dict.fromkeys(PERMISSION_NAMES, False)
+    inherited = bool(row["managed_eligible"])
+    return {
+        name: (open_permissions is not None and open_permissions[name])
+        or ((inherited or (name == "cloud_sync" and bool(row["self_service_cloud"])))
+            if row[name] is None else bool(row[name]))
+        for name in PERMISSION_NAMES
+    }
+
+
+def account_invite_redeemable(row):
+    return not row["managed_eligible"] and all(row[name] is None for name in PERMISSION_NAMES)
+
+
+def validate_permissions(permissions):
+    if (not isinstance(permissions, dict) or set(permissions) != set(PERMISSION_NAMES)
+            or any(type(value) is not bool for value in permissions.values())):
+        raise ServiceError(422, "请为聊天、生图和云同步各选择启用或停用。")
+
+
+def _invitation_permissions(row):
+    return {name: row[name] is None or bool(row[name]) for name in PERMISSION_NAMES}
 
 
 def _iso(timestamp):
@@ -101,6 +128,18 @@ class Accounts:
             if "role" not in {column["name"] for column in db.execute("PRAGMA table_info(registered_accounts)")}:
                 db.execute("""ALTER TABLE registered_accounts ADD COLUMN role TEXT
                     NOT NULL DEFAULT 'user' CHECK(role IN ('user','admin'))""")
+            account_columns = {column["name"] for column in db.execute("PRAGMA table_info(registered_accounts)")}
+            for name in PERMISSION_NAMES:
+                if name not in account_columns:
+                    db.execute(f"ALTER TABLE registered_accounts ADD COLUMN {name} INTEGER CHECK({name} IN (0,1))")
+            if "self_service_cloud" not in account_columns:
+                db.execute("""ALTER TABLE registered_accounts ADD COLUMN self_service_cloud INTEGER
+                    NOT NULL DEFAULT 0 CHECK(self_service_cloud IN (0,1))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS account_registration_policy (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                self_service INTEGER NOT NULL CHECK(self_service IN (0,1))
+            )""")
+            db.execute("INSERT OR IGNORE INTO account_registration_policy VALUES(1,1)")
             db.execute("""CREATE TABLE IF NOT EXISTS account_sessions (
                 token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES registered_accounts(user_id),
                 created_at REAL NOT NULL, expires_at REAL NOT NULL, revoked_at REAL
@@ -116,6 +155,10 @@ class Accounts:
                 created_at REAL NOT NULL, expires_at REAL NOT NULL,
                 redeemed_at REAL, redeemed_by TEXT REFERENCES registered_accounts(user_id), revoked_at REAL
             )""")
+            invite_columns = {column["name"] for column in db.execute("PRAGMA table_info(registration_invites)")}
+            for name in PERMISSION_NAMES:
+                if name not in invite_columns:
+                    db.execute(f"ALTER TABLE registration_invites ADD COLUMN {name} INTEGER CHECK({name} IN (0,1))")
             db.execute("""CREATE TABLE IF NOT EXISTS registration_counter (
                 id INTEGER PRIMARY KEY CHECK(id=1), public_registered_count INTEGER NOT NULL CHECK(public_registered_count>=0)
             )""")
@@ -130,6 +173,21 @@ class Accounts:
             return int(db.execute("SELECT public_registered_count FROM registration_counter WHERE id=1").fetchone()[0])
         with self.store.connection() as connection:
             return self.public_registered_count(connection)
+
+    @staticmethod
+    def _self_service_enabled(db):
+        return bool(db.execute("SELECT self_service FROM account_registration_policy WHERE id=1").fetchone()[0])
+
+    def registration_policy(self):
+        with self.store.connection() as db:
+            return {"self_service": self._self_service_enabled(db)}
+
+    def set_registration_policy(self, self_service):
+        if type(self_service) is not bool:
+            raise ServiceError(422, "自助注册状态须为布尔值。")
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE account_registration_policy SET self_service=? WHERE id=1", (int(self_service),))
+            return {"self_service": self._self_service_enabled(db)}
 
     def _attempt(self, kind, ip, username_key, now):
         ip_hash, subject_hash = digest(str(ip)), digest(username_key)
@@ -159,39 +217,51 @@ class Accounts:
         return token, _iso(expires)
 
     @staticmethod
-    def _user(row):
+    def _user(row, permissions=None):
+        if permissions is None:
+            permissions = account_permissions(row)
         return {"id": row["user_id"], "username": row["username"],
                 "role": row["role"], "registration_kind": row["registration_kind"], "created_at": _iso(row["created_at"]),
-                "managed_eligible": bool(row["managed_eligible"]), "enabled": not bool(row["disabled"])}
+                "managed_eligible": permissions["chat_api"], "permissions": permissions,
+                "invite_redeemable": account_invite_redeemable(row), "enabled": not bool(row["disabled"])}
 
     def register(self, username, password, invitation_code=None, client_ip="unknown"):
         name, key = _username(username)
         if key == "admin":
             raise ServiceError(409, "此用户名保留给管理员，请更换用户名")
         password = _password(password)
-        if invitation_code is not None and (not isinstance(invitation_code, str) or invitation_code.strip()):
-            raise ServiceError(422, "请只填写用户名和密码注册，注册后可在 API 设置中兑换邀请码")
+        if isinstance(invitation_code, str):
+            invitation_code = invitation_code.strip() or None
         self._attempt("registration", client_ip, key, time.time())
         password_hash = _hash_password(password)
         with self.store.connection(write=True) as db:
             now = time.time()
+            self_service = invitation_code is None
+            if self_service and not self._self_service_enabled(db):
+                raise ServiceError(422, "注册需要邀请码，请填写管理员发放的有效邀请码。")
             if db.execute("SELECT 1 FROM registered_accounts WHERE username_key=?", (key,)).fetchone():
                 raise ServiceError(409, "用户名已被注册")
-            owner_id = self._create_identity(db, name, key, password_hash, now)
-            db.execute("UPDATE registration_counter SET public_registered_count=public_registered_count+1 WHERE id=1")
+            owner_id = self._create_identity(db, name, key, password_hash, now,
+                registration_kind="public" if self_service else "invitation", self_service_cloud=self_service)
+            if self_service:
+                db.execute("UPDATE registration_counter SET public_registered_count=public_registered_count+1 WHERE id=1")
+            else:
+                self._redeem_invite(db, owner_id, invitation_code, now)
             self.store._touch_user(db, owner_id, now)
             token, expires = self._session(db, owner_id, now)
         return {"token": token, "expires_at": expires, **self.me(owner_id)}
 
     @staticmethod
-    def _create_identity(db, name, key, password_hash, now, role="user", managed_eligible=False):
+    def _create_identity(db, name, key, password_hash, now, *, role="user", managed_eligible=False,
+                         registration_kind="public", self_service_cloud=False):
         owner_id = str(uuid.uuid4())
         # Only revocable account sessions authenticate; the legacy token is never issued.
         db.execute("INSERT INTO users(id,token_hash,budget_limit,created_at,access_mode) VALUES(?,?,0,?,'public')",
                    (owner_id, digest(secrets.token_urlsafe(32)), now))
         db.execute("""INSERT INTO registered_accounts
-            (user_id,username,username_key,password_hash,registration_kind,created_at,role,managed_eligible)
-            VALUES(?,?,?,?,'public',?,?,?)""", (owner_id, name, key, password_hash, now, role, int(managed_eligible)))
+            (user_id,username,username_key,password_hash,registration_kind,created_at,role,managed_eligible,self_service_cloud)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (owner_id, name, key, password_hash, registration_kind, now, role, int(managed_eligible), int(self_service_cloud)))
         return owner_id
 
     def bootstrap_admin(self, password):
@@ -221,28 +291,44 @@ class Accounts:
     def _redeem_invite(db, owner_id, code, now):
         if not isinstance(code, str) or not code.isascii() or not 16 <= len(code.strip()) <= 128:
             raise ServiceError(400, "邀请码无效、已使用或已过期")
-        updated = db.execute("""UPDATE registration_invites SET redeemed_at=?,redeemed_by=?,unused_plaintext=NULL
+        invitation = db.execute("""SELECT id,chat_api,image_api,cloud_sync FROM registration_invites
             WHERE code_hash=? AND redeemed_at IS NULL AND revoked_at IS NULL AND expires_at>?""",
-            (now, owner_id, digest(code.strip()), now))
-        if updated.rowcount != 1:
+            (digest(code.strip()), now)).fetchone()
+        if invitation is None:
             raise ServiceError(400, "邀请码无效、已使用或已过期")
-        db.execute("UPDATE registered_accounts SET managed_eligible=1 WHERE user_id=?", (owner_id,))
+        db.execute("UPDATE registration_invites SET redeemed_at=?,redeemed_by=?,unused_plaintext=NULL WHERE id=?",
+                   (now, owner_id, invitation["id"]))
+        cloud = invitation["cloud_sync"]
+        db.execute("""UPDATE registered_accounts SET managed_eligible=1,chat_api=?,image_api=?,
+            cloud_sync=CASE WHEN self_service_cloud=1 AND ?=0 THEN NULL ELSE ? END WHERE user_id=?""",
+            (invitation["chat_api"], invitation["image_api"], cloud, cloud, owner_id))
 
     def redeem_invite(self, owner_id, invitation_code):
         with self.store.connection(write=True) as db:
-            row = db.execute("SELECT disabled,managed_eligible FROM registered_accounts WHERE user_id=?", (owner_id,)).fetchone()
+            row = db.execute("SELECT disabled,managed_eligible,chat_api,image_api,cloud_sync FROM registered_accounts WHERE user_id=?",
+                             (owner_id,)).fetchone()
             if row is None or row["disabled"]:
                 raise ServiceError(401, "请先注册并登录")
-            if row["managed_eligible"]:
-                raise ServiceError(409, "当前账号已有免费资格，无需再次兑换")
+            if not account_invite_redeemable(row):
+                raise ServiceError(409, "当前账号已有权限设置，请联系管理员调整。")
             self._redeem_invite(db, owner_id, invitation_code, time.time())
         return self.me(owner_id)
 
     def revoke_managed(self, owner_id):
         with self.store.connection(write=True) as db:
-            if not db.execute("UPDATE registered_accounts SET managed_eligible=0 WHERE user_id=?", (owner_id,)).rowcount:
+            if not db.execute("""UPDATE registered_accounts SET managed_eligible=0,chat_api=NULL,image_api=NULL,
+                cloud_sync=CASE WHEN self_service_cloud=1 AND cloud_sync=0 THEN 0 ELSE NULL END WHERE user_id=?""",
+                (owner_id,)).rowcount:
                 raise ServiceError(404, "注册用户不存在")
         return {"id": owner_id, "managed_eligible": False}
+
+    def set_permissions(self, owner_id, permissions):
+        validate_permissions(permissions)
+        with self.store.connection(write=True) as db:
+            if not db.execute("UPDATE registered_accounts SET chat_api=?,image_api=?,cloud_sync=? WHERE user_id=?",
+                              (*(int(permissions[name]) for name in PERMISSION_NAMES), owner_id)).rowcount:
+                raise ServiceError(404, "注册用户不存在")
+            return self._user(db.execute("SELECT * FROM registered_accounts WHERE user_id=?", (owner_id,)).fetchone())
 
     def login(self, username, password, client_ip="unknown", *, admin_only=False):
         _, key = _username(username)
@@ -296,7 +382,8 @@ class Accounts:
             row = db.execute("SELECT * FROM registered_accounts WHERE user_id=?", (owner_id,)).fetchone()
             if row is None or row["disabled"]:
                 raise ServiceError(401, "请先注册并登录")
-            return {"user": self._user(row), "quota": self.store.quota(owner_id, db=db)}
+            quota = self.store.quota(owner_id, db=db)
+            return {"user": self._user(row, quota["permissions"]), "quota": quota}
 
     def set_enabled(self, owner_id, enabled):
         if type(enabled) is not bool:
@@ -331,9 +418,16 @@ class Accounts:
                            (time.time(), digest(token)))
         return {}
 
-    def create_invites(self, count, valid_days):
+    def create_invites(self, count, valid_days, permissions=None):
         if type(count) is not int or not 1 <= count <= 100 or type(valid_days) is not int or not 1 <= valid_days <= 365:
             raise ServiceError(422, "邀请码数量须为 1–100，有效天数须为 1–365")
+        if permissions is None:
+            overrides = (None,) * len(PERMISSION_NAMES)
+            visible_permissions = dict.fromkeys(PERMISSION_NAMES, True)
+        else:
+            validate_permissions(permissions)
+            overrides = tuple(int(permissions[name]) for name in PERMISSION_NAMES)
+            visible_permissions = permissions
         invitations = []
         with self.store.connection(write=True) as db:
             now = time.time()
@@ -341,9 +435,10 @@ class Accounts:
             for _ in range(count):
                 code, identity = secrets.token_urlsafe(24), str(uuid.uuid4())
                 db.execute("""INSERT INTO registration_invites
-                    (id,code_hash,unused_plaintext,created_at,expires_at) VALUES(?,?,?,?,?)""",
-                    (identity, digest(code), code, now, expires))
-                invitations.append({"id": identity, "code": code, "expires_at": _iso(expires)})
+                    (id,code_hash,unused_plaintext,created_at,expires_at,chat_api,image_api,cloud_sync) VALUES(?,?,?,?,?,?,?,?)""",
+                    (identity, digest(code), code, now, expires, *overrides))
+                invitations.append({"id": identity, "code": code, "expires_at": _iso(expires),
+                                    "permissions": visible_permissions})
         return {"invitations": invitations}
 
     def list_invites(self, limit=50, offset=0):
@@ -362,7 +457,8 @@ class Accounts:
             item = {"id": row["id"], "created_at": _iso(row["created_at"]), "expires_at": _iso(row["expires_at"]),
                     "redeemed_at": _iso(row["redeemed_at"]) if row["redeemed_at"] is not None else None,
                     "redeemed_by": row["redeemed_by"],
-                    "revoked_at": _iso(row["revoked_at"]) if row["revoked_at"] is not None else None}
+                    "revoked_at": _iso(row["revoked_at"]) if row["revoked_at"] is not None else None,
+                    "permissions": _invitation_permissions(row)}
             item["code"] = row["unused_plaintext"]
             invitations.append(item)
         return {"limit": limit, "offset": offset, "total": total, "invitations": invitations}

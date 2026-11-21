@@ -5,11 +5,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
-from account_fixtures import managed_account
+from account_fixtures import legacy_personal_account, managed_account
 from app.config import ProviderRoute, Settings
 from app.main import create_app
 from app.provider import ProviderOutcome
-from app.store import digest, local_day, local_week
+from app.store import ServiceError, digest, local_day, local_week
 
 
 PASSWORD = "synthetic password 123"
@@ -130,25 +130,28 @@ def test_this_week_remaining_is_atomic_with_reservations_and_does_not_rewrite_ac
         assert db.execute("SELECT COUNT(*) FROM jobs WHERE count_state='used'").fetchone()[0] == 1
 
 
-def test_account_validation_does_not_echo_secrets_and_public_registration_is_uncapped(service):
+def test_account_validation_requires_invitation_and_does_not_echo_secrets(service):
     store, client = service
     invalid = client.post("/v1/accounts/register", json={"username": "abc", "password": {"secret": "hidden"}})
     assert invalid.status_code == 422 and "hidden" not in invalid.text
     store.update_config({"public_registration_limit": 0})
-    personal = client.post("/v1/accounts/register", json={"username": "no_public_slot", "password": PASSWORD})
-    assert personal.status_code == 200 and not personal.json()['user']['managed_eligible']
+    store.accounts.set_registration_policy(False)
+    personal = client.post("/v1/accounts/register", json={"username": "no_invite", "password": PASSWORD})
+    assert personal.status_code == 422 and "注册需要邀请码" in personal.json()["detail"]
     invite = store.accounts.create_invites(1, 7)["invitations"][0]["code"]
     response = client.post("/v1/accounts/register", json={"username": "invited_user", "password": PASSWORD,
                                                           "invitation_code": invite})
-    assert response.status_code == 422 and "注册后" in response.json()["detail"]
+    assert response.status_code == 200
     assert invite not in response.text
-    assert store.accounts.list_invites()["invitations"][0]["code"] == invite
-    assert store.admin_config()["public_registered_count"] == 1
+    assert response.json()["user"]["registration_kind"] == "invitation"
+    assert response.json()["user"]["managed_eligible"] and response.json()["quota"]["user_weekly_remaining"] == 10
+    assert store.accounts.list_invites()["invitations"] == []
+    assert store.admin_config()["public_registered_count"] == 0
 
 
 def test_bearer_redemption_and_revocation_between_queue_and_dispatch(service):
     store, client = service
-    account = client.post("/v1/accounts/register", json={"username": "queue_owner", "password": PASSWORD}).json()
+    account = legacy_personal_account(store, "queue_owner", PASSWORD)
     owner = account["user"]["id"]
     headers = {"Authorization": "Bearer " + account["token"]}
     assert client.post("/v1/jobs", headers=headers, json=payload()).status_code == 403
@@ -161,3 +164,34 @@ def test_bearer_redemption_and_revocation_between_queue_and_dispatch(service):
     assert store.get_job(owner, job["id"])["status"] == "failed"
     quota = client.get("/v1/accounts/me", headers=headers).json()["quota"]
     assert not quota["managed_eligible"] and quota["user_weekly_reserved"] == quota["user_weekly_used"] == 0
+
+
+def test_image_only_account_can_spend_shared_quota_but_not_dispatch_chat_or_organization(service):
+    store, client = service
+    account, headers = register(client)
+    owner = account["user"]["id"]
+    token_hash = digest(account["token"])
+    first = client.post("/v1/jobs", headers=headers, json=payload()).json()
+    image_only = {"chat_api": False, "image_api": True, "cloud_sync": False}
+    updated = store.accounts.set_permissions(owner, image_only)
+    assert not updated["managed_eligible"] and updated["permissions"] == image_only
+    assert store.claim_next() is None
+    assert client.get(f"/v1/jobs/{first['id']}", headers=headers).json()["status"] == "failed"
+    assert client.post("/v1/jobs", headers=headers, json=payload("another-job")).status_code == 403
+
+    quota = client.get("/v1/accounts/me", headers=headers).json()["quota"]
+    assert not quota["enabled"] and quota["permissions"] == image_only
+    assert quota["user_weekly_remaining"] == 10
+    for kind in ("chat", "file", "asr", "tts"):
+        with pytest.raises(ServiceError) as error:
+            store.begin_chat_call(owner, kind, token_hash)
+        assert (error.value.status, error.value.code) == (403, "managed_ineligible")
+    store.finish_chat_call(store.begin_chat_call(owner, "image", token_hash), "success")
+    assert store.quota(owner)["user_weekly_remaining"] == 9
+
+    store.accounts.set_permissions(owner, {"chat_api": True, "image_api": False, "cloud_sync": True})
+    with pytest.raises(ServiceError) as error:
+        store.begin_chat_call(owner, "image", token_hash)
+    assert (error.value.status, error.value.code) == (403, "image_ineligible")
+    store.finish_chat_call(store.begin_chat_call(owner, "chat", token_hash), "success")
+    assert store.quota(owner)["user_weekly_remaining"] == 8

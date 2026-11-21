@@ -15,6 +15,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
+from .accounts import account_permissions
 from .chat import ChatError, _body, _error, _origin_ok, _token
 from .share_import import _invalid_constant, _unique_object
 from .store import digest
@@ -61,8 +62,8 @@ def _identity(value):
     return value
 
 
-def _fields(value, required):
-    if not isinstance(value, dict) or set(value) != set(required):
+def _fields(value, required, *, optional=()):
+    if not isinstance(value, dict) or not (required <= value.keys() <= required | set(optional)):
         _invalid()
 
 
@@ -116,9 +117,43 @@ def _files(value):
     return sorted(result, key=lambda item: item["id"])
 
 
+def _attachment_ids(snapshot):
+    if snapshot.get("version") != 1 or not isinstance(snapshot.get("session"), dict):
+        return None
+    messages = snapshot["session"].get("messages")
+    if not isinstance(messages, list):
+        return None
+    ids = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            return None
+        if message.get("role") == "user":
+            entries = message.get("files")
+        elif message.get("role") == "assistant":
+            blocks = message.get("blocks")
+            if not isinstance(blocks, list):
+                return None
+            entries = [block for block in blocks if isinstance(block, dict) and block.get("type") == "image"]
+        else:
+            return None
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                return None
+            ids.add(entry["id"])
+    return ids
+
+
 def _validate_preferences(value):
+    style_levels = ("default", "less", "more")
     choices = {"locale": ("zh-CN", "en-US"), "themePreference": ("light", "dark", "system"),
-               "ttsVoice": ("stella", "tide"), "reasoningEffort": ("", "low", "medium", "high", "max")}
+               "ttsVoice": ("stella", "tide"), "reasoningEffort": ("", "low", "medium", "high", "max"),
+               "replyTone": ("default", "direct", "warm", "structured", "casual", "custom"),
+               "replyWarmth": style_levels, "replyEnthusiasm": style_levels, "replyEmojis": style_levels,
+               "replyVisuals": style_levels, "replyStructure": style_levels,
+               "replyDetail": ("default", "brief", "balanced", "deep"),
+               "replyApproach": ("default", "direct", "compare", "explore")}
     flags = {"thinking", "search", "siderCollapsed"}
     if not isinstance(value, dict) or set(value) - (flags | choices.keys() | {"persona", "temperature"}):
         _invalid()
@@ -170,6 +205,14 @@ class ConversationSync:
                     owner_id TEXT PRIMARY KEY REFERENCES registered_accounts(user_id),
                     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
                     generation INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0)""",
+                """CREATE TABLE IF NOT EXISTS conversation_sync_scopes (
+                    owner_id TEXT PRIMARY KEY REFERENCES conversation_sync_settings(owner_id) ON DELETE CASCADE,
+                    conversations INTEGER NOT NULL CHECK(conversations IN (0,1)),
+                    preferences INTEGER NOT NULL CHECK(preferences IN (0,1)))""",
+                # Earlier releases write the three-column scopes table positionally.
+                """CREATE TABLE IF NOT EXISTS conversation_sync_attachment_scopes (
+                    owner_id TEXT PRIMARY KEY REFERENCES conversation_sync_settings(owner_id) ON DELETE CASCADE,
+                    attachments INTEGER NOT NULL CHECK(attachments IN (0,1)))""",
                 """CREATE TABLE IF NOT EXISTS conversation_sync_documents (
                     owner_id TEXT NOT NULL REFERENCES registered_accounts(user_id), kind TEXT NOT NULL,
                     revision INTEGER NOT NULL, value TEXT, PRIMARY KEY(owner_id,kind))""",
@@ -195,22 +238,40 @@ class ConversationSync:
                 "CREATE INDEX IF NOT EXISTS sync_blob_size ON conversation_sync_blobs(size)",
                 "CREATE INDEX IF NOT EXISTS sync_snapshot_size ON conversation_sync_sessions(snapshot_size)",
                 "CREATE INDEX IF NOT EXISTS conversation_sync_file_hash ON conversation_sync_files(owner_id,sha256)",
-                """CREATE TRIGGER IF NOT EXISTS sync_pause_on_invitation_revocation
-                    AFTER UPDATE OF managed_eligible ON registered_accounts
-                    WHEN OLD.managed_eligible=1 AND NEW.managed_eligible=0
+                "DROP TRIGGER IF EXISTS sync_pause_on_invitation_revocation",
+                "DROP TRIGGER IF EXISTS sync_pause_on_cloud_revocation",
+                "DROP TRIGGER IF EXISTS sync_pause_on_global_cloud_revocation",
+                """CREATE TRIGGER sync_pause_on_cloud_revocation
+                    AFTER UPDATE OF managed_eligible,cloud_sync,self_service_cloud,disabled ON registered_accounts
+                    WHEN COALESCE(NEW.cloud_sync,MAX(NEW.managed_eligible,NEW.self_service_cloud))=0
+                    AND (COALESCE(OLD.cloud_sync,MAX(OLD.managed_eligible,OLD.self_service_cloud))=1
+                         OR (OLD.disabled=1 AND NEW.disabled=0))
+                    AND (SELECT cloud_sync FROM global_feature_access WHERE id=1)=0
                     BEGIN
                         UPDATE conversation_sync_settings SET enabled=0,generation=generation+1
                             WHERE owner_id=NEW.user_id AND enabled=1;
                     END""",
+                """CREATE TRIGGER sync_pause_on_global_cloud_revocation
+                    AFTER UPDATE OF cloud_sync ON global_feature_access
+                    WHEN OLD.cloud_sync=1 AND NEW.cloud_sync=0
+                    BEGIN
+                        UPDATE conversation_sync_settings SET enabled=0,generation=generation+1
+                        WHERE enabled=1 AND owner_id IN (SELECT user_id FROM registered_accounts
+                            WHERE disabled=0 AND COALESCE(cloud_sync,MAX(managed_eligible,self_service_cloud))=0);
+                    END""",
             ]
             for statement in statements:
                 db.execute(statement)
-            db.execute("""UPDATE conversation_sync_settings SET enabled=0,generation=generation+1
-                WHERE enabled=1 AND owner_id IN (SELECT user_id FROM registered_accounts WHERE managed_eligible=0)""")
+            if not self.store.open_permissions(db)["cloud_sync"]:
+                db.execute("""UPDATE conversation_sync_settings SET enabled=0,generation=generation+1
+                    WHERE enabled=1 AND owner_id IN (SELECT user_id FROM registered_accounts
+                        WHERE disabled=0 AND COALESCE(cloud_sync,MAX(managed_eligible,self_service_cloud))=0)""")
             self._clean_orphans(db)
 
     def _authorize(self, db, owner, token_hash, *, require_eligible=False):
-        account = db.execute("SELECT disabled,managed_eligible FROM registered_accounts WHERE user_id=?", (owner,)).fetchone()
+        account = db.execute("""SELECT disabled,managed_eligible,chat_api,image_api,cloud_sync,self_service_cloud
+                             FROM registered_accounts WHERE user_id=?""",
+                             (owner,)).fetchone()
         valid = account is not None and not account["disabled"]
         if token_hash is not None:
             session = db.execute("""SELECT 1 FROM account_sessions WHERE user_id=? AND token_hash=?
@@ -218,25 +279,36 @@ class ConversationSync:
             valid = valid and session is not None
         if not valid:
             raise ChatError(401, "登录已过期，请重新登录。", {"X-Session-Expired": "1"})
-        eligible = bool(account["managed_eligible"])
+        eligible = account_permissions(account, self.store.open_permissions(db))["cloud_sync"]
         if require_eligible and not eligible:
-            raise ChatError(403, "云同步需要邀请码资格。", code="sync_invitation_required")
+            raise ChatError(403, "当前账号未开通云同步。", code="sync_invitation_required")
         return eligible
 
     @staticmethod
     def _state(db, owner):
-        row = db.execute("SELECT enabled,generation,sequence FROM conversation_sync_settings WHERE owner_id=?",
-                         (owner,)).fetchone()
-        return ({"enabled": bool(row["enabled"]), "generation": row["generation"], "sequence": row["sequence"]}
-                if row is not None else {"enabled": False, "generation": 0, "sequence": 0})
+        row = db.execute("""SELECT enabled,generation,sequence,
+            COALESCE(scopes.conversations,1) AS conversations, COALESCE(scopes.preferences,1) AS preferences,
+            COALESCE(originals.attachments,1) AS attachments
+            FROM conversation_sync_settings LEFT JOIN conversation_sync_scopes AS scopes USING(owner_id)
+            LEFT JOIN conversation_sync_attachment_scopes AS originals USING(owner_id)
+            WHERE conversation_sync_settings.owner_id=?""", (owner,)).fetchone()
+        if row is None:
+            return {"enabled": False, "generation": 0, "sequence": 0,
+                    "scopes": {"conversations": True, "preferences": True, "attachments": True}}
+        return {"enabled": bool(row["enabled"]), "generation": row["generation"], "sequence": row["sequence"],
+                "scopes": {name: bool(row[name]) for name in ("conversations", "preferences", "attachments")}}
 
-    def _active(self, db, owner, generation, token_hash):
+    def _active(self, db, owner, generation, token_hash, *, scope):
         self._authorize(db, owner, token_hash, require_eligible=True)
         state = self._state(db, owner)
         if generation != state["generation"]:
             raise ChatError(409, "同步设置已变化，请刷新后重试。", code="sync_generation_changed")
         if not state["enabled"]:
             raise ChatError(409, "多端同步已关闭。", code="sync_disabled")
+        if scope is not None and (
+            not state["scopes"][scope] or scope == "attachments" and not state["scopes"]["conversations"]
+        ):
+            raise ChatError(409, "此类内容未启用同步。", code="sync_scope_disabled")
         return state
 
     @staticmethod
@@ -270,13 +342,16 @@ class ConversationSync:
             raise ChatError(413, "云端会话与附件已达到 512 MiB，请导出或清理后重试。", code="sync_storage_full")
 
     @staticmethod
-    def _dto(db, owner, row, generation):
-        files = db.execute("""SELECT id,sha256,size,mime_type FROM conversation_sync_files
-            WHERE owner_id=? AND session_id=? ORDER BY id""", (owner, row["id"])).fetchall()
+    def _session_files(db, owner, session_id):
+        return [dict(item) for item in db.execute("""SELECT id,sha256,size,mime_type FROM conversation_sync_files
+            WHERE owner_id=? AND session_id=? ORDER BY id""", (owner, session_id))]
+
+    @classmethod
+    def _dto(cls, db, owner, row, generation, attachments):
         return {"generation": generation, "id": row["id"], "revision": row["revision"],
                 "deleted": bool(row["deleted"]), "content_hash": row["content_hash"],
                 "snapshot": json.loads(row["snapshot"]) if row["snapshot"] is not None else None,
-                "files": [dict(item) for item in files]}
+                "files": cls._session_files(db, owner, row["id"]) if attachments else []}
 
     def status(self, owner, token_hash=None):
         with self.store.connection() as db:
@@ -285,21 +360,39 @@ class ConversationSync:
             return {**self._state(db, owner), "eligible": eligible}
 
     def configure(self, owner, payload, token_hash=None):
-        _fields(payload, {"enabled", "expected_generation"})
+        _fields(payload, {"enabled", "expected_generation"}, optional={"scopes"})
         expected = _integer(payload["expected_generation"])
         enabled = payload["enabled"]
         if type(enabled) is not bool:
             _invalid()
+        if "scopes" in payload:
+            _fields(payload["scopes"], {"conversations", "preferences"}, optional={"attachments"})
+            if any(type(value) is not bool for value in payload["scopes"].values()):
+                _invalid()
         with self.store.connection(write=True) as db:
             eligible = self._authorize(db, owner, token_hash, require_eligible=enabled)
             state = self._state(db, owner)
             if expected != state["generation"]:
                 raise ChatError(409, "同步设置已变化，请刷新后重试。", code="sync_generation_changed")
-            if enabled != state["enabled"]:
+            scopes = {**state["scopes"], **payload.get("scopes", {})}
+            if enabled and not (scopes["conversations"] or scopes["preferences"]):
+                _invalid("请至少选择一类要同步的内容。")
+            scopes_changed = scopes != state["scopes"]
+            if enabled != state["enabled"] or scopes_changed:
                 state.update(enabled=enabled, generation=state["generation"] + 1)
                 db.execute("""INSERT INTO conversation_sync_settings VALUES(?,?,?,?)
                     ON CONFLICT(owner_id) DO UPDATE SET enabled=excluded.enabled,generation=excluded.generation""",
                            (owner, int(state["enabled"]), state["generation"], state["sequence"]))
+            if scopes_changed:
+                db.execute("""INSERT INTO conversation_sync_scopes(owner_id,conversations,preferences)
+                    VALUES(?,?,?)
+                    ON CONFLICT(owner_id) DO UPDATE SET
+                    conversations=excluded.conversations,preferences=excluded.preferences""",
+                           (owner, int(scopes["conversations"]), int(scopes["preferences"])))
+                db.execute("""INSERT INTO conversation_sync_attachment_scopes(owner_id,attachments) VALUES(?,?)
+                    ON CONFLICT(owner_id) DO UPDATE SET attachments=excluded.attachments""",
+                           (owner, int(scopes["attachments"])))
+                state["scopes"] = scopes
             self._authorize(db, owner, token_hash, require_eligible=enabled)
             return {**state, "eligible": eligible}
 
@@ -326,7 +419,7 @@ class ConversationSync:
         with self.store.connection(write=expected is not None) as db:
             if expected is None:
                 db.execute("BEGIN")
-            self._active(db, owner, generation, token_hash)
+            self._active(db, owner, generation, token_hash, scope="preferences" if kind == "preferences" else None)
             row = db.execute("SELECT revision,value FROM conversation_sync_documents WHERE owner_id=? AND kind=?",
                              (owner, kind)).fetchone()
             revision, saved = (row["revision"], row["value"]) if row else (0, None)
@@ -345,7 +438,7 @@ class ConversationSync:
         generation, after = _integer(generation), _integer(after)
         with self.store.connection() as db:
             db.execute("BEGIN")
-            self._active(db, owner, generation, token_hash)
+            self._active(db, owner, generation, token_hash, scope="conversations")
             rows = db.execute("""SELECT id,revision,deleted,content_hash FROM conversation_sync_sessions
                 WHERE owner_id=? AND revision>? ORDER BY revision LIMIT ?""", (owner, after, PAGE_SIZE + 1)).fetchall()
             entries = [{**dict(row), "deleted": bool(row["deleted"])} for row in rows[:PAGE_SIZE]]
@@ -356,12 +449,12 @@ class ConversationSync:
         session_id, generation = _identity(session_id), _integer(generation)
         with self.store.connection() as db:
             db.execute("BEGIN")
-            self._active(db, owner, generation, token_hash)
+            state = self._active(db, owner, generation, token_hash, scope="conversations")
             row = db.execute("SELECT * FROM conversation_sync_sessions WHERE owner_id=? AND id=?",
                              (owner, session_id)).fetchone()
             if row is None:
                 raise ChatError(404, "云端会话不存在。")
-            return self._dto(db, owner, row, generation)
+            return self._dto(db, owner, row, generation, state["scopes"]["attachments"])
 
     def mutate(self, owner, session_id, payload, *, deleted=False, token_hash=None):
         required = {"generation", "expected_revision", "mutation_id"}
@@ -378,11 +471,12 @@ class ConversationSync:
                 raise ChatError(413, "单个云端会话超过 32 MiB，请拆分或导出后重试。")
             snapshot = snapshot_bytes.decode("utf-8")
             files = _files(payload["files"])
-        content_hash = hashlib.sha256(_encoded({"snapshot": payload.get("snapshot"), "files": files,
-                                               "deleted": deleted})).hexdigest()
         request_hash = hashlib.sha256(_encoded({"session_id": session_id, "deleted": deleted, **payload})).hexdigest()
         with self.store.connection(write=True) as db:
-            state = self._active(db, owner, generation, token_hash)
+            state = self._active(db, owner, generation, token_hash, scope="conversations")
+            attachments = state["scopes"]["attachments"]
+            if files and not attachments:
+                raise ChatError(409, "图片与附件原件未启用同步。", code="sync_scope_disabled")
             row = db.execute("SELECT * FROM conversation_sync_sessions WHERE owner_id=? AND id=?",
                              (owner, session_id)).fetchone()
             revision = row["revision"] if row is not None else 0
@@ -391,7 +485,7 @@ class ConversationSync:
             if previous is not None:
                 if previous["request_hash"] != request_hash or previous["revision"] != revision:
                     raise SyncConflict(revision)
-                return self._dto(db, owner, row, generation)
+                return self._dto(db, owner, row, generation, attachments)
             if expected != revision:
                 raise SyncConflict(revision)
             self._check_growth(db, len(snapshot_bytes) - (row["snapshot_size"] if row else 0))
@@ -400,14 +494,25 @@ class ConversationSync:
                                   (owner, file["sha256"])).fetchone()
                 if blob is None or blob["size"] != file["size"]:
                     raise ChatError(409, "附件尚未完整上传，请重试同步。", code="sync_blob_missing")
+            old_files = self._session_files(db, owner, session_id)
+            if old_files and not deleted:
+                references = _attachment_ids(payload["snapshot"])
+                supplied = {file["id"] for file in files}
+                # A device may synchronize a conversation while originals are paused
+                # or before it has downloaded them. Keep originals still referenced.
+                files += [file for file in old_files if file["id"] not in supplied and (
+                    not attachments if references is None else file["id"] in references
+                )]
+                files.sort(key=lambda item: item["id"])
+            content_hash = hashlib.sha256(_encoded({"snapshot": payload.get("snapshot"), "files": files,
+                                                   "deleted": deleted})).hexdigest()
             revision = state["sequence"] + 1
             db.execute("UPDATE conversation_sync_settings SET sequence=? WHERE owner_id=?", (revision, owner))
             db.execute("""INSERT INTO conversation_sync_sessions VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_id,id)
                 DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted,content_hash=excluded.content_hash,
                 snapshot=excluded.snapshot,snapshot_size=excluded.snapshot_size""",
                        (owner, session_id, revision, int(deleted), content_hash, snapshot, len(snapshot_bytes)))
-            old_hashes = {item[0] for item in db.execute("SELECT sha256 FROM conversation_sync_files WHERE owner_id=? AND session_id=?",
-                                                      (owner, session_id)).fetchall()}
+            old_hashes = {item["sha256"] for item in old_files}
             db.execute("DELETE FROM conversation_sync_files WHERE owner_id=? AND session_id=?", (owner, session_id))
             for file in files:
                 db.execute("INSERT INTO conversation_sync_files VALUES(?,?,?,?,?,?)",
@@ -426,7 +531,12 @@ class ConversationSync:
             self._capacity(self._used_bytes(db, owner))
             self._authorize(db, owner, token_hash)
             row = db.execute("SELECT * FROM conversation_sync_sessions WHERE owner_id=? AND id=?", (owner, session_id)).fetchone()
-            return self._dto(db, owner, row, generation)
+            return self._dto(db, owner, row, generation, attachments)
+
+    def check_attachments(self, owner, generation, token_hash):
+        with self.store.connection() as db:
+            db.execute("BEGIN")
+            self._active(db, owner, generation, token_hash, scope="attachments")
 
     def upload(self, owner, checksum, generation, raw, token_hash=None):
         generation = _integer(generation)
@@ -437,7 +547,7 @@ class ConversationSync:
         if hashlib.sha256(raw).hexdigest() != checksum:
             raise ChatError(422, "附件校验失败，请重新同步。", code="sync_blob_invalid")
         with self.store.connection(write=True) as db:
-            self._active(db, owner, generation, token_hash)
+            self._active(db, owner, generation, token_hash, scope="attachments")
             self._clean_orphans(db, owner)
             previous = db.execute("SELECT size FROM conversation_sync_blobs WHERE owner_id=? AND sha256=?",
                                   (owner, checksum)).fetchone()
@@ -454,7 +564,7 @@ class ConversationSync:
             _invalid()
         with self.store.connection() as db:
             db.execute("BEGIN")
-            self._active(db, owner, generation, token_hash)
+            self._active(db, owner, generation, token_hash, scope="attachments")
             row = db.execute("SELECT data FROM conversation_sync_blobs WHERE owner_id=? AND sha256=?",
                              (owner, checksum)).fetchone()
             if row is None:
@@ -573,7 +683,7 @@ def build_conversation_sync_router(store, sync, public_origin=None):
         async def action(account, token_hash, _payload):
             generation = query_integer(request, "generation")
             # Refuse closed or superseded consent before accepting the bytes.
-            await asyncio.to_thread(sync.index, account, generation, 0, token_hash)
+            await asyncio.to_thread(sync.check_attachments, account, generation, token_hash)
             raw = await _body(request, MAX_BLOB_BYTES, "单个同步附件超过 64 MiB。")
             return await asyncio.to_thread(sync.upload, account, checksum, generation, raw, token_hash)
         return await execute(request, action)

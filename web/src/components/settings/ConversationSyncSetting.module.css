@@ -122,3 +122,75 @@
 .confirmText:last-child {
   margin-bottom: 0;
 }
+
+.scopeList {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.scopeOption {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.scopeOption:focus-within {
+  border-color: var(--dsw-alias-button-primary-fill);
+}
+
+.scopeOption > input {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--dsw-alias-button-primary-fill);
+}
+
+.scopeOption span {
+  display: block;
+}
+
+.scopeLabel {
+  color: var(--dsw-alias-label-primary);
+}
+
+.scopeTools {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 8px;
+}
+
+.secondaryAction {
+  padding-inline: 10px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.secondaryAction:hover {
+  text-decoration: underline;
+}
+
+.secondaryAction:focus-visible {
+  outline: 2px solid var(--dsw-alias-button-primary-fill);
+}
+
+.secondaryAction:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.dangerAction {
+  color: var(--dsw-alias-state-error-primary);
+}

@@ -1,6 +1,6 @@
 import { useTranslate } from '../../i18n/index.js'
 import clsx from 'clsx'
-import { memo, useEffect, useState, type ReactNode } from 'react'
+import { memo, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import {
   IconBrowseOutline16,
   IconBrowseWarningOutline16,
@@ -32,6 +32,7 @@ import { Tooltip } from '../base/Tooltip.js'
 import { Markdown } from '../markdown/Markdown.js'
 import { SiteThumbnails } from '../search/SiteLogo.js'
 import { toggleSearchPanel, useSearchPanel } from '../search/searchPanelState.js'
+import { ScrollToBottomContext } from './scrollContext.js'
 import styles from './ReplyArea.module.css'
 import './thinking.markdown.css'
 
@@ -65,8 +66,13 @@ export const ReplyArea = memo(function ReplyArea({
   hasResponse: boolean
 }) {
   useTranslate()
-  const [open, setOpen] = useState(true)
   const titleActive = streaming && !hasResponse
+  const titleId = useId()
+  const [disclosure, setDisclosure] = useState({ active: titleActive, open: titleActive })
+  const open = disclosure.active === titleActive ? disclosure.open : titleActive
+  if (disclosure.active !== titleActive) {
+    setDisclosure({ active: titleActive, open })
+  }
   useTicker(titleActive, 1000)
   if (view.steps.length === 0 && !(message.thinking && streaming)) {
     return null
@@ -75,34 +81,96 @@ export const ReplyArea = memo(function ReplyArea({
   const thinking = message.thinking ?? view.steps.some((step) => step.type === 'thinking')
   const title = thinking ? getAreaTitle(view, streaming, Date.now(), hasResponse) : null
   const stopped = !streaming && !hasResponse
+  const steps = view.steps.map((step, index) => (
+    <StepItem
+      key={stepKey(step, index)}
+      step={step}
+      message={message}
+      sources={view.sources}
+      streaming={streaming}
+      isLast={index === view.steps.length - 1}
+    />
+  ))
   return (
     <div className={styles.area}>
       {title ? (
-        <div className={styles.title} onClick={() => setOpen((value) => !value)}>
+        <button
+          id={titleId}
+          type="button"
+          className={styles.title}
+          aria-expanded={open}
+          onClick={() => setDisclosure({ active: titleActive, open: !open })}
+        >
           <span className={clsx(styles.titleIcon, stopped && styles.stoppedIcon)}>
             <IconThinkOutline16 />
           </span>
           <span className={clsx(styles.titleText, titleActive && styles.shimmer)}>{title}</span>
           {open ? <IconChevronDownOutline14 /> : <IconChevronRightOutline14 />}
-        </div>
+        </button>
       ) : null}
       {open || !title ? (
-        <div className={styles.steps}>
-          {view.steps.map((step, index) => (
-            <StepItem
-              key={stepKey(step, index)}
-              step={step}
-              message={message}
-              sources={view.sources}
-              streaming={streaming}
-              isLast={index === view.steps.length - 1}
-            />
-          ))}
-        </div>
+        title && titleActive && steps.length > 0
+          ? <ActiveThinkingScroll labelId={titleId}>{steps}</ActiveThinkingScroll>
+          : <div>{steps}</div>
       ) : null}
     </div>
   )
 })
+
+const ignoreOuterScroll = () => {}
+
+const ActiveThinkingScroll = ({ labelId, children }: { labelId: string; children: ReactNode }) => {
+  const paneRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+
+  useLayoutEffect(() => {
+    const pane = paneRef.current
+    const content = contentRef.current
+    if (!pane || !content) {
+      return
+    }
+
+    let following = true
+    let previousTop = pane.scrollTop
+    const followContent = () => {
+      if (following) {
+        pane.scrollTop = pane.scrollHeight
+        previousTop = pane.scrollTop
+      }
+    }
+    const onScroll = () => {
+      const top = pane.scrollTop
+      if (top === previousTop) {
+        return
+      }
+      if (pane.scrollHeight - top - pane.clientHeight <= 4) {
+        following = true
+      } else if (top < previousTop) {
+        following = false
+      }
+      previousTop = top
+    }
+
+    pane.addEventListener('scroll', onScroll, { passive: true })
+    const observer = new ResizeObserver(followContent)
+    observer.observe(content)
+    observer.observe(pane)
+    followContent()
+    return () => {
+      pane.removeEventListener('scroll', onScroll)
+      observer.disconnect()
+    }
+  }, [])
+
+  // The message list already observes the pane's layout. Markdown updates within it only need the inner observer.
+  return (
+    <ScrollToBottomContext.Provider value={ignoreOuterScroll}>
+      <div ref={paneRef} className={styles.thinkingScroll} tabIndex={0} role="region" aria-labelledby={labelId}>
+        <div ref={contentRef}>{children}</div>
+      </div>
+    </ScrollToBottomContext.Provider>
+  )
+}
 
 const stepKey = (step: Step, index: number) =>
   step.type === 'thinking' || step.type === 'text' || step.type === 'search'

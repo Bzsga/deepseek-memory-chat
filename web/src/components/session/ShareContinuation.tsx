@@ -10,6 +10,7 @@ import { openAccountLogin } from '../../services/runtime.js'
 import { Button } from '../base/Button.js'
 import { IconChevronRightOutline14, IconLinkOutline16 } from '../base/icons.js'
 import { Modal } from '../base/Modal.js'
+import { showConversationShareControls } from './conversationShareVisibility.js'
 import styles from './ShareContinuation.module.css'
 import {
   clearPendingConversationShare,
@@ -251,7 +252,9 @@ export const ShareContinuationDialog = ({
           </a>
         </section>
       ) : null}
-      <p className={styles.hint}>{t('shareContinuationAppTutorial')}</p>
+      {showConversationShareControls ? (
+        <p className={styles.hint}>{t('shareContinuationAppTutorial')}</p>
+      ) : null}
       <details className={styles.tutorial}>
         <summary>{t('shareContinuationTutorial')}</summary>
         <ol>

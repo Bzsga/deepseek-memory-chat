@@ -1,16 +1,24 @@
 /** Loaded before any account-scoped stores or UI modules are imported. */
 export const API_ORIGIN = __API_ORIGIN__
 
+export type AccountPermissions = {
+  chat_api: boolean
+  image_api: boolean
+  cloud_sync: boolean
+}
 export type RuntimeUser = {
   id: string
   username: string
   role: 'admin' | 'user' | 'guest'
   managed_eligible: boolean
+  permissions: AccountPermissions
+  invite_redeemable: boolean
 }
 export type WeeklyQuota = {
   user_weekly_remaining: number
   reset_at: string
   managed_eligible?: boolean
+  permissions?: AccountPermissions
 }
 export type RuntimeConfig = {
   provider: string
@@ -28,6 +36,48 @@ let runtime: RuntimeConfig | null = null
 let ended = false
 let sessionEndHandler: ((reason: SessionEndReason) => void) | undefined
 let authChannel: BroadcastChannel | undefined
+let runtimeRevision = 0
+let runtimeRefresh: { revision: number; promise: Promise<void> } | undefined
+const userListeners = new Set<(current: RuntimeUser, previous: RuntimeUser) => void>()
+
+export const subscribeRuntimeUser = (listener: (current: RuntimeUser, previous: RuntimeUser) => void) => {
+  userListeners.add(listener)
+  return () => { userListeners.delete(listener) }
+}
+
+export const parseRuntimeUser = (value: unknown): RuntimeUser | undefined => {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+  const user = value as Partial<RuntimeUser>
+  if (
+    typeof user.id !== 'string' || !user.id || user.id.length > 256 ||
+    typeof user.username !== 'string' || (!user.username && user.role !== 'guest') ||
+    (user.role !== 'admin' && user.role !== 'user' && user.role !== 'guest')
+  ) {
+    return undefined
+  }
+  const legacy = user.role !== 'guest' && user.managed_eligible === true
+  const supplied = user.permissions
+  const permissions = user.role === 'guest' || supplied === undefined
+    ? { chat_api: legacy, image_api: legacy, cloud_sync: legacy }
+    : {
+        chat_api: supplied?.chat_api === true,
+        image_api: supplied?.image_api === true,
+        cloud_sync: supplied?.cloud_sync === true,
+      }
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    managed_eligible: permissions.chat_api,
+    permissions: Object.freeze(permissions),
+    invite_redeemable: user.role !== 'guest' && (
+      user.invite_redeemable === true ||
+      (user.invite_redeemable === undefined && supplied === undefined && !legacy)
+    ),
+  }
+}
 
 export const fetchRuntime = async (): Promise<RuntimeConfig> => {
   const controller = new AbortController()
@@ -53,17 +103,11 @@ export const fetchRuntime = async (): Promise<RuntimeConfig> => {
     throw new Error('Invalid runtime configuration')
   }
   const data = value as Partial<RuntimeConfig>
-  const user = data.user
+  const user = parseRuntimeUser(data.user)
   if (
     typeof data.model !== 'string' ||
     !data.model ||
-    !user ||
-    typeof user.id !== 'string' ||
-    !user.id ||
-    user.id.length > 256 ||
-    typeof user.username !== 'string' ||
-    !user.username ||
-    (user.role !== 'admin' && user.role !== 'user')
+    !user || user.role === 'guest'
   ) {
     throw new Error('Invalid account configuration')
   }
@@ -77,12 +121,7 @@ export const fetchRuntime = async (): Promise<RuntimeConfig> => {
       speech: data.features?.speech === true,
       image_generation: data.features?.image_generation === true,
     },
-    user: {
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      managed_eligible: user.managed_eligible === true,
-    },
+    user,
     ...(validWeeklyQuota(data.weekly_quota) ? { weekly_quota: data.weekly_quota } : {}),
   }
 }
@@ -91,14 +130,17 @@ export const localGuestRuntime = (): RuntimeConfig => ({
   provider: 'DeepSeek',
   model: 'deepseek-flash',
   features: { search: true, files: true, speech: true, image_generation: false },
-  user: { id: 'local', username: '', role: 'guest', managed_eligible: false },
+  user: {
+    id: 'local', username: '', role: 'guest', managed_eligible: false, invite_redeemable: false,
+    permissions: { chat_api: false, image_api: false, cloud_sync: false },
+  },
 })
 
 export const isGuestWorkspace = (): boolean => runtime?.user.role === 'guest'
 
-export const openAccountLogin = async (): Promise<void> => {
+export const openAccountLogin = async (section?: 'data'): Promise<void> => {
   const { isNativeConnected, sendNative } = await import('./nativeBridge.js')
-  if (isNativeConnected()) {await sendNative('account.open')}
+  if (isNativeConnected()) {await sendNative('account.open', section ? { section } : undefined)}
   else {window.location.assign(`${API_ORIGIN}/login`)}
 }
 
@@ -116,10 +158,19 @@ export const validWeeklyQuota = (value: unknown): value is WeeklyQuota => {
 }
 
 export const initializeRuntime = (value: RuntimeConfig) => {
-  if (runtime && (runtime.user.id !== value.user.id || runtime.user.role !== value.user.role)) {
+  const user = parseRuntimeUser(value.user)
+  if (!user) {
+    throw new Error('Invalid account configuration')
+  }
+  const previous = runtime?.user
+  if (previous && (previous.id !== user.id || previous.role !== user.role)) {
     throw new Error('Changing account requires a full page reload')
   }
-  runtime = Object.freeze({ ...value, user: Object.freeze({ ...value.user }) })
+  runtime = Object.freeze({ ...value, user: Object.freeze(user) })
+  runtimeRevision++
+  if (previous) {
+    userListeners.forEach((listener) => listener(user, previous))
+  }
 }
 
 export const getRuntime = (): RuntimeConfig => {
@@ -130,12 +181,62 @@ export const getRuntime = (): RuntimeConfig => {
 }
 
 /** Never read or migrate the legacy anonymous chat-demo database/settings. */
+export const guestStorageKey = (name: string): string =>
+  `deepseek-chat:${encodeURIComponent(API_ORIGIN)}:local-guest:${name}`
+
 export const accountStorageKey = (name: string): string =>
   isGuestWorkspace()
-    ? `deepseek-chat:${encodeURIComponent(API_ORIGIN)}:local-guest:${name}`
+    ? guestStorageKey(name)
     : `deepseek-chat:${encodeURIComponent(API_ORIGIN)}:user:${getRuntime().user.id}:${name}`
 
 export const isSessionActive = () => runtime !== null && !ended
+
+/** Share focus and quota refreshes; pre-redemption responses cannot overwrite new permissions. */
+export const refreshRuntime = (): Promise<void> => {
+  if (!isSessionActive()) {
+    return Promise.resolve()
+  }
+  if (runtimeRefresh?.revision === runtimeRevision) {
+    return runtimeRefresh.promise
+  }
+  const started = runtimeRevision
+  const promise: Promise<void> = fetchRuntime()
+    .then((fresh) => {
+      if (!isSessionActive() || started !== runtimeRevision) {
+        return
+      }
+      const current = getRuntime().user
+      if (fresh.user.id !== current.id || fresh.user.role !== current.role) {
+        invalidateSession('changed')
+      } else {
+        initializeRuntime(fresh)
+      }
+    })
+    .catch((error: unknown) => {
+      if (started === runtimeRevision && error instanceof LoginRequired && !isGuestWorkspace()) {
+        invalidateSession('login')
+      }
+    })
+    .finally(() => {
+      if (runtimeRefresh?.promise === promise) {
+        runtimeRefresh = undefined
+      }
+    })
+  runtimeRefresh = { revision: started, promise }
+  return promise
+}
+
+export const denyRuntimePermission = (name: keyof AccountPermissions) => {
+  if (!isSessionActive()) {
+    return
+  }
+  const current = getRuntime()
+  if (current.user.permissions[name]) {
+    initializeRuntime({ ...current, user: {
+      ...current.user, permissions: { ...current.user.permissions, [name]: false },
+    } })
+  }
+}
 
 export const setSessionEndHandler = (handler: (reason: SessionEndReason) => void) => {
   sessionEndHandler = handler

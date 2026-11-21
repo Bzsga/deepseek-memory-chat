@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslate } from '../../i18n/index.js'
 import { MAX_COUNT, MAX_SIZE_MB } from '../../services/attachments.js'
+import { MAX_IMAGE_EDIT_COUNT, MAX_IMAGE_EDIT_MB, MAX_IMAGE_EDIT_TOTAL_MB } from '../../services/imageEditSource.js'
 import styles from './DragMask.module.css'
 
 const hasFiles = (event: DragEvent) => event.dataTransfer?.types.includes('Files') ?? false
@@ -57,17 +58,20 @@ export const useFileDrop = (onDrop: (files: File[]) => void) => {
 }
 
 /** 拖拽遮罩，挂到 body 上盖住整个页面 */
-export const DragMask = () => createPortal(<DragMaskContent />, document.body)
+export const DragMask = ({ imageEdit }: { imageEdit: boolean }) =>
+  createPortal(<DragMaskContent imageEdit={imageEdit} />, document.body)
 
-const DragMaskContent = () => {
+const DragMaskContent = ({ imageEdit }: { imageEdit: boolean }) => {
   const t = useTranslate()
   return (
     <div className={styles.mask}>
       <div className={styles.wrap}>
         <UploadIcon />
-        <div className={styles.title}>{t('dragFileToUpload')}</div>
+        <div className={styles.title}>{t(imageEdit ? 'imageEditChooseSource' : 'dragFileToUpload')}</div>
         <div className={styles.desc}>
-          {t('dragFileDesc', { count: MAX_COUNT, size: MAX_SIZE_MB })}
+          {imageEdit
+            ? t('imageEditSourceHint', { count: MAX_IMAGE_EDIT_COUNT, size: MAX_IMAGE_EDIT_MB, total: MAX_IMAGE_EDIT_TOTAL_MB })
+            : t('dragFileDesc', { count: MAX_COUNT, size: MAX_SIZE_MB })}
         </div>
       </div>
     </div>

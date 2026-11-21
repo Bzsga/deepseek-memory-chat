@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.requests import Request
 
+from account_fixtures import legacy_personal_account
 from app import conversation_shares as module
 from app.config import Settings
 from app.conversation_shares import ConversationShares, build_conversation_share_router
@@ -51,7 +52,7 @@ def setup(tmp_path):
     store = Store(Settings(db_path=str(tmp_path / "test.sqlite3"), worker_enabled=False,
         api_enabled=True, api_key="synthetic-key", weekly_limit=100, user_weekly_limit=20))
     store.initialize()
-    account = store.accounts.register("synthetic_share", "synthetic-password-123")
+    account = legacy_personal_account(store, "synthetic_share")
     shares = ConversationShares(store, tmp_path / "private-shares")
     shares.initialize()
     app = FastAPI()
@@ -141,7 +142,7 @@ def test_authenticated_management_origin_owner_and_cookie_identity(setup):
                       "X-Chat-User-Id": account["user"]["id"]}
     response = client.post(API, json=payload(), headers=cookie_headers)
     assert response.status_code == 201
-    other = store.accounts.register("synthetic_other", "synthetic-password-123")
+    other = legacy_personal_account(store, "synthetic_other")
     share_id = response.json()["id"]
     assert client.get(API, headers=headers(other)).json() == {"shares": []}
     assert client.delete(API + "/" + share_id, headers=headers(other)).status_code == 404
@@ -335,7 +336,7 @@ def test_real_create_app_routes_shares_before_chat_fallback(tmp_path):
     app = create_app(settings)
     with TestClient(app, base_url=ORIGIN) as client:
         store = app.state.store
-        account = store.accounts.register("synthetic_unified", "synthetic-password-123")
+        account = legacy_personal_account(store, "synthetic_unified")
         assert client.post(API, json=payload()).status_code == 401
         created = create(client, account)
         path = API + "/" + created["id"]

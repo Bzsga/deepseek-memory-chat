@@ -36,11 +36,36 @@ class AccountNetworkTest {
         assertEquals(12, parsed.quota.organizationProtocolVersion)
     }
 
+    @Test fun permissionPayloadKeepsChatImageAndSyncIndependent() {
+        val permissions = """"permissions":{"chat_api":false,"image_api":true,"cloud_sync":true},"invite_redeemable":false"""
+        val payload = """{"user":${user.dropLast(1)},$permissions},"quota":$quota}"""
+        val parsed = AccountNetwork.parseProfile(payload).user
+        assertFalse(parsed.managedEligible)
+        assertEquals(ServicePermissions(false, true, true), parsed.servicePermissions)
+        assertEquals(false, parsed.inviteRedeemable)
+        assertThrows(Exception::class.java) {
+            AccountNetwork.parseProfile(payload.replace("\"image_api\":true", "\"image_api\":\"true\""))
+        }
+        assertEquals(ServicePermissions.All,
+            AccountNetwork.parseProfile("""{"user":${user.dropLast(1)},"managed_eligible":true},"quota":$quota}""").user.servicePermissions)
+    }
+
     @Test fun registrationNormalizesUsernameAndKeepsPasswordVerbatim() {
-        val parsed = json(AccountNetwork.credentialsPayload("  Ａｌｉｃｅ_小明  ", "  secret  "))
+        val parsed = json(AccountNetwork.credentialsPayload("  Ａｌｉｃｅ_小明  ", "  secret  ", "SYN-REGISTER-123456"))
         assertEquals("Alice_小明", parsed["username"]!!.jsonPrimitive.content)
         assertEquals("  secret  ", parsed["password"]!!.jsonPrimitive.content)
-        assertEquals(setOf("username", "password"), parsed.keys)
+        assertEquals("SYN-REGISTER-123456", parsed["invitation_code"]!!.jsonPrimitive.content)
+        assertEquals(setOf("username", "password", "invitation_code"), parsed.keys)
+        assertEquals(setOf("username", "password"), json(AccountNetwork.credentialsPayload("User_123", "password123", "  ")).keys)
+        assertEquals(setOf("username", "password"), json(AccountNetwork.credentialsPayload("User_123", "password123")).keys)
+    }
+
+    @Test fun registrationPolicyAcceptsOnlyABooleanFlag() {
+        assertTrue(AccountNetwork.parseSelfServiceRegistration("""{"self_service":true}"""))
+        assertFalse(AccountNetwork.parseSelfServiceRegistration("""{"self_service":false}"""))
+        listOf("""{"self_service":"true"}""", """{"self_service":1}""", "{}").forEach { payload ->
+            assertThrows(IllegalStateException::class.java) { AccountNetwork.parseSelfServiceRegistration(payload) }
+        }
     }
 
     @Test fun usernameAndPasswordLengthsUseUnicodeCharacters() {

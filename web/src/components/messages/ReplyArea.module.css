@@ -2,12 +2,29 @@
   margin-bottom: 10px;
 }
 
+.thinkingScroll {
+  max-height: min(260px, calc(var(--app-viewport-height, 100vh) * 0.32));
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+
+  &:focus-visible {
+    outline: 1px solid var(--dsw-alias-brand-primary);
+    outline-offset: -1px;
+  }
+}
+
 .title {
   display: flex;
   align-items: center;
+  width: 100%;
   height: 34px;
   margin-bottom: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  text-align: start;
   cursor: pointer;
   user-select: none;
   transition: color 0.2s;

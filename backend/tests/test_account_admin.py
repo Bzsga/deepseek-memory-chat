@@ -6,6 +6,7 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from account_fixtures import legacy_personal_account, managed_account
 from app.config import Settings
 from app.main import create_app
 from app.store import digest, local_day, local_week
@@ -161,6 +162,8 @@ def test_registration_invites_are_admin_only_and_unused_codes_remain_shareable(a
     assert len(created) == 2
     assert len({invite["id"] for invite in created}) == len({invite["code"] for invite in created}) == 2
     assert all(invite["code"] and invite["expires_at"] for invite in created)
+    assert all(invite["permissions"] == {"chat_api": True, "image_api": True, "cloud_sync": True}
+               for invite in created)
     unavailable = store.accounts.create_invites(3, 7)["invitations"]
     with store.connection(write=True) as db:
         now = time.time()
@@ -185,27 +188,73 @@ def test_registration_invites_are_admin_only_and_unused_codes_remain_shareable(a
     assert len(users(client, headers)) == 1  # Issuing an invite does not create a user.
 
 
+def test_admin_sets_scoped_account_and_invitation_permissions(account_admin):
+    store, client, headers = account_admin
+    registered = managed_account(store, "SyntheticPermissions")
+    owner = registered["user"]["id"]
+    endpoint = f"/v1/admin/users/{owner}/permissions"
+    invite_url = "/v1/admin/registration-invites"
+    image_only = {"chat_api": False, "image_api": True, "cloud_sync": False}
+    assert client.patch(endpoint, json=image_only).status_code == 401
+    assert client.patch(endpoint, json=image_only,
+        headers={"Authorization": "Bearer " + registered["token"]}).status_code == 403
+    assert client.patch("/v1/admin/users/missing/permissions", headers=headers, json=image_only).status_code == 404
+
+    for invalid in ({}, {"chat_api": False, "image_api": True},
+                    {**image_only, "cloud_sync": 1}, {**image_only, "chat_api": "false"},
+                    {**image_only, "cloud_sync": None}, {**image_only, "other": True}):
+        assert client.patch(endpoint, headers=headers, json=invalid).status_code == 422
+        assert client.post(invite_url, headers=headers, json={"permissions": invalid}).status_code == 422
+    assert client.post(invite_url, headers=headers, json={"permissions": None}).status_code == 422
+
+    changed = client.patch(endpoint, headers=headers, json=image_only)
+    assert changed.status_code == 200
+    assert changed.json()["permissions"] == image_only and changed.json()["invite_redeemable"] is False
+    listed = users(client, headers)[owner]
+    assert listed["permissions"] == image_only and listed["managed_eligible"] is False
+    assert listed["weekly_limit"] == listed["weekly_remaining"] == 5
+
+    sync_only = {"chat_api": False, "image_api": False, "cloud_sync": True}
+    assert client.patch(endpoint, headers=headers, json=sync_only).status_code == 200
+    listed = users(client, headers)[owner]
+    assert listed["permissions"] == sync_only and listed["managed_eligible"] is False
+    assert listed["weekly_limit"] == listed["weekly_remaining"] == 0
+
+    created = client.post(invite_url, headers=headers, json={"permissions": sync_only})
+    assert created.status_code == 200
+    invite = created.json()["invitations"][0]
+    assert invite["permissions"] == sync_only
+    listed = client.get(invite_url, headers=headers).json()["invitations"]
+    assert any(row["id"] == invite["id"] and row["permissions"] == sync_only for row in listed)
+
+
 def test_admin_revoke_managed_is_scoped_authenticated_and_idempotent(account_admin):
     store, client, headers = account_admin
-    invite = store.accounts.create_invites(1, 7)["invitations"][0]["code"]
-    registered = store.accounts.register("SyntheticInvited", "synthetic-account-password")
+    registered = managed_account(store, "SyntheticInvited")
     owner = registered["user"]["id"]
-    store.accounts.redeem_invite(owner, invite)
-    byok = store.accounts.register("SyntheticPersonal", "synthetic-account-password")["user"]["id"]
+    byok = legacy_personal_account(store, "SyntheticPersonal")["user"]["id"]
     endpoint = f"/v1/admin/users/{owner}/revoke-managed"
     assert client.post(endpoint).status_code == 401
     assert client.post(endpoint, headers={"Authorization": "Bearer " + registered["token"]}).status_code == 403
     before = users(client, headers)
     assert before[owner]["managed_eligible"] is True
     assert before[byok]["managed_eligible"] is False
+    assert before[owner]["invite_redeemable"] is False and before[byok]["invite_redeemable"] is True
     for _ in range(2):
         response = client.post(endpoint, headers=headers)
         assert response.status_code == 200, response.text
         assert response.json() == {"id": owner, "managed_eligible": False}
     after = users(client, headers)
     assert after[owner]["managed_eligible"] is False and after[owner]["enabled"] is True
+    assert after[owner]["invite_redeemable"] is True
     assert after[byok] == before[byok]
     assert client.post("/v1/admin/users/missing/revoke-managed", headers=headers).status_code == 404
+
+    inactive = before[byok]["permissions"]
+    assert inactive == {"chat_api": False, "image_api": False, "cloud_sync": False}
+    assert client.patch(f"/v1/admin/users/{byok}/permissions", headers=headers, json=inactive).status_code == 200
+    locked = users(client, headers)[byok]
+    assert locked["permissions"] == inactive and locked["invite_redeemable"] is False
 
 
 def test_console_admin_rotation_revokes_old_sessions(account_admin):

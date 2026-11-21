@@ -53,6 +53,22 @@ export function customEndpointFixture(subpathKey) {
   async function exercise(page, origin) {
     const button = name => page.getByRole('button', {name,exact:true})
     await page.goto(origin + '/deepseek/')
+    const draft = page.getByPlaceholder('请输入消息')
+    const pendingText = '配置前保留这段草稿。'
+    const provider = page.getByRole('dialog', {name:'聊天 API',exact:true})
+    await draft.fill(pendingText)
+    await button('发送').click()
+    await provider.waitFor()
+    assert.equal(await page.getByRole('dialog').count(), 1)
+    assert.equal(new URL(page.url()).hash, '')
+    await page.evaluate(() => history.back())
+    await provider.waitFor({state:'hidden'})
+    assert.equal(await draft.inputValue(), pendingText)
+    await page.getByRole('button', {name:/^填写(?:个人)?\s*API Key/}).click()
+    await provider.waitFor()
+    await page.keyboard.press('Escape')
+    await provider.waitFor({state:'hidden'})
+    assert.equal(await draft.inputValue(), pendingText)
     for (const [base, key] of [[root,rootKey],[destination,subpathKey],[official,officialKey]]) {
       await button('设置').click()
       const form = await openAdvancedChat(page)

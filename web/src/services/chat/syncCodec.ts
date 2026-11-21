@@ -260,7 +260,7 @@ const reply = (
     ...(item.imageGeneration !== undefined
       ? { imageGeneration: boolean(item.imageGeneration) }
       : {}),
-    ...(item.imageOrigin !== undefined ? { imageOrigin: oneOf(item.imageOrigin, ['chat']) } : {}),
+    ...(item.imageOrigin !== undefined ? { imageOrigin: oneOf(item.imageOrigin, ['chat', 'edit']) } : {}),
     ...(item.imageModel !== undefined ? { imageModel: text(item.imageModel, 256) } : {}),
     ...(item.imageAction !== undefined
       ? { imageAction: validateImageActionTrace(item.imageAction) }

@@ -9,7 +9,7 @@ import {
 const scenario = new URLSearchParams(location.search).get('case') ?? 'main'
 const KEY_A = 'SYNTHETIC_PERSONAL_KEY_A_0123456789'
 const KEY_B = 'SYNTHETIC_PERSONAL_KEY_B_0123456789'
-const owner = scenario === 'other' ? 'qa-provider-other' : 'qa-provider-main'
+const owner = scenario === 'guest-copy' ? 'qa-guest-copy' : scenario === 'other' ? 'qa-provider-other' : 'qa-provider-main'
 initializeRuntime(scenario === 'guest' ? localGuestRuntime() : {
   provider: 'DeepSeek',
   model: 'deepseek-flash',
@@ -537,7 +537,41 @@ try {
     }
     provider.updateManagedEligibility(true)
     check(!provider.useChatProvider.getState().managedEligible && calls.length === 4,'guest_allowed_managed')
+    const db = await import('../../src/services/chat/db.ts')
+    await db.appendSession({
+      id: 'guest-original', title: 'Synthetic guest history', createdAt: 1, updatedAt: 2,
+      rootMessageId: 'g-question', messages: [
+        { id: 'g-question', role: 'user', parentId: null, selectedChildId: 'g-active', content: 'Example', createdAt: 1,
+          files: [{ id: 'fixture-file', name: 'note.txt', size: 4, mimeType: 'text/plain', isImage: false,
+            serverId: 'guest-provider-handle', serverScope: 'guest-api' }] },
+        { id: 'g-active', role: 'assistant', parentId: 'g-question', createdAt: 2, status: 'done', prefix: false,
+          model: null, blocks: [{ type: 'text', text: 'Current branch' }] },
+        { id: 'g-alt', role: 'assistant', parentId: 'g-question', createdAt: 2, status: 'streaming', prefix: true,
+          model: null, blocks: [{ type: 'text', text: 'Other branch' }] },
+      ],
+    }, () => true, [{ id: 'fixture-file', blob: new Blob(['test'], {type:'text/plain'}) }])
     results.cases.push('local guest key direct chat/file/ASR/TTS, no application-account headers, no managed operations')
+    results.passed = true
+  } else if (scenario === 'guest-copy') {
+    const history = await import('../../src/services/chat/guestHistory.ts')
+    const db = await import('../../src/services/chat/db.ts')
+    check(await history.countGuestChats() === 1 && (await db.loadSessionSummaries()).length === 0, 'guest_data_visible_without_copy')
+    await history.copyGuestChats(() => false).then(
+      () => { throw Error('unconfirmed_copy_writes') }, () => {}
+    )
+    check(await history.copyGuestChats(() => true) === 1, 'guest_copy_failed')
+    const [summary] = await db.loadSessionSummaries()
+    const copy = await db.loadSession(summary.id)
+    const file = copy.messages[0].files[0]
+    check(copy.id !== 'guest-original' && copy.rootMessageId === 'g-question' && copy.messages.length === 3 &&
+      copy.messages[0].selectedChildId === 'g-active' && copy.messages[2].status === 'stopped', 'guest_copy_lost_branches')
+    check(file.id !== 'fixture-file' && !file.serverId && !file.serverScope &&
+      await (await db.loadFile(file.id)).text() === 'test', 'guest_copy_reused_provider_file_or_lost_original')
+    await db.saveSession({...copy, title: 'Keep account edit'})
+    check(await history.copyGuestChats(() => true) === 0 &&
+      (await db.loadSession(copy.id)).title === 'Keep account edit' &&
+      await history.countGuestChats() === 1 && calls.length === 0, 'guest_copy_retry_not_safe')
+    results.cases.push('confirmed cross-workspace copy preserves branches and local files, without API calls or duplicate overwrites')
     results.passed = true
   } else {
     check(

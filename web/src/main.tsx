@@ -7,8 +7,8 @@ import {
   initializeRuntime,
   localGuestRuntime,
   isGuestWorkspace,
-  invalidateSession,
   isSessionActive,
+  refreshRuntime,
   setSessionEndHandler,
 } from './services/runtime.js'
 import './app/bootstrap.css'
@@ -77,41 +77,6 @@ setSessionEndHandler(() => {
   window.location.reload()
 })
 
-let validating: Promise<void> | undefined
-const revalidate = (): Promise<void> => {
-  if (!isSessionActive()) {
-    return Promise.resolve()
-  }
-  if (validating) {
-    return validating
-  }
-  // Focus can arrive between touch-down and click in Android WebView. Keep
-  // the mounted page interactive while the account check runs in the background.
-  validating = fetchRuntime()
-    .then((fresh) => {
-      if (fresh.user.id !== getRuntime().user.id || fresh.user.role !== getRuntime().user.role) {
-        invalidateSession('changed')
-      } else if (isSessionActive()) {
-        const changedImageService = fresh.features.image_generation !== getRuntime().features.image_generation
-        initializeRuntime(fresh)
-        chatProvider?.updateManagedEligibility(fresh.user.managed_eligible === true)
-        if (changedImageService) {void import('./services/imageProvider.js').then(({useImageProvider}) => useImageProvider.setState({}))}
-        hideStatus()
-      }
-    })
-    .catch((error: unknown) => {
-      if (error instanceof LoginRequired && !isGuestWorkspace()) {
-        invalidateSession('login')
-      }
-      // A later focus/visibility/auth event retries transient failures. Each
-      // model request still authenticates its cookie and claimed account server-side.
-    })
-    .finally(() => {
-      validating = undefined
-    })
-  return validating
-}
-
 let starting = false
 let initialized = false
 const start = async (localOnly = false) => {
@@ -133,16 +98,18 @@ const start = async (localOnly = false) => {
     app.startApp()
     resolveWorkspaceReady()
     hideStatus()
-    bindAuthChannel(() => void revalidate())
+    // Mobile WebView can focus between touch-down and click. Keep the UI mounted
+    // while account and permission checks run in the background.
+    bindAuthChannel(() => void refreshRuntime())
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        void revalidate()
+        void refreshRuntime()
       }
     })
-    window.addEventListener('focus', () => void revalidate())
+    window.addEventListener('focus', () => void refreshRuntime())
     window.addEventListener('pageshow', (event) => {
       if (event.persisted) {
-        void revalidate()
+        void refreshRuntime()
       }
     })
   } catch (error) {

@@ -31,6 +31,7 @@ import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
 import styles from './MemoryActions.module.css'
 import { ConversationShareDialog } from './ConversationShareDialog.js'
+import { showConversationShareControls } from './conversationShareVisibility.js'
 
 type ExportFormat = 'markdown' | 'text' | 'json' | 'zip'
 
@@ -38,7 +39,8 @@ type ExportFormat = 'markdown' | 'text' | 'json' | 'zip'
 export const MemoryActions = ({ session, disabled }: { session: Session; disabled: boolean }) => {
   const t = useTranslate()
   const messages = getVisibleMessages(session)
-  const showShare = messages.length > 0 && !messages.some(message => message.role === 'assistant' && message.status === 'done')
+  const showShare = showConversationShareControls && messages.length > 0 &&
+    !messages.some(message => message.role === 'assistant' && message.status === 'done')
   const [panel, setPanel] = useState<'memory' | 'export' | 'share' | null>(null)
   const importing = useChatStore((state) => state.importingHistory)
   return (
@@ -79,7 +81,7 @@ export const MemoryActions = ({ session, disabled }: { session: Session; disable
           />
         )}
       </Menu>
-      {panel === 'share' ? (
+      {showConversationShareControls && panel === 'share' ? (
         <ConversationShareDialog
           key={session.id}
           session={session}

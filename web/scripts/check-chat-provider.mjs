@@ -179,7 +179,7 @@ try {
   await call('Runtime.enable')
   await call('Fetch.enable', { patterns: [{ urlPattern: '*' }] })
   let scope
-  for (const scenario of ['main', 'reload', 'corrupt', 'other', 'guest']) {
+  for (const scenario of ['main', 'reload', 'corrupt', 'other', 'guest', 'guest-copy']) {
     await call('Page.navigate', { url: 'https://qa.invalid/test?case=' + scenario })
     const result = await waitFor(
       () => evaluate('window.__chatProviderCheck'),

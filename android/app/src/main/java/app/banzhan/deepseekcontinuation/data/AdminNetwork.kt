@@ -15,11 +15,15 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 
 /** Developer credentials are independent of BYOK and free-session credentials. */
 object AdminNetwork {
     private val contentType = "application/json; charset=utf-8".toMediaType()
+    private const val OPEN_PERMISSIONS_PATH = "account-feature-access"
+    private const val REGISTRATION_POLICY_PATH = "registration-policy"
 
     suspend fun getAdminConfig(prefs: DeveloperPrefs): AdminConfig {
         val request = authenticated(prefs, "config").get().build()
@@ -33,6 +37,60 @@ object AdminNetwork {
         val payload = SummaryNetwork.exchange(request, mutation = true,
             secrets = listOfNotNull(prefs.sessionToken, upstreamApiKey))
         return parseResponse { parseAdminConfig(payload) }
+    }
+
+    suspend fun getOpenPermissions(prefs: DeveloperPrefs): ServicePermissions {
+        val request = authenticated(prefs, OPEN_PERMISSIONS_PATH).get().build()
+        val payload = SummaryNetwork.exchange(request, mutation = false, secrets = listOf(prefs.sessionToken))
+        return parseResponse { parseOpenPermissions(payload) }
+    }
+
+    suspend fun updateOpenPermissions(prefs: DeveloperPrefs, permissions: ServicePermissions): ServicePermissions {
+        val request = openPermissionsPatchRequest(prefs, permissions)
+        val payload = SummaryNetwork.exchange(request, mutation = true, secrets = listOf(prefs.sessionToken))
+        return parseResponse(mutation = true) { parseOpenPermissions(payload) }
+    }
+
+    internal fun openPermissionsPatchRequest(prefs: DeveloperPrefs, permissions: ServicePermissions): Request =
+        sameOriginPatch(prefs, OPEN_PERMISSIONS_PATH, permissions.toWireJson())
+
+    suspend fun getRegistrationPolicy(prefs: DeveloperPrefs): Boolean {
+        val request = authenticated(prefs, REGISTRATION_POLICY_PATH).get().build()
+        val payload = SummaryNetwork.exchange(request, mutation = false, secrets = listOf(prefs.sessionToken))
+        return parseResponse { AccountNetwork.parseSelfServiceRegistration(payload) }
+    }
+
+    suspend fun updateRegistrationPolicy(prefs: DeveloperPrefs, selfService: Boolean): Boolean {
+        val request = registrationPolicyPatchRequest(prefs, selfService)
+        val payload = SummaryNetwork.exchange(request, mutation = true, secrets = listOf(prefs.sessionToken))
+        return parseResponse(mutation = true) { AccountNetwork.parseSelfServiceRegistration(payload) }
+    }
+
+    internal fun registrationPolicyPatchRequest(prefs: DeveloperPrefs, selfService: Boolean): Request =
+        sameOriginPatch(prefs, REGISTRATION_POLICY_PATH, buildJsonObject { put("self_service", selfService) })
+
+    private fun sameOriginPatch(prefs: DeveloperPrefs, path: String, json: JsonObject): Request {
+        val payload = json.toString().encodeToByteArray()
+        val body = object : RequestBody() {
+            override fun contentType() = contentType
+            override fun contentLength() = payload.size.toLong()
+            override fun writeTo(sink: BufferedSink) { sink.write(payload) }
+            override fun isOneShot() = true
+        }
+        val request = authenticated(prefs, path)
+            .patch(body).build()
+        val origin = request.url.newBuilder().encodedPath("/").build().toString().removeSuffix("/")
+        return request.newBuilder().header("Origin", origin).build()
+    }
+
+    internal fun parseOpenPermissions(payload: String): ServicePermissions {
+        val root = objectResponse(payload)
+        require(root.keys == setOf("chat_api", "image_api", "cloud_sync")) { "全局权限字段无效" }
+        return ServicePermissions(
+            chatApi = root.boolean("chat_api"),
+            imageApi = root.boolean("image_api"),
+            cloudSync = root.boolean("cloud_sync"),
+        )
     }
 
     suspend fun getStats(prefs: DeveloperPrefs, days: Int = 7): AdminStats {
@@ -133,6 +191,7 @@ object AdminNetwork {
             val accessMode = user.text("access_mode")
             require(accessMode in setOf("public", "invitation")) { "用户访问方式无效" }
             val lastSeenAt = if (user["last_seen_at"] == JsonNull) null else user.timestamp("last_seen_at")
+            val permissions = user.readServicePermissions()
             UserUsage(user.text("id"), accessMode, user.timestamp("created_at"), lastSeenAt,
                 user.nonnegativeInteger("weekly_limit"), user.nonnegativeInteger("weekly_used"),
                 user.nonnegativeInteger("weekly_reserved"), user.nonnegativeInteger("weekly_remaining"),
@@ -146,8 +205,10 @@ object AdminNetwork {
                 },
                 weeklyLimitOverride = if (user["weekly_limit_override"] == null || user["weekly_limit_override"] == JsonNull) null
                     else user.nonnegativeInteger("weekly_limit_override"),
-                managedEligible = "managed_eligible" in user && user.boolean("managed_eligible"),
-                enabled = if ("enabled" in user) user.boolean("enabled") else true)
+                managedEligible = permissions?.chatApi ?: (user.readAccountFlag("managed_eligible") == true),
+                enabled = if ("enabled" in user) user.boolean("enabled") else true,
+                permissions = permissions,
+                inviteRedeemable = user.readAccountFlag("invite_redeemable"))
         }
         return AdminUsersPage(limit, offset, root.count("total"), users,
             week = root.optionalText("week")?.also { LocalDate.parse(it) },
@@ -202,12 +263,21 @@ object AdminNetwork {
     private data class RegistrationInvitesPage(val limit: Int, val offset: Int, val total: Int,
         val invitations: List<AdminRegistrationInvite>)
 
-    suspend fun createRegistrationInvites(prefs: DeveloperPrefs, count: Int, validDays: Int): List<AdminRegistrationInvite> {
-        require(count in 1..100 && validDays in 1..365) { "邀请码数量须为1–100，有效期须为1–365天。" }
-        val body = buildJsonObject { put("count", count); put("valid_days", validDays) }.toString()
+    suspend fun createRegistrationInvites(prefs: DeveloperPrefs, count: Int, validDays: Int,
+        permissions: ServicePermissions): List<AdminRegistrationInvite> {
+        val body = registrationInvitePayload(count, validDays, permissions)
         val payload = SummaryNetwork.exchange(authenticated(prefs, "registration-invites")
             .post(body.toRequestBody(contentType)).build(), mutation = true, secrets = listOf(prefs.sessionToken))
         return parseResponse { parseRegistrationInvites(payload) }
+    }
+
+    internal fun registrationInvitePayload(count: Int, validDays: Int, permissions: ServicePermissions): String {
+        require(count in 1..100 && validDays in 1..365) { "邀请码数量须为1–100，有效期须为1–365天。" }
+        return buildJsonObject {
+            put("count", count)
+            put("valid_days", validDays)
+            put("permissions", permissions.toWireJson())
+        }.toString()
     }
 
     suspend fun updateUserQuota(prefs: DeveloperPrefs, userId: String, weeklyLimit: Int?,
@@ -218,10 +288,11 @@ object AdminNetwork {
             .patch(body.toRequestBody(contentType)).build(), mutation = true, secrets = listOf(prefs.sessionToken))
     }
 
-    suspend fun revokeManaged(prefs: DeveloperPrefs, userId: String) {
+    suspend fun updateUserPermissions(prefs: DeveloperPrefs, userId: String, permissions: ServicePermissions) {
         require(userId.isNotBlank() && userId.length <= 256) { "用户编号无效" }
-        SummaryNetwork.exchange(authenticated(prefs, "users", userId, "revoke-managed")
-            .post("".toRequestBody(null)).build(), mutation = true, secrets = listOf(prefs.sessionToken))
+        SummaryNetwork.exchange(authenticated(prefs, "users", userId, "permissions")
+            .patch(permissions.toWireJson().toString().toRequestBody(contentType)).build(),
+            mutation = true, secrets = listOf(prefs.sessionToken))
     }
 
     suspend fun setUserEnabled(prefs: DeveloperPrefs, userId: String, enabled: Boolean) {
@@ -275,7 +346,8 @@ object AdminNetwork {
                 expiresAt = value.timestamp("expires_at"),
                 createdAt = value.optionalText("created_at")?.also { OffsetDateTime.parse(it) }.orEmpty(),
                 usedAt = value.optionalText("redeemed_at")?.also { OffsetDateTime.parse(it) },
-                usedBy = value.optionalText("redeemed_by"))
+                usedBy = value.optionalText("redeemed_by"),
+                permissions = value.readServicePermissions() ?: ServicePermissions.All)
         }
     }
 
@@ -296,13 +368,13 @@ object AdminNetwork {
         return SummaryNetwork.authenticated(SummaryNetwork.companionEndpoint(prefs.serviceUrl, "admin", *path), prefs.sessionToken)
     }
 
-    private fun <T> parseResponse(block: () -> T): T = try {
+    private fun <T> parseResponse(mutation: Boolean = false, block: () -> T): T = try {
         block()
     } catch (error: CancellationException) {
         throw error
     } catch (error: Exception) {
         // Do not surface parser excerpts, which could contain an incorrectly echoed secret.
-        throw SummaryFailure("开发者服务响应格式无效，请刷新后再试", ambiguous = false)
+        throw SummaryFailure("开发者服务响应格式无效，请刷新后确认。", ambiguous = mutation)
     }
 
     private fun objectResponse(payload: String): JsonObject =

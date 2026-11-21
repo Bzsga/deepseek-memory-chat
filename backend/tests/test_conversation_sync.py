@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.requests import Request
 
+from account_fixtures import legacy_personal_account, managed_account
 from app import conversation_sync as module
 from app.chat import ChatError
 from app.config import Settings
@@ -21,6 +22,7 @@ ORIGIN = "https://digimonlegend.com"
 API = "/chat/api/conversation-sync"
 RAW = b"synthetic attachment\x00\xff"
 CHECKSUM = hashlib.sha256(RAW).hexdigest()
+ALL_SCOPES = {"conversations": True, "preferences": True, "attachments": True}
 
 
 def headers(account):
@@ -45,7 +47,7 @@ def setup(tmp_path):
     store = Store(Settings(db_path=str(tmp_path / "private-sync.sqlite3"), worker_enabled=False,
                            api_enabled=True, api_key="synthetic-key", weekly_limit=100, user_weekly_limit=20))
     store.initialize()
-    account = invite(store, store.accounts.register("synthetic_sync", "synthetic-password-123"))
+    account = managed_account(store, "synthetic_sync")
     sync = ConversationSync(store)
     sync.initialize()
     app = FastAPI()
@@ -83,7 +85,8 @@ def assert_no_usage(store, account):
 def test_default_closed_and_account_metadata_only(setup):
     store, account, _sync, client = setup
     response = client.get(API, headers=headers(account))
-    assert response.json() == {"enabled": False, "generation": 0, "sequence": 0, "eligible": True}
+    assert response.json() == {"enabled": False, "generation": 0, "sequence": 0, "eligible": True,
+                               "scopes": ALL_SCOPES}
     assert response.headers["cache-control"] == "no-store"
     targets = [("get", "/index?generation=0", None),
                ("get", "/sessions/synthetic-session?generation=0", None),
@@ -113,7 +116,7 @@ def test_private_access_origin_identity_and_session(setup):
     enable(client, account)
     upload(client, account)
     own = write(client, account, payload(files=True))
-    other = invite(store, store.accounts.register("synthetic_second", "synthetic-password-123", client_ip="synthetic-other"))
+    other = managed_account(store, "synthetic_second")
     enable(client, other)
     assert client.get(API + "/sessions/" + own["id"] + "?generation=1", headers=headers(other)).status_code == 404
     assert client.get(API + "/blobs/" + CHECKSUM + "?generation=1", headers=headers(other)).status_code == 404
@@ -125,12 +128,13 @@ def test_private_access_origin_identity_and_session(setup):
 
 def test_pause_retains_copies_reenable_and_clear_erases_every_owner_payload(setup):
     store, account, sync, client = setup
-    assert enable(client, account) == {"enabled": True, "generation": 1, "sequence": 0, "eligible": True}
+    assert enable(client, account) == {"enabled": True, "generation": 1, "sequence": 0, "eligible": True,
+                                       "scopes": ALL_SCOPES}
     assert enable(client, account, generation=1)["generation"] == 1
     upload(client, account)
     original = write(client, account, payload(files=True))
     paused = client.patch(API, json={"enabled": False, "expected_generation": 1}, headers=headers(account)).json()
-    assert paused == {"enabled": False, "generation": 2, "sequence": 1, "eligible": True}
+    assert paused == {"enabled": False, "generation": 2, "sequence": 1, "eligible": True, "scopes": ALL_SCOPES}
     for generation, code in ((1, "sync_generation_changed"), (2, "sync_disabled")):
         result = client.get(API + f"/sessions/synthetic-session?generation={generation}", headers=headers(account))
         assert result.status_code == 409 and result.json()["error"]["code"] == code
@@ -140,7 +144,7 @@ def test_pause_retains_copies_reenable_and_clear_erases_every_owner_payload(setu
     recovered = client.get(API + "/sessions/synthetic-session?generation=3", headers=headers(account)).json()
     assert recovered["snapshot"] == original["snapshot"] and recovered["files"] == original["files"]
     cleared = client.request("DELETE", API, json={"expected_generation": 3}, headers=headers(account))
-    assert cleared.json() == {"enabled": False, "generation": 4, "sequence": 1, "eligible": True}
+    assert cleared.json() == {"enabled": False, "generation": 4, "sequence": 1, "eligible": True, "scopes": ALL_SCOPES}
     with store.connection() as db:
         for table in ("sessions", "blobs", "files", "mutations"):
             assert db.execute("SELECT COUNT(*) FROM conversation_sync_" + table).fetchone()[0] == 0
@@ -153,11 +157,12 @@ def test_pause_retains_copies_reenable_and_clear_erases_every_owner_payload(setu
 
 def test_invitation_required_and_revocation_resets_consent_but_allows_clear(setup):
     store, _eligible, _, client = setup
-    account = store.accounts.register("no_invite", "synthetic-password-123", client_ip="uninvited")
+    account = legacy_personal_account(store, "no_invite")
     auth = headers(account)
     owner = account["user"]["id"]
 
-    assert client.get(API, headers=auth).json() == {"enabled": False, "generation": 0, "sequence": 0, "eligible": False}
+    assert client.get(API, headers=auth).json() == {"enabled": False, "generation": 0, "sequence": 0, "eligible": False,
+                                                   "scopes": ALL_SCOPES}
     blocked = client.patch(API, json={"enabled": True, "expected_generation": 0}, headers=auth)
     assert blocked.status_code == 403 and blocked.json()["error"]["code"] == "sync_invitation_required"
     invite(store, account)
@@ -167,7 +172,7 @@ def test_invitation_required_and_revocation_resets_consent_but_allows_clear(setu
 
     store.accounts.revoke_managed(owner)
     assert store.accounts.authenticate(account["token"]) == owner
-    paused = {"enabled": False, "generation": 2, "sequence": 1, "eligible": False}
+    paused = {"enabled": False, "generation": 2, "sequence": 1, "eligible": False, "scopes": ALL_SCOPES}
     assert client.get(API, headers=auth).json() == paused
     assert client.patch(API, json={"enabled": False, "expected_generation": 2}, headers=auth).json() == paused
     for route in ("/index", "/sessions/synthetic-session", "/blobs/" + CHECKSUM, "/preferences", "/key-envelope"):
@@ -196,15 +201,203 @@ def test_initialize_pauses_pre_invitation_consents_once(setup):
     write(client, account)
     owner = account["user"]["id"]
     with store.connection(write=True) as db:
-        db.execute("DROP TRIGGER sync_pause_on_invitation_revocation")
-    store.accounts.revoke_managed(owner)
+        db.execute("DROP TRIGGER sync_pause_on_cloud_revocation")
+        db.execute("""CREATE TRIGGER sync_pause_on_invitation_revocation
+            AFTER UPDATE OF managed_eligible ON registered_accounts
+            WHEN OLD.managed_eligible=1 AND NEW.managed_eligible=0 BEGIN
+                UPDATE conversation_sync_settings SET enabled=0,generation=generation+1
+                WHERE owner_id=NEW.user_id AND enabled=1;
+            END""")
+    store.accounts.set_permissions(owner, {"chat_api": True, "image_api": True, "cloud_sync": False})
     sync.initialize()
     sync.initialize()
     assert client.get(API, headers=headers(account)).json() == {
-        "enabled": False, "generation": 2, "sequence": 1, "eligible": False,
+        "enabled": False, "generation": 2, "sequence": 1, "eligible": False, "scopes": ALL_SCOPES,
     }
     with store.connection() as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_pause_on_invitation_revocation'").fetchone() is None
         assert db.execute("SELECT COUNT(*) FROM conversation_sync_sessions WHERE owner_id=?", (owner,)).fetchone()[0] == 1
+
+
+def test_cloud_sync_permissions_are_independent_and_revocation_requires_new_consent(setup):
+    store, account, _, client = setup
+    owner = account["user"]["id"]
+    auth = headers(account)
+    sync_only = {"chat_api": False, "image_api": False, "cloud_sync": True}
+    store.accounts.set_permissions(owner, sync_only)
+    enable(client, account)
+    original = write(client, account)
+    store.accounts.set_permissions(owner, {**sync_only, "chat_api": True})
+    assert client.get(API, headers=auth).json()["generation"] == 1
+    store.accounts.set_permissions(owner, {**sync_only, "cloud_sync": False, "image_api": True})
+    paused = {"enabled": False, "generation": 2, "sequence": 1, "eligible": False, "scopes": ALL_SCOPES}
+    assert client.get(API, headers=auth).json() == paused
+    assert client.get(API + "/index?generation=2", headers=auth).status_code == 403
+    store.accounts.set_permissions(owner, sync_only)
+    assert client.get(API, headers=auth).json() == {**paused, "eligible": True}
+    assert client.get(API + "/index?generation=2", headers=auth).status_code == 409
+    enable(client, account, generation=2)
+    restored = client.get(API + "/sessions/synthetic-session?generation=3", headers=auth).json()
+    assert restored["snapshot"] == original["snapshot"]
+    store.accounts.set_permissions(owner, {**sync_only, "cloud_sync": False, "image_api": True})
+    assert client.request("DELETE", API, json={"expected_generation": 4}, headers=auth).status_code == 200
+    assert_no_usage(store, account)
+
+
+def test_scope_changes_block_each_category_and_preserve_copies_until_cleared(setup):
+    store, account, _sync, client = setup
+    auth = headers(account)
+    only_preferences = {"conversations": False, "preferences": True}
+    only_conversations = {"conversations": True, "preferences": False}
+    session = "/sessions/synthetic-session"
+    attachment = "/blobs/" + CHECKSUM
+    preference_data = {"themePreference": "dark"}
+    enable(client, account)
+    upload(client, account)
+    original = write(client, account, payload(files=True))
+
+    preference_only = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 1, "scopes": only_preferences,
+    })
+    assert preference_only.json() == {"enabled": True, "generation": 2, "sequence": 1,
+                                      "eligible": True, "scopes": {**only_preferences, "attachments": True}}
+    assert enable(client, account, generation=2) == preference_only.json()
+    stale = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 1, "scopes": only_conversations,
+    })
+    assert (stale.status_code, stale.json()["error"]["code"]) == (409, "sync_generation_changed")
+    stale_read = client.get(API + session + "?generation=1", headers=auth)
+    assert (stale_read.status_code, stale_read.json()["error"]["code"]) == (409, "sync_generation_changed")
+    forbidden = [
+        client.get(API + suffix + "?generation=2", headers=auth) for suffix in ("/index", session, attachment)
+    ] + [
+        client.put(API + session, json=payload(generation=2), headers=auth),
+        client.request("DELETE", API + session, headers=auth,
+                       json={"generation": 2, "expected_revision": 1, "mutation_id": "scope-delete"}),
+        client.put(API + attachment + "?generation=2", content=RAW, headers=auth),
+    ]
+    for response in forbidden:
+        assert (response.status_code, response.json()["error"]["code"]) == (409, "sync_scope_disabled")
+    saved_preference = client.put(API + "/preferences", headers=auth, json={
+        "generation": 2, "expected_revision": 0, "value": preference_data,
+    })
+    assert saved_preference.json() == {"generation": 2, "revision": 1, "value": preference_data}
+
+    conversation_only = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 2, "scopes": only_conversations,
+    })
+    assert conversation_only.json()["generation"] == 3
+    assert client.get(API + session + "?generation=3", headers=auth).json() == {**original, "generation": 3}
+    assert client.get(API + attachment + "?generation=3", headers=auth).content == RAW
+    for response in (
+        client.get(API + "/preferences?generation=3", headers=auth),
+        client.put(API + "/preferences", headers=auth,
+                   json={"generation": 3, "expected_revision": 1, "value": {"themePreference": "light"}}),
+    ):
+        assert (response.status_code, response.json()["error"]["code"]) == (409, "sync_scope_disabled")
+    assert client.get(API + "/key-envelope?generation=3", headers=auth).json()["value"] is None
+
+    paused = client.patch(API, headers=auth, json={"enabled": False, "expected_generation": 3})
+    assert paused.json()["scopes"] == {**only_conversations, "attachments": True}
+    assert enable(client, account, generation=4)["scopes"] == {**only_conversations, "attachments": True}
+    restored = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 5, "scopes": ALL_SCOPES,
+    })
+    assert restored.json()["generation"] == 6
+    assert client.get(API + "/preferences?generation=6", headers=auth).json()["value"] == preference_data
+    restricted = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 6, "scopes": only_conversations,
+    })
+    assert restricted.json()["generation"] == 7
+    cleared = client.request("DELETE", API, headers=auth, json={"expected_generation": 7})
+    assert cleared.json()["scopes"] == {**only_conversations, "attachments": True}
+    with store.connection() as db:
+        for table in ("sessions", "blobs", "documents"):
+            assert db.execute(f"SELECT COUNT(*) FROM conversation_sync_{table}").fetchone()[0] == 0
+    assert_no_usage(store, account)
+
+
+def test_attachment_consent_pauses_transfers_without_losing_existing_originals(setup):
+    store, account, sync, client = setup
+    auth = headers(account)
+    owner = account["user"]["id"]
+    session_id = "synthetic-session"
+    session = API + "/sessions/" + session_id
+    attachment = API + "/blobs/" + CHECKSUM
+
+    assert enable(client, account)["scopes"] == ALL_SCOPES
+    # Simulate pre-upgrade storage, then reopen twice to exercise the additive table.
+    with store.connection(write=True) as db:
+        db.execute("DROP TABLE conversation_sync_attachment_scopes")
+        db.execute("INSERT INTO conversation_sync_scopes VALUES(?,?,?)", (owner, 1, 0))
+    sync.initialize()
+    sync.initialize()
+    state = client.get(API, headers=auth).json()
+    assert state["scopes"] == {**ALL_SCOPES, "preferences": False}
+    assert (state["enabled"], state["generation"]) == (True, 1)
+
+    upload(client, account)
+    first = payload(files=True)
+    first["files"].append({**first["files"][0], "id": "reply-image", "mime_type": "image/png"})
+    first["snapshot"] = {"version": 1, "session": {"id": session_id, "messages": [
+        {"id": "stable-user", "role": "user", "content": "用户原文", "files": [{"id": "local-file"}]},
+        {"id": "stable-reply", "role": "assistant", "blocks": [{"type": "image", "id": "reply-image"}]},
+    ]}}
+    saved = write(client, account, first)
+    text_only = {**state["scopes"], "attachments": False}
+    paused = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 1, "scopes": text_only,
+    })
+    assert paused.status_code == 200 and paused.json()["scopes"] == text_only
+    assert paused.json()["generation"] == 2
+    # The previous server build can still write its positional settings row after rollback.
+    with store.connection(write=True) as db:
+        db.execute("""INSERT INTO conversation_sync_scopes VALUES(?,?,?)
+            ON CONFLICT(owner_id) DO UPDATE SET
+            conversations=excluded.conversations,preferences=excluded.preferences""", (owner, 1, 0))
+    assert client.get(API, headers=auth).json()["scopes"] == text_only
+
+    hidden = client.get(session + "?generation=2", headers=auth).json()
+    assert hidden["snapshot"] == saved["snapshot"]
+    assert hidden["files"] == []
+    for response in (
+        client.get(attachment + "?generation=2", headers=auth),
+        client.put(attachment + "?generation=2", headers=auth, content=RAW),
+        client.put(session, headers=auth, json={**first, "generation": 2, "expected_revision": saved["revision"]}),
+    ):
+        assert (response.status_code, response.json()["error"]["code"]) == (409, "sync_scope_disabled")
+
+    edited = copy.deepcopy(first["snapshot"])
+    edited["session"]["messages"][0]["content"] = "暂停附件同步时编辑正文"
+    text_update = write(client, account, {
+        **first, "generation": 2, "mutation_id": "edit-with-paused-attachments",
+        "snapshot": edited, "files": [], "expected_revision": saved["revision"],
+    })
+    assert text_update["files"] == []
+    assert text_update["snapshot"] == edited
+
+    # An older settings client only sends two scopes, so it must leave the paused originals paused.
+    legacy = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 2, "scopes": {"conversations": True, "preferences": False},
+    })
+    assert legacy.status_code == 200 and legacy.json()["scopes"] == text_only
+    assert legacy.json()["generation"] == 2
+    resumed = client.patch(API, headers=auth, json={
+        "enabled": True, "expected_generation": 2, "scopes": state["scopes"],
+    })
+    assert resumed.status_code == 200 and resumed.json()["generation"] == 3
+    restored = client.get(session + "?generation=3", headers=auth).json()
+    assert restored["snapshot"] == edited
+    assert restored["files"] == saved["files"]
+    assert client.get(attachment + "?generation=3", headers=auth).content == RAW
+    # A device that hasn't fetched the original yet may edit the text immediately after resuming.
+    edited["session"]["messages"][0]["content"] = "恢复后本机原件仍未下载"
+    text_update = write(client, account, {
+        **first, "generation": 3, "mutation_id": "edit-before-downloading-originals",
+        "snapshot": edited, "files": [], "expected_revision": restored["revision"],
+    })
+    assert text_update["files"] == saved["files"]
+    assert_no_usage(store, account)
 
 
 def test_unknown_result_replay_and_later_modification_return_conflict(setup):
@@ -366,12 +559,12 @@ def test_concurrent_read_keeps_snapshot_revision_and_file_manifest_together(setu
     original = sync._dto
     pending = True
 
-    def interleave(db, owner, row, generation):
+    def interleave(db, owner, row, generation, attachments):
         nonlocal pending
         if pending:
             pending = False
             sync.mutate(owner, "synthetic-session", payload(revision=1, mutation="concurrent-update", text="new body"))
-        return original(db, owner, row, generation)
+        return original(db, owner, row, generation, attachments)
 
     monkeypatch.setattr(sync, "_dto", interleave)
     read = sync.read(account["user"]["id"], "synthetic-session", 1)
@@ -383,12 +576,19 @@ def test_concurrent_read_keeps_snapshot_revision_and_file_manifest_together(setu
 
 @pytest.mark.parametrize("raw", [b'{"enabled":true,"enabled":false,"expected_generation":0}',
     b'{"enabled":NaN,"expected_generation":0}', b'{"enabled":true,"expected_generation":true}',
-    b'{"enabled":true,"expected_generation":0,"extra":1}', b'\xff', b'[]'])
+    b'{"enabled":true,"expected_generation":0,"extra":1}', b'\xff', b'[]',
+    b'{"enabled":true,"expected_generation":0,"scopes":null}',
+    b'{"enabled":true,"expected_generation":0,"scopes":{"conversations":true}}',
+    b'{"enabled":true,"expected_generation":0,"scopes":{"conversations":1,"preferences":true}}',
+    b'{"enabled":true,"expected_generation":0,"scopes":{"conversations":true,"preferences":true,"attachments":1}}',
+    b'{"enabled":true,"expected_generation":0,"scopes":{"conversations":false,"preferences":false,"attachments":true}}',
+    b'{"enabled":true,"expected_generation":0,"scopes":{"conversations":false,"preferences":false}}'])
 def test_invalid_control_payloads_do_not_change_consent(setup, raw):
     _store, account, _sync, client = setup
     result = client.patch(API, content=raw, headers=headers(account))
     assert result.status_code == 422 and result.headers["cache-control"] == "no-store"
-    assert client.get(API, headers=headers(account)).json() == {"enabled": False, "generation": 0, "sequence": 0, "eligible": True}
+    assert client.get(API, headers=headers(account)).json() == {"enabled": False, "generation": 0, "sequence": 0,
+                                                               "eligible": True, "scopes": ALL_SCOPES}
 
 
 def test_snapshot_depth_size_identity_and_file_manifest_validation(setup, monkeypatch):
@@ -439,8 +639,8 @@ def test_logout_during_body_read_and_before_transaction_prevents_write(setup, mo
     assert error.value.status == 401
 
 
-@pytest.mark.parametrize("revoke_invitation", [False, True])
-def test_disable_during_upload_prevents_storage_and_stale_cas(setup, monkeypatch, revoke_invitation):
+@pytest.mark.parametrize("consent_change", ["pause", "revoke", "scope"])
+def test_disable_during_upload_prevents_storage_and_stale_cas(setup, monkeypatch, consent_change):
     store, account, sync, client = setup
     enable(client, account)
     original = Request.stream
@@ -448,14 +648,17 @@ def test_disable_during_upload_prevents_storage_and_stale_cas(setup, monkeypatch
     async def pause_after_body(request):
         async for chunk in original(request):
             yield chunk
-        if revoke_invitation:
+        if consent_change == "revoke":
             store.accounts.revoke_managed(account["user"]["id"])
         else:
-            sync.configure(account["user"]["id"], {"enabled": False, "expected_generation": 1}, digest(account["token"]))
+            control = {"enabled": False, "expected_generation": 1}
+            if consent_change == "scope":
+                control.update(enabled=True, scopes={"conversations": False, "preferences": True})
+            sync.configure(account["user"]["id"], control, digest(account["token"]))
 
     monkeypatch.setattr(Request, "stream", pause_after_body)
     response = client.put(API + "/blobs/" + CHECKSUM + "?generation=1", content=RAW, headers=headers(account))
-    expected = (403, "sync_invitation_required") if revoke_invitation else (409, "sync_generation_changed")
+    expected = (403, "sync_invitation_required") if consent_change == "revoke" else (409, "sync_generation_changed")
     assert (response.status_code, response.json()["error"]["code"]) == expected
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM conversation_sync_blobs").fetchone()[0] == 0
@@ -467,7 +670,7 @@ def test_real_application_router_is_wired_before_chat_catch_all(tmp_path):
         api_enabled=True, api_key="synthetic-key", admin_token="synthetic-admin-token"))
     with TestClient(app, base_url=ORIGIN) as client:
         store = app.state.store
-        account = invite(store, store.accounts.register("synthetic_composition", "synthetic-password-123"))
+        account = managed_account(store, "synthetic_composition")
         result = client.get(API, headers=headers(account))
         assert result.status_code == 200 and result.json()["enabled"] is False
         enable(client, account)
@@ -490,15 +693,23 @@ def test_preferences_and_envelope_consent_conflicts_and_clear(setup):
         return client.put(path, headers=auth, json={"generation": 1, "expected_revision": rev, "value": value})
     for path, value in ((pref, {"apiKey": "synthetic"}), (pref, {"thinking": 1}),
                         (pref, {"temperature": "2.01"}), (pref, {"reasoningEffort": "unsupported"}),
-                        (pref, {"persona": "🐟" * 1001}),
+                        (pref, {"persona": "🐟" * 1001}), (pref, {"replyTone": "unsupported"}),
+                        (pref, {"replyTone": None}), (pref, {"replyTone": 1}),
+                        (pref, {"replyWarmth": "warm"}), (pref, {"replyEmojis": True}),
+                        (pref, {"replyVisuals": None}),
+                        (pref, {"replyDetail": "compare"}), (pref, {"replyDetail": False}),
+                        (pref, {"replyApproach": "deep"}), (pref, {"replyApproach": None}),
                         (key, {**envelope, "password": "synthetic"}), (key, {**envelope, "iv": "invalid"})):
         assert put(path, value).status_code == 422
     assert put(key, envelope).json()["revision"] == 1
-    preferences = {"themePreference": "dark", "persona": "🐟" * 1000, "temperature": "1.25", "reasoningEffort": "high"}
+    preferences = {"themePreference": "dark", "replyTone": "custom", "persona": "🐟" * 1000,
+                   "replyWarmth": "more", "replyEnthusiasm": "less", "replyEmojis": "default",
+                   "replyVisuals": "less", "replyStructure": "more", "replyDetail": "deep", "replyApproach": "compare",
+                   "temperature": "1.25", "reasoningEffort": "high"}
     assert put(pref, preferences).json()["revision"] == 1
     assert client.get(pref + "?generation=1", headers=auth).json()["value"] == preferences
     assert client.get(key + "?generation=1", headers=auth).json()["value"] == envelope
-    other = invite(store, store.accounts.register("isolated_sync", "synthetic-password-123", client_ip="other"))
+    other = managed_account(store, "isolated_sync")
     enable(client, other)
     assert client.get(key + "?generation=1", headers=headers(other)).json()["value"] is None
     deleted = client.request("DELETE", key, headers=auth, json={"generation": 1, "expected_revision": 1})

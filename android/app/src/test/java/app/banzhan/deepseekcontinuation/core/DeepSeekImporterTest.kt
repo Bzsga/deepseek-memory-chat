@@ -38,6 +38,81 @@ class DeepSeekImporterTest {
         assertEquals(3, nodes.size)
     }
 
+    @Test fun officialSplitZipImportsChatsWithTheirCurrentBranches() {
+        val firstId = "11111111-1111-4111-8111-111111111111"
+        val secondId = "22222222-2222-4222-8222-222222222222"
+        val timestamp = "2026-11-01T08:00:00Z"
+        val index = """
+            [{"id":"$firstId","title":"路线比较","inserted_at":"$timestamp","updated_at":"$timestamp","message_count":3,"pinned":true},
+             {"id":"$secondId","title":null,"inserted_at":"$timestamp","updated_at":"$timestamp","message_count":2,"pinned":false}]
+        """.trimIndent()
+        val first = """
+            {"id":"$firstId","title":"路线比较","inserted_at":"$timestamp","updated_at":"$timestamp",
+             "current_message_id":3,"messages":[
+              {"id":1,"parent_id":null,"role":"USER","fragments":[
+               {"type":"REQUEST","content":"选择哪条路线？"},
+               {"type":"FILE","files":[{"file_name":"地图.pdf","mime_type":"application/pdf","size":32}]}]},
+              {"id":2,"parent_id":1,"role":"ASSISTANT","fragments":[{"type":"RESPONSE","content":"路线 A"}]},
+              {"id":3,"parent_id":1,"role":"ASSISTANT","fragments":[{"type":"RESPONSE","content":"路线 B"}]}]}
+        """.trimIndent()
+        val second = """
+            {"id":"$secondId","title":"独立会话","inserted_at":"$timestamp","updated_at":"$timestamp",
+             "current_message_id":2,"messages":[
+              {"id":1,"parent_id":null,"role":"USER","fragments":[{"type":"REQUEST","content":"第二个问题"}]},
+              {"id":2,"parent_id":1,"role":"ASSISTANT","fragments":[{"type":"RESPONSE","content":"第二个回答"}]}]}
+        """.trimIndent()
+        val entries = listOf(
+            "manifest.json" to """{"export_format_version":3}""",
+            "user.json" to """{"id":"fixture-user"}""",
+            "chat_session_index.json" to index,
+            "chat_sessions/$firstId.json" to first,
+            "chat_sessions/$secondId.json" to second,
+        )
+        val archive = zip(entries.map { (path, contents) -> path to contents.toByteArray() })
+        val chats = DeepSeekImporter.parse(archive, "export.zip").conversations.associateBy { it.title }
+        assertEquals(setOf("路线比较", "独立会话"), chats.keys)
+        val routed = chats.getValue("路线比较")
+        assertEquals(timestamp, routed.createdAt)
+        assertEquals(timestamp, routed.updatedAt)
+        val selected = routed.branches.single { it.isCurrent }
+        assertEquals(selected.id, routed.currentBranchId)
+        assertEquals(listOf("选择哪条路线？", "路线 B"), selected.messages.map { it.content })
+        assertEquals(listOf("user", "assistant"), selected.messages.map { it.role })
+        assertEquals("地图.pdf", Json.parseToJsonElement(selected.messages.first().attachments.single())
+            .jsonObject.getValue("file_name").jsonPrimitive.content)
+        assertEquals(listOf("选择哪条路线？", "路线 A"), routed.branches.single { !it.isCurrent }.messages.map { it.content })
+        val other = chats.getValue("独立会话").branches.single().messages
+        assertEquals(listOf("第二个问题", "第二个回答"), other.map { it.content })
+        assertNotEquals(selected.messages.first().id, other.first().id)
+
+        val chat = Json.parseToJsonElement(routed.chatImportJson()).jsonObject
+        val messages = chat.getValue("messages").jsonArray.map { it.jsonObject }.associateBy { it.getValue("id") }
+        val root = messages.getValue(chat.getValue("root"))
+        assertEquals("路线 B", messages.getValue(root.getValue("next")).getValue("text").jsonPrimitive.content)
+    }
+
+    @Test fun splitZipRequiresActualValidConversationDocuments() {
+        val id = "33333333-3333-4333-8333-333333333333"
+        val indexPath = "chat_session_index.json"
+        val chatPath = "chat_sessions/$id.json"
+        val metadata = """
+            {"id":"$id","title":"示例会话","inserted_at":"2026-11-01T08:00:00Z","updated_at":"2026-11-01T08:00:00Z"}
+        """.trimIndent()
+        val index = indexPath to "[$metadata]".toByteArray()
+        assertRejected("未找到") { DeepSeekImporter.parse(zip(listOf(index)), "index-only.zip") }
+        val archive = zip(listOf(
+            index,
+            chatPath to """{"id":"$id","title":"示例会话","messages":[null]}""".toByteArray(),
+        ))
+        assertRejected("消息必须是对象") { DeepSeekImporter.parse(archive, "export.zip") }
+
+        val record = """{"id":"$id","title":"示例会话","messages":[{"id":1,"role":"USER","content":"测试正文"}]}"""
+        for (rows in listOf("[$metadata,$record]", "[$record,$metadata]")) {
+            val mixed = zip(listOf(indexPath to rows.toByteArray(), chatPath to record.toByteArray()))
+            assertThrows(IllegalArgumentException::class.java) { DeepSeekImporter.parse(mixed, "mixed-index.zip") }
+        }
+    }
+
     @Test fun officialFragmentsPreserveForksRolesAttachmentsAndExcludeThinking() {
         val result = DeepSeekImporter.parse(fixture("official-fragments-forks.json"), "conversations.json")
         val conversation = result.conversations.single()
@@ -137,10 +212,19 @@ class DeepSeekImporterTest {
         assertTrue(result.warnings.any { it.contains("非 JSON") })
     }
 
+    @Test fun importsSplitZipWithStoredAttachmentDataDescriptors() {
+        // A nonseekable writer places the STORED WebP size and CRC in a data descriptor.
+        val result = DeepSeekImporter.parse(fixture("official-split-stored-descriptor.zip.fixture"), "data.zip")
+        val chat = result.conversations.single()
+        assertEquals("Descriptor fixture", chat.title)
+        assertEquals("Test message", chat.branches.single().messages.single().content)
+        assertTrue(result.warnings.any { it.contains("非 JSON") })
+    }
+
     @Test fun rejectsUnsafeDuplicateAndOversizedZipEntries() {
         assertRejected("不安全路径") { DeepSeekImporter.parse(zip(listOf("../conversations.json" to "[]".toByteArray())), "data.zip") }
         assertRejected("重复路径") { DeepSeekImporter.parse(zip(listOf("a.json" to "[]".toByteArray(), "A.JSON" to "[]".toByteArray())), "data.zip") }
-        assertRejected("安全上限") { DeepSeekImporter.parse(zip(listOf("bomb.json" to ByteArray(32 * 1024 * 1024 + 1) { 32 })), "data.zip") }
+        assertRejected("32 MiB") { DeepSeekImporter.parse(zip(listOf("bomb.json" to ByteArray(32 * 1024 * 1024 + 1) { 32 })), "data.zip") }
     }
 
     @Test fun rejectsExcessiveDepthMalformedUtf8AndEmptyExports() {

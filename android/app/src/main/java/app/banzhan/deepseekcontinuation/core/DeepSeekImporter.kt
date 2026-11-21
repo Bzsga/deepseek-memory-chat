@@ -1,12 +1,14 @@
 package app.banzhan.deepseekcontinuation.core
 
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
 import java.util.Locale
-import java.util.zip.ZipInputStream
+import java.util.zip.CRC32
+import java.util.zip.ZipFile
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -23,9 +25,10 @@ object DeepSeekImporter {
     private const val MAX_NODES = 100_000
     private const val MAX_BRANCHES = 256
     private const val MAX_PATH_NODES = 500_000
+    private val sessionIndexFields = setOf("id", "title", "inserted_at", "updated_at", "message_count", "pinned")
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-    fun parse(bytes: ByteArray, fileName: String): ImportResult {
+    fun parse(bytes: ByteArray, fileName: String, temporaryDirectory: File? = null): ImportResult {
         require(bytes.isNotEmpty()) { "导入文件为空。请选择 DeepSeek 导出的 JSON 或 ZIP。" }
         require(bytes.size <= MAX_INPUT_BYTES) { "导入文件超过 32 MiB，请拆分后导入。" }
         val warnings = linkedSetOf<String>()
@@ -44,7 +47,7 @@ object DeepSeekImporter {
             conversations[result.id] = result
         }
         if (fileName.endsWith(".zip", true) || looksLikeZip) {
-            readZip(bytes, warnings, ::consume)
+            readZip(bytes, temporaryDirectory, warnings, ::consume)
         } else {
             require(fileName.endsWith(".json", true)) { "仅支持 DeepSeek JSON 或 ZIP 导出文件。" }
             readJson(ByteArrayInputStream(bytes), fileName, warnings, ::consume)
@@ -53,17 +56,28 @@ object DeepSeekImporter {
         return ImportResult(conversations.values.toList(), warnings.toList())
     }
 
-    private fun readZip(bytes: ByteArray, warnings: MutableSet<String>, consume: (JsonObject) -> Unit) {
+    private fun readZip(
+        bytes: ByteArray,
+        temporaryDirectory: File?,
+        warnings: MutableSet<String>,
+        consume: (JsonObject) -> Unit,
+    ) {
         var documents = 0
         val names = mutableSetOf<String>()
-        var entries = 0
         var total = 0L
+        var temporary: File? = null
         try {
-            ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
-                while (true) {
-                    val entry = zip.nextEntry ?: break
-                    entries += 1
-                    require(entries <= MAX_ZIP_ENTRIES) { "ZIP 内文件过多，最多支持 $MAX_ZIP_ENTRIES 项。" }
+            // The official export uses data descriptors even for STORED images.
+            // ZipFile can use the central directory to locate those entries.
+            val archive = File.createTempFile("deepseek-import-", ".zip", temporaryDirectory)
+            temporary = archive
+            archive.writeBytes(bytes)
+            ZipFile(archive).use { zip ->
+                require(zip.size() <= MAX_ZIP_ENTRIES) { "ZIP 内文件过多，最多支持 $MAX_ZIP_ENTRIES 项。" }
+                val entries = zip.entries()
+                val buffer = ByteArray(8192)
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
                     val name = entry.name.replace('\\', '/')
                     require(name.isNotBlank() && !name.startsWith('/') && !name.contains(':') &&
                         name.split('/').none { it == ".." || it == "." } && name.none { it.code < 32 }) {
@@ -71,54 +85,64 @@ object DeepSeekImporter {
                     }
                     require(names.add(name.lowercase(Locale.ROOT))) { "ZIP 包含重复路径，已停止导入。" }
                     require(entry.size <= MAX_INPUT_BYTES) { "ZIP 内单个文件超过 32 MiB。" }
-                    if (entry.isDirectory) {
-                        zip.closeEntry()
-                        continue
-                    }
+                    if (entry.isDirectory) continue
                     val isJson = name.endsWith(".json", true)
-                    val buffer = ByteArray(8192)
-                    var entryBytes = 0
-                    val bounded = object : InputStream() {
-                        override fun read(): Int {
-                            val byte = ByteArray(1)
-                            return if (read(byte, 0, 1) < 0) -1 else byte[0].toInt() and 0xff
-                        }
-                        override fun read(target: ByteArray, offset: Int, length: Int): Int {
-                            val count = zip.read(target, offset, length)
-                            if (count > 0) {
-                                entryBytes += count
-                                total += count
-                                require(entryBytes <= MAX_INPUT_BYTES && total <= MAX_UNCOMPRESSED_BYTES) {
-                                    "ZIP 解压内容超过安全上限（单文件 32 MiB、总计 64 MiB）。"
-                                }
+                    zip.getInputStream(entry).use { data ->
+                        var entryBytes = 0L
+                        val crc = CRC32()
+                        val bounded = object : InputStream() {
+                            override fun read(): Int {
+                                val byte = ByteArray(1)
+                                return if (read(byte, 0, 1) < 0) -1 else byte[0].toInt() and 0xff
                             }
-                            return count
+                            override fun read(target: ByteArray, offset: Int, length: Int): Int {
+                                val count = data.read(target, offset, length)
+                                if (count > 0) {
+                                    entryBytes += count
+                                    total += count
+                                    require(entryBytes <= MAX_INPUT_BYTES && total <= MAX_UNCOMPRESSED_BYTES) {
+                                        "ZIP 解压内容超过安全上限（单文件 32 MiB、总计 64 MiB）。"
+                                    }
+                                    crc.update(target, offset, count)
+                                }
+                                return count
+                            }
                         }
+                        if (isJson) {
+                            val allowsSessionIndex = name.substringAfterLast('/').equals("chat_session_index.json", ignoreCase = true)
+                            readJson(bounded, name, warnings, consume, allowsSessionIndex)
+                            documents++
+                        } else {
+                            warnings += "ZIP 中的非 JSON 文件未导入，附件正文未读取。"
+                        }
+                        while (bounded.read(buffer) >= 0) { /* Validate every file, including attachments. */ }
+                        require(entryBytes == entry.size && crc.value == entry.crc) { "ZIP 内文件的大小或校验值不一致。" }
                     }
-                    if (isJson) {
-                        readJson(bounded, name, warnings, consume)
-                        documents++
-                    } else {
-                        while (bounded.read(buffer) >= 0) { /* Bound ignored attachment bytes too. */ }
-                        warnings += "ZIP 中的非 JSON 文件未导入，附件正文未读取。"
-                    }
-                    zip.closeEntry()
                 }
             }
         } catch (error: IllegalArgumentException) {
             throw error
         } catch (error: Exception) {
             throw IllegalArgumentException("ZIP 无法读取，可能已损坏、加密或压缩格式不受支持。", error)
+        } finally {
+            temporary?.delete()
         }
         require(documents > 0) { "ZIP 中没有 JSON 会话文件。" }
     }
 
-    private fun readJson(input: InputStream, fileName: String, warnings: MutableSet<String>, consume: (JsonObject) -> Unit) {
+    private fun readJson(
+        input: InputStream,
+        fileName: String,
+        warnings: MutableSet<String>,
+        consume: (JsonObject) -> Unit,
+        allowsSessionIndex: Boolean = false,
+    ) {
         try {
             val decoder = Charsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
             val possibleMessages = mutableListOf<JsonObject>()
             var conversationArray = false
+            var sessionIndex = false
             var found = false
             JsonDocumentReader(InputStreamReader(input, decoder)).read { text, arrayItem ->
                 validateStructure(text)
@@ -127,6 +151,13 @@ object DeepSeekImporter {
                     conversationObjects(value).forEach { found = true; consume(it) }
                 } else {
                     val item = value as? JsonObject ?: throw IllegalArgumentException("会话数组包含非对象项。")
+                    // DeepSeek lists session metadata separately from the conversation files.
+                    if (allowsSessionIndex && item.isSessionIndexRow()) {
+                        require(!conversationArray && possibleMessages.isEmpty()) { "会话索引混有聊天内容。" }
+                        sessionIndex = true
+                        return@read
+                    }
+                    require(!sessionIndex) { "会话索引含无法识别的对象。" }
                     if (!conversationArray && item.hasMessageShape()) possibleMessages += item
                     else {
                         require(item.hasConversationShape() && possibleMessages.all { it.hasConversationShape() }) {
@@ -144,7 +175,7 @@ object DeepSeekImporter {
                 consume(JsonObject(mapOf("messages" to JsonArray(possibleMessages))))
                 found = true
             }
-            if (!found) warnings += "$fileName 中未找到受支持的会话结构。"
+            if (!found && !sessionIndex) warnings += "$fileName 中未找到受支持的会话结构。"
         } catch (error: IllegalArgumentException) {
             throw IllegalArgumentException("$fileName 无法导入。${error.message ?: "JSON 格式不正确。"}", error)
         } catch (error: Exception) {
@@ -179,6 +210,13 @@ object DeepSeekImporter {
 
     private fun JsonObject.hasMessageShape(): Boolean =
         containsKey("content") && listOf("role", "author", "sender", "type").any { containsKey(it) }
+
+    private fun JsonObject.isSessionIndexRow(): Boolean {
+        val title = this["title"]
+        return keys.all { it in sessionIndexFields } &&
+            (this["id"] as? JsonPrimitive)?.let { it.isString && it.content.isNotBlank() } == true &&
+            (title is JsonNull || (title as? JsonPrimitive)?.isString == true)
+    }
 
     private fun parseConversation(source: JsonObject, warnings: MutableSet<String>): ImportedConversation {
         val rawId = source.value("id", "conversation_id", "chat_session_id", "uuid")

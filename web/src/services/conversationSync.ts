@@ -1,7 +1,6 @@
 import { create } from 'zustand'
 import { ApiError, request } from './api/client.js'
-import { useChatProvider } from './chatProvider.js'
-import { API_ORIGIN, accountStorageKey, getRuntime, isSessionActive, isGuestWorkspace } from './runtime.js'
+import { API_ORIGIN, accountStorageKey, getRuntime, isSessionActive, isGuestWorkspace, subscribeRuntimeUser } from './runtime.js'
 import * as db from './chat/db.js'
 import {
   captureConversationSyncGuard,
@@ -17,7 +16,7 @@ import {
 } from './chat/syncCodec.js'
 import type { Session } from './chat/types.js'
 
-import { syncPreferences, watchPreferenceChanges } from './cloudPreferences.js'
+import { advancePendingPreferences, syncPreferences, watchPreferenceChanges } from './cloudPreferences.js'
 
 const BASE = `${API_ORIGIN}/api/conversation-sync`
 const MAX_JSON = 34 * 1024 * 1024
@@ -25,7 +24,21 @@ const MAX_FILE = 64 * 1024 * 1024
 const POLL_MS = 15000
 const SHA256 = /^[a-f0-9]{64}$/
 
-type SyncStatus = { eligible: boolean; enabled: boolean; generation: number; sequence: number }
+export type SyncScopes = Readonly<{ conversations: boolean; preferences: boolean; attachments: boolean }>
+const DEFAULT_SCOPES: SyncScopes = { conversations: true, preferences: true, attachments: true }
+const sameScopes = (left: SyncScopes, right: SyncScopes) =>
+  left.conversations === right.conversations && left.preferences === right.preferences &&
+  left.attachments === right.attachments
+
+type SyncStatus = {
+  eligible: boolean
+  enabled: boolean
+  generation: number
+  sequence: number
+  scopes: SyncScopes
+  supportsScopes: boolean
+  supportsAttachments: boolean
+}
 type CloudFile = { id: string; sha256: string; size: number; mime_type: string }
 type CloudEntry = { id: string; revision: number; deleted: boolean; content_hash: string | null }
 type CloudSession = CloudEntry & { generation: number; snapshot: unknown; files: CloudFile[] }
@@ -40,20 +53,24 @@ export const useConversationSync = create<{
   error: string | null
   lastSyncedAt: number | null
   generation: number
+  scopes: SyncScopes
+  supportsAttachments: boolean
 }>(() => ({
-  eligible: useChatProvider.getState().managedEligible,
+  eligible: getRuntime().user.permissions.cloud_sync,
   enabled: false,
   loading: true,
   syncing: false,
   error: null,
   lastSyncedAt: null,
   generation: 0,
+  scopes: DEFAULT_SCOPES,
+  supportsAttachments: false,
 }))
 
-let cycle: Promise<void> | undefined
+let cycle: { generation: number; task: Promise<void> } | undefined
 let controller: AbortController | undefined
 let schedule: ((delay?: number) => void) | undefined
-let broadcast: (() => void) | undefined
+let broadcast: ((type: 'conversations' | 'settings') => void) | undefined
 let lifetime = 0
 const knownCloudBlobs = new Set<string>()
 
@@ -77,13 +94,28 @@ const boolean = (value: unknown): boolean => (typeof value === 'boolean' ? value
 
 const readStatus = (value: unknown): SyncStatus => {
   const item = record(value)
+  const enabled = boolean(item.enabled)
+  const supportsScopes = item.scopes !== undefined
+  const selection = supportsScopes ? record(item.scopes) : DEFAULT_SCOPES
+  const supportsAttachments = supportsScopes && selection.attachments !== undefined
+  const scopes = {
+    conversations: boolean(selection.conversations),
+    preferences: boolean(selection.preferences),
+    attachments: supportsAttachments ? boolean(selection.attachments) : true,
+  }
+  if (enabled && !scopes.conversations && !scopes.preferences) {
+    return invalid()
+  }
   return {
     eligible: item.eligible === undefined
-      ? useChatProvider.getState().managedEligible
+      ? getRuntime().user.permissions.cloud_sync
       : boolean(item.eligible),
-    enabled: boolean(item.enabled),
+    enabled,
     generation: integer(item.generation),
     sequence: integer(item.sequence),
+    scopes,
+    supportsScopes,
+    supportsAttachments,
   }
 }
 const readEntry = (value: unknown): CloudEntry => {
@@ -203,22 +235,37 @@ const statusRequest = async (signal?: AbortSignal) =>
   readStatus(await jsonRequest('', { method: 'GET', signal }))
 const message = (error: unknown): string =>
   error instanceof Error ? error.message : '同步暂时失败，请稍后重试。'
+const changedConsent = (error: unknown): boolean =>
+  error instanceof ApiError && error.status === 409 &&
+  (error.code === 'sync_generation_changed' || error.code === 'sync_disabled' ||
+    error.code === 'sync_scope_disabled')
 
 const publishStatus = (status: SyncStatus) => {
-  if (status.generation < useConversationSync.getState().generation) {
+  const current = useConversationSync.getState()
+  if (status.generation < current.generation) {
     return
   }
   const enabled = status.eligible && status.enabled
-  if (!enabled || status.generation !== useConversationSync.getState().generation) {
+  const nextGeneration = status.generation !== current.generation
+  const scopesChanged = !sameScopes(current.scopes, status.scopes)
+  if (!enabled || nextGeneration || scopesChanged) {
     controller?.abort()
     knownCloudBlobs.clear()
+  }
+  if (
+    current.enabled && enabled && current.scopes.preferences && status.scopes.preferences &&
+    status.generation === current.generation + 1
+  ) {
+    advancePendingPreferences(current.generation, status.generation)
   }
   useConversationSync.setState({
     eligible: status.eligible,
     enabled,
     generation: status.generation,
+    scopes: scopesChanged ? status.scopes : current.scopes,
+    supportsAttachments: status.supportsAttachments,
     loading: false,
-    ...(!status.eligible ? { lastSyncedAt: null } : {}),
+    ...(!enabled || nextGeneration ? { lastSyncedAt: null } : {}),
   })
 }
 
@@ -243,33 +290,61 @@ export const refreshConversationSync = async (): Promise<void> => {
   }
 }
 
-export const setConversationSyncEnabled = async (enabled: boolean): Promise<void> => {
+export const setConversationSyncEnabled = async (
+  enabled: boolean,
+  scopes?: SyncScopes,
+  expectedGeneration?: number
+): Promise<void> => {
+  if (enabled && scopes && !scopes.conversations && !scopes.preferences) {
+    throw new Error('请至少选择一项同步内容。')
+  }
   controller?.abort()
   const current = lifetime
   const owner = getRuntime().user.id
+  const matchesChoice = (status: SyncStatus) =>
+    status.enabled === enabled && (!scopes || sameScopes(status.scopes, scopes))
+  let sent = false
   try {
     const before = await statusRequest()
     if (current !== lifetime || !isSessionActive() || getRuntime().user.id !== owner) {
       return
     }
     if (enabled && !before.eligible) {
-      throw new ApiError('http', '云同步需要邀请码资格。', 403, 'sync_invitation_required')
+      throw new ApiError('http', '此账号未开通云同步。', 403, 'sync_invitation_required')
     }
+    if (expectedGeneration !== undefined && before.generation !== expectedGeneration) {
+      throw new ApiError('http', '同步设置已在其他设备上更改，请重新选择。', 409, 'sync_generation_changed')
+    }
+    if (scopes && !before.supportsScopes && !sameScopes(scopes, DEFAULT_SCOPES)) {
+      throw new Error('当前服务暂不支持选择同步内容，请稍后重试。')
+    }
+    if (scopes && !before.supportsAttachments && !scopes.attachments) {
+      throw new Error('当前服务暂不支持单独关闭图片与附件同步，请稍后重试。')
+    }
+    sent = true
     const status = readStatus(
       await jsonRequest('', {
         method: 'PATCH',
         body: JSON.stringify({
           enabled,
           expected_generation: before.generation,
+          ...(scopes && before.supportsScopes ? {
+            scopes: before.supportsAttachments ? scopes : {
+              conversations: scopes.conversations, preferences: scopes.preferences,
+            },
+          } : {}),
         }),
       })
     )
     if (current !== lifetime || !isSessionActive() || getRuntime().user.id !== owner) {
       return
     }
+    if (!matchesChoice(status)) {
+      throw new Error('服务器未保存本次同步设置，请重试。')
+    }
     publishStatus(status)
     useConversationSync.setState({ error: null })
-    broadcast?.()
+    broadcast?.('settings')
     if (enabled) {
       schedule?.(0)
     }
@@ -282,8 +357,8 @@ export const setConversationSyncEnabled = async (enabled: boolean): Promise<void
     if (status) {
       publishStatus(status)
     }
-    if (status?.enabled === enabled) {
-      broadcast?.()
+    if (sent && status && matchesChoice(status) && !changedConsent(error)) {
+      broadcast?.('settings')
       if (enabled) {
         schedule?.(0)
       }
@@ -311,7 +386,7 @@ export const clearCloudConversations = async (): Promise<void> => {
     }
     publishStatus(status)
     useConversationSync.setState({ error: null })
-    broadcast?.()
+    broadcast?.('settings')
   } catch (error) {
     if (current === lifetime && isSessionActive()) {
       await refreshConversationSync().catch(() => {})
@@ -339,10 +414,13 @@ const sameContent = (local: PreparedSession, remote: CloudSession) =>
   JSON.stringify(canonical({ snapshot: local.snapshot, files: local.files })) ===
   JSON.stringify(canonical({ snapshot: remote.snapshot, files: remote.files }))
 
-const prepareSession = async (session: Session, guard: () => boolean): Promise<PreparedSession> => {
+const prepareSession = async (session: Session, attachments: boolean, guard: () => boolean): Promise<PreparedSession> => {
   const snapshot = encodeSyncSnapshot(session)
   const files: CloudFile[] = []
   const blobs = new Map<string, Blob>()
+  if (!attachments) {
+    return { snapshot, files, blobs }
+  }
   for (const file of referencedSyncFiles(snapshot.session)) {
     const blob = await db.loadFile(file.id)
     if (!guard()) {
@@ -396,8 +474,10 @@ const loadRemote = async (
 const receiveSession = async (
   remote: CloudSession,
   generation: number,
+  attachments: boolean,
   signal: AbortSignal,
-  live: () => boolean
+  live: () => boolean,
+  refreshOriginals = false,
 ): Promise<boolean> => {
   const storeGuard = captureConversationSyncGuard(remote.id)
   const guard = () => live() && storeGuard()
@@ -405,8 +485,11 @@ const receiveSession = async (
     return false
   }
   const state = await db.loadSyncState(remote.id)
-  if (state?.revision === remote.revision) {
-    return true
+  const acknowledged = state?.revision === remote.revision
+  if (acknowledged) {
+    if (!refreshOriginals || remote.deleted) {return true}
+    // Let the ordinary upload queue flush this device's edits first.
+    if (state.dirty) {return false}
   }
   const local = await db.loadSession(remote.id)
   if (!guard() || sessionBusy(local)) {
@@ -414,7 +497,7 @@ const receiveSession = async (
   }
   let conflictCopy: Session | undefined
   if (state?.dirty && local) {
-    const prepared = await prepareSession(local, guard)
+    const prepared = await prepareSession(local, attachments, guard)
     if (!remote.deleted && sameContent(prepared, remote)) {
       for (const file of remote.files) {
         knownCloudBlobs.add(file.sha256)
@@ -423,12 +506,12 @@ const receiveSession = async (
     }
     conflictCopy = db.createSyncConflictCopy(local)
   }
-  const session = remote.deleted ? null : decodeSyncSnapshot(remote.snapshot, remote.id)
+  const session = remote.deleted ? null : acknowledged && local ? local : decodeSyncSnapshot(remote.snapshot, remote.id)
   const references = session
     ? new Map(referencedSyncFiles(session).map((file) => [file.id, file]))
     : new Map()
   const files: db.StoredFile[] = []
-  for (const file of remote.files) {
+  for (const file of attachments ? remote.files : []) {
     if (!references.has(file.id)) {
       return invalid()
     }
@@ -457,6 +540,9 @@ const receiveSession = async (
   if (!guard()) {
     return false
   }
+  if (acknowledged && files.length === 0) {
+    return true
+  }
   const saved = await db.applySyncedSession({
     id: remote.id,
     session,
@@ -472,11 +558,11 @@ const receiveSession = async (
     if (remote.deleted) {
       knownCloudBlobs.clear()
     }
-    for (const file of remote.files) {
+    for (const file of attachments ? remote.files : []) {
       knownCloudBlobs.add(file.sha256)
     }
     displaySyncedSession(remote.id, session, conflictCopy, (state?.version ?? 0) + 1)
-    broadcast?.()
+    broadcast?.('conversations')
   }
   return saved
 }
@@ -484,26 +570,26 @@ const receiveSession = async (
 const sendSession = async (
   state: db.SyncSessionState,
   generation: number,
+  attachments: boolean,
   signal: AbortSignal,
   live: () => boolean
-): Promise<void> => {
+): Promise<boolean> => {
   const storeGuard = captureConversationSyncGuard(state.id)
   const guard = () => live() && storeGuard()
   if (!guard()) {
-    return
+    return false
   }
   const local = await db.loadSession(state.id)
   if (sessionBusy(local) || !guard()) {
-    return
+    return false
   }
   if (state.deleted && state.revision === 0) {
-    await db.acknowledgeSync(state.id, state, 0, generation, guard)
-    return
+    return db.acknowledgeSync(state.id, state, 0, generation, guard)
   }
   if (!state.deleted && !local) {
     throw new Error('本机会话暂时无法读取，已保留待同步记录。')
   }
-  const prepared = local ? await prepareSession(local, guard) : undefined
+  const prepared = local ? await prepareSession(local, attachments, guard) : undefined
   const uploadOriginals = async (force = false) => {
     for (const [sha256, blob] of prepared?.blobs ?? []) {
       if (!guard()) {
@@ -527,7 +613,7 @@ const sendSession = async (
   await uploadOriginals()
   const current = await db.loadSyncState(state.id)
   if (!guard() || current?.version !== state.version || current.revision !== state.revision) {
-    return
+    return false
   }
   try {
     const body = {
@@ -560,168 +646,242 @@ const sendSession = async (
       knownCloudBlobs.clear()
       await uploadOriginals(true)
       if (!guard()) {
-        return
+        return false
       }
       result = await send()
     }
     const remote = readCloudSession(result, state.id, generation)
     if (!guard()) {
-      return
+      return false
     }
-    await db.acknowledgeSync(state.id, state, remote.revision, generation, live)
+    const saved = await db.acknowledgeSync(state.id, state, remote.revision, generation, live)
     if (remote.deleted) {
       knownCloudBlobs.clear()
     }
     for (const file of remote.files) {
       knownCloudBlobs.add(file.sha256)
     }
+    return saved
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 409 || !live()) {
       throw error
     }
     const status = await statusRequest(signal)
-    if (status.generation !== generation || !status.enabled) {
+    if (status.generation !== generation || !status.eligible || !status.enabled || !status.scopes.conversations) {
       publishStatus(status)
-      return
+      return false
     }
     const remote = await loadRemote(state.id, generation, signal)
-    await receiveSession(remote, generation, signal, live)
+    await receiveSession(remote, generation, attachments, signal, live)
+    return false
+  }
+}
+
+const backfillOriginals = async (
+  remote: CloudSession,
+  generation: number,
+  signal: AbortSignal,
+  live: () => boolean,
+): Promise<boolean> => {
+  const state = await db.loadSyncState(remote.id)
+  if (!live() || !state || state.revision !== remote.revision || state.dirty) {
+    return false
+  }
+  const local = await db.loadSession(remote.id)
+  if (!local || !live()) {
+    return false
+  }
+  const cloudIds = new Set(remote.files.map((file) => file.id))
+  for (const file of referencedSyncFiles(local)) {
+    if (!cloudIds.has(file.id) && await db.loadFile(file.id)) {
+      return sendSession({ ...state, mutationId: `${state.mutationId}-originals` }, generation, true, signal, live)
+    }
+  }
+  return live()
+}
+
+const synchronizeConversationScope = async (
+  status: SyncStatus,
+  signal: AbortSignal,
+  live: () => boolean
+): Promise<void> => {
+  let firstError: unknown
+  await db.prepareSyncRecords()
+  await refreshConversationSyncCache()
+  let control = await db.loadSyncControl()
+  const attachments = status.scopes.attachments
+  const refreshOriginals = status.supportsAttachments && attachments &&
+    control?.attachmentGeneration !== status.generation
+  const fullScan = refreshOriginals || control?.generation !== status.generation || control.cursor === 0
+  if (control?.generation !== status.generation) {
+    control = { id: 'control', generation: status.generation, cursor: 0 }
+    if (!(await db.saveSyncControl(control, live))) {
+      return
+    }
+  }
+  let after = refreshOriginals ? 0 : control?.cursor ?? 0
+  let safeCursor = after
+  let blocked = false
+  const remoteIds = new Set<string>()
+  while (live()) {
+    const item = record(
+      await jsonRequest(`/index?generation=${status.generation}&after=${after}`, {
+        method: 'GET',
+        signal,
+      })
+    )
+    if (item.generation !== status.generation || !Array.isArray(item.entries)) {
+      return invalid()
+    }
+    const index: CloudIndex = {
+      generation: status.generation,
+      entries: item.entries.map(readEntry),
+      cursor: integer(item.cursor),
+      has_more: boolean(item.has_more),
+    }
+    if (index.cursor < after || (index.has_more && index.cursor <= after)) {
+      return invalid()
+    }
+    for (const entry of index.entries) {
+      remoteIds.add(entry.id)
+      try {
+        const state = await db.loadSyncState(entry.id)
+        if (state?.revision !== entry.revision || refreshOriginals && !entry.deleted) {
+          const remote = await loadRemote(entry.id, status.generation, signal)
+          const handled = await receiveSession(remote, status.generation, attachments, signal, live, refreshOriginals)
+          blocked ||= !handled
+          if (handled && refreshOriginals && !remote.deleted) {
+            const restored = await backfillOriginals(remote, status.generation, signal, live)
+            blocked ||= !restored
+          }
+        }
+      } catch (error) {
+        if (signal.aborted || !live()) {
+          return
+        }
+        if (changedConsent(error)) {
+          throw error
+        }
+        firstError ??= error
+        blocked = true
+      }
+      if (!blocked) {
+        safeCursor = entry.revision
+      }
+    }
+    if (!blocked) {
+      safeCursor = index.cursor
+    }
+    await db.saveSyncControl(
+      { id: 'control', generation: status.generation, cursor: safeCursor },
+      live
+    )
+    after = index.cursor
+    if (!index.has_more) {
+      break
+    }
+  }
+  if (!live()) {
+    return
+  }
+  if (fullScan) {
+    await db.rebaseMissingSyncRecords(remoteIds, status.sequence, status.generation, live)
+  }
+  for (const state of await db.loadSyncStates()) {
+    if (!live()) {
+      return
+    }
+    if (!state.dirty) {
+      continue
+    }
+    try {
+      await sendSession(state, status.generation, attachments, signal, live)
+    } catch (error) {
+      if (signal.aborted || !live()) {
+        return
+      }
+      if (changedConsent(error)) {
+        throw error
+      }
+      firstError ??= error
+    }
+  }
+  if (!live()) {
+    return
+  }
+  if (refreshOriginals && !blocked && !firstError) {
+    await db.saveSyncControl({
+      id: 'control', generation: status.generation, cursor: safeCursor, attachmentGeneration: status.generation,
+    }, live)
+  }
+  await refreshConversationSyncCache()
+  if (firstError) {
+    throw firstError
   }
 }
 
 const synchronize = async (): Promise<void> => {
   const currentLifetime = lifetime
   const owner = getRuntime().user.id
+  const stillAccount = () =>
+    currentLifetime === lifetime && isSessionActive() && getRuntime().user.id === owner
   const status = await statusRequest()
-  if (currentLifetime !== lifetime || !isSessionActive() || getRuntime().user.id !== owner) {
+  if (!stillAccount()) {
     return
   }
   publishStatus(status)
-  if (!status.eligible || !status.enabled || !useChatStore.getState().ready) {
+  if (!status.eligible || !status.enabled) {
     return
   }
   controller = new AbortController()
   const signal = controller.signal
-  const baseGuard = captureConversationSyncGuard()
-  const live = () =>
-    !signal.aborted &&
-    currentLifetime === lifetime &&
-    isSessionActive() &&
-    getRuntime().user.id === owner &&
-    useConversationSync.getState().enabled &&
-    useConversationSync.getState().generation === status.generation &&
-    baseGuard()
-  if (!live()) {
+  const live = () => {
+    const current = useConversationSync.getState()
+    return !signal.aborted && stillAccount() && current.enabled &&
+      current.generation === status.generation && sameScopes(current.scopes, status.scopes)
+  }
+  const conversationGuard = status.scopes.conversations ? captureConversationSyncGuard() : undefined
+  const conversationsLive = () => live() && conversationGuard?.() === true
+  if (!live() || (!status.scopes.preferences && !conversationsLive())) {
     return
   }
   useConversationSync.setState({ syncing: true, error: null })
   let firstError: unknown
   try {
-    try {
-      await syncPreferences(status.generation, live, signal)
-    } catch (error) {
-      if (!live()) {return}
-      firstError = error
-    }
-    await db.prepareSyncRecords()
-    await refreshConversationSyncCache()
-    let control = await db.loadSyncControl()
-    const fullScan = control?.generation !== status.generation || control.cursor === 0
-    if (control?.generation !== status.generation) {
-      control = { id: 'control', generation: status.generation, cursor: 0 }
-      if (!(await db.saveSyncControl(control, live))) {
-        return
-      }
-    }
-    let after = control?.cursor ?? 0
-    let safeCursor = after
-    let blocked = false
-    const remoteIds = new Set<string>()
-    while (live()) {
-      const item = record(
-        await jsonRequest(`/index?generation=${status.generation}&after=${after}`, {
-          method: 'GET',
-          signal,
-        })
-      )
-      if (item.generation !== status.generation || !Array.isArray(item.entries)) {
-        return invalid()
-      }
-      const index: CloudIndex = {
-        generation: status.generation,
-        entries: item.entries.map(readEntry),
-        cursor: integer(item.cursor),
-        has_more: boolean(item.has_more),
-      }
-      if (index.cursor < after || (index.has_more && index.cursor <= after)) {
-        return invalid()
-      }
-      for (const entry of index.entries) {
-        remoteIds.add(entry.id)
-        try {
-          const state = await db.loadSyncState(entry.id)
-          const handled =
-            state?.revision === entry.revision ||
-            (await receiveSession(
-              await loadRemote(entry.id, status.generation, signal),
-              status.generation,
-              signal,
-              live
-            ))
-          blocked ||= !handled
-        } catch (error) {
-          if (signal.aborted || !live()) {
-            return
-          }
-          firstError ??= error
-          blocked = true
-        }
-        if (!blocked) {
-          safeCursor = entry.revision
-        }
-      }
-      if (!blocked) {
-        safeCursor = index.cursor
-      }
-      await db.saveSyncControl(
-        { id: 'control', generation: status.generation, cursor: safeCursor },
-        live
-      )
-      after = index.cursor
-      if (!index.has_more) {
-        break
-      }
-    }
-    if (!live()) {
-      return
-    }
-    if (fullScan) {
-      await db.rebaseMissingSyncRecords(remoteIds, status.sequence, status.generation, live)
-    }
-    for (const state of await db.loadSyncStates()) {
-      if (!live()) {
-        return
-      }
-      if (!state.dirty) {
-        continue
-      }
+    if (status.scopes.preferences) {
       try {
-        await sendSession(state, status.generation, signal, live)
+        await syncPreferences(status.generation, live, signal)
       } catch (error) {
-        if (signal.aborted || !live()) {
-          return
-        }
+        if (!live()) {return}
+        if (changedConsent(error)) {throw error}
+        firstError = error
+      }
+    }
+    if (conversationsLive()) {
+      try {
+        await synchronizeConversationScope(status, signal, conversationsLive)
+      } catch (error) {
+        if (!live()) {return}
+        if (changedConsent(error)) {throw error}
         firstError ??= error
       }
     }
     if (!live()) {
       return
     }
-    await refreshConversationSyncCache()
     if (firstError) {
       throw firstError
     }
     useConversationSync.setState({ lastSyncedAt: Date.now(), error: null })
+  } catch (error) {
+    if (changedConsent(error) && stillAccount()) {
+      const latest = await statusRequest()
+      if (stillAccount()) {
+        publishStatus(latest)
+      }
+      return
+    }
+    throw error
   } finally {
     if (currentLifetime === lifetime) {
       useConversationSync.setState({ syncing: false })
@@ -730,8 +890,12 @@ const synchronize = async (): Promise<void> => {
 }
 
 export const syncConversationsNow = (): Promise<void> => {
+  const generation = useConversationSync.getState().generation
   if (cycle) {
-    return cycle
+    if (cycle.generation === generation) {
+      return cycle.task
+    }
+    return cycle.task.catch(() => {}).then(syncConversationsNow)
   }
   const current = lifetime
   const task = synchronize()
@@ -746,11 +910,11 @@ export const syncConversationsNow = (): Promise<void> => {
       }
     })
     .finally(() => {
-      if (cycle === task) {
+      if (cycle?.task === task) {
         cycle = undefined
       }
     })
-  cycle = task
+  cycle = { generation, task }
   return task
 }
 
@@ -777,17 +941,25 @@ export const bindConversationSync = (): (() => void) => {
   schedule = queue
   try {
     channel = new BroadcastChannel(accountStorageKey('conversation-sync'))
-    channel.onmessage = () => {
-      void refreshConversationSyncCache().catch(() => {})
-      queue(0)
+    channel.onmessage = ({ data }: MessageEvent) => {
+      if (data?.type !== 'settings') {
+        void refreshConversationSyncCache().catch(() => {})
+      }
+      const state = useConversationSync.getState()
+      if (data?.type !== 'conversations' || (state.enabled && state.scopes.conversations)) {
+        queue(0)
+      }
     }
-    broadcast = () => channel?.postMessage({ type: 'changed' })
+    broadcast = (type) => channel?.postMessage({ type })
   } catch {
     broadcast = undefined
   }
-  const localChange = () => {
-    broadcast?.()
-    queue()
+  const localConversationChange = () => {
+    broadcast?.('conversations')
+    const state = useConversationSync.getState()
+    if (state.enabled && state.scopes.conversations) {
+      queue()
+    }
   }
   const foreground = () => {
     if (document.visibilityState !== 'hidden') {
@@ -796,6 +968,10 @@ export const bindConversationSync = (): (() => void) => {
   }
   const end = () => cleanup()
   const unsubscribe = useChatStore.subscribe((state, previous) => {
+    const sync = useConversationSync.getState()
+    if (!sync.enabled || !sync.scopes.conversations) {
+      return
+    }
     if (state.importingHistory && !previous.importingHistory) {
       controller?.abort()
     }
@@ -808,13 +984,16 @@ export const bindConversationSync = (): (() => void) => {
   })
   const unwatchPreferences = watchPreferenceChanges(() => {
     const state = useConversationSync.getState()
-    return state.enabled ? state.generation : undefined
-  }, localChange)
-  const unwatchEligibility = useChatProvider.subscribe((state, previous) => {
-    if (state.managedEligible === previous.managedEligible) {
+    return state.enabled && state.scopes.preferences ? state.generation : undefined
+  }, () => {
+    broadcast?.('settings')
+    queue()
+  })
+  const unwatchEligibility = subscribeRuntimeUser((user, previous) => {
+    if (user.permissions.cloud_sync === previous.permissions.cloud_sync) {
       return
     }
-    if (!state.managedEligible) {
+    if (!user.permissions.cloud_sync) {
       controller?.abort()
       knownCloudBlobs.clear()
       useConversationSync.setState({ eligible: false, enabled: false, lastSyncedAt: null })
@@ -825,7 +1004,7 @@ export const bindConversationSync = (): (() => void) => {
   window.addEventListener('online', foreground)
   window.addEventListener('pageshow', foreground)
   document.addEventListener('visibilitychange', foreground)
-  window.addEventListener('deepseek-conversations-changed', localChange)
+  window.addEventListener('deepseek-conversations-changed', localConversationChange)
   window.addEventListener('deepseek-session-ending', end)
   void refreshConversationSync().catch(() => {})
   const cleanup = () => {
@@ -849,7 +1028,7 @@ export const bindConversationSync = (): (() => void) => {
     window.removeEventListener('online', foreground)
     window.removeEventListener('pageshow', foreground)
     document.removeEventListener('visibilitychange', foreground)
-    window.removeEventListener('deepseek-conversations-changed', localChange)
+    window.removeEventListener('deepseek-conversations-changed', localConversationChange)
     window.removeEventListener('deepseek-session-ending', end)
   }
   return cleanup

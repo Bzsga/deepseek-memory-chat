@@ -5,16 +5,19 @@ package app.banzhan.deepseekcontinuation.ui
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -40,9 +43,13 @@ internal fun DeveloperScreen(
         if (signedIn) {
             when (page) {
                 "overview" -> run { controller.refreshAdminStats(days) }
-                "users" -> run {
-                    controller.refreshAdminConfig()
-                    controller.refreshAdminUsers(limit = 25, offset = 0)
+                "users" -> {
+                    run { controller.refreshAdminOpenPermissions() }
+                    run { controller.refreshAdminRegistrationPolicy() }
+                    run {
+                        controller.refreshAdminConfig()
+                        controller.refreshAdminUsers(limit = 25, offset = 0)
+                    }
                 }
                 "server" -> run { controller.refreshAdminConfig() }
             }
@@ -234,6 +241,24 @@ private fun AdminUsers(
         contentPadding = PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
+        item {
+            AdminRegistrationPolicyControls(
+                current = state.adminSelfServiceRegistration,
+                loading = state.adminSelfServiceRegistrationLoading,
+                error = state.adminSelfServiceRegistrationError,
+                onRefresh = { run { controller.refreshAdminRegistrationPolicy() } },
+                onSave = { enabled -> run { controller.updateAdminRegistrationPolicy(enabled) } },
+            )
+        }
+        item {
+            AdminOpenPermissionsControls(
+                current = state.adminOpenPermissions,
+                loading = state.adminOpenPermissionsLoading,
+                error = state.adminOpenPermissionsError,
+                onRefresh = { run { controller.refreshAdminOpenPermissions() } },
+                onSave = { permissions -> run { controller.updateAdminOpenPermissions(permissions) } },
+            )
+        }
         state.adminError?.let { item { NoticeCard(it) } }
         item {
             RegistrationInvitationControls(
@@ -241,7 +266,7 @@ private fun AdminUsers(
                 loading = state.adminRegistrationLoading,
                 onToggle = { invitationsExpanded = !invitationsExpanded; invitationCount = 10 },
                 onRefresh = { run { controller.refreshAdminRegistrationInvites() } },
-                onCreate = { count, days -> run { controller.createAdminRegistrationInvites(count, days) } },
+                onCreate = { count, days, permissions -> run { controller.createAdminRegistrationInvites(count, days, permissions) } },
             )
         }
         if (invitationsExpanded) {
@@ -284,7 +309,7 @@ private fun AdminUsers(
                     user, state.adminConfig?.userWeeklyLimit, state.adminUsersLoading,
                     onSetEnabled = { enabled -> run { controller.setAdminUserEnabled(user.id, enabled) } },
                     onResetPassword = { resetTarget = user },
-                    onRevokeManaged = { run { controller.revokeAdminUserManaged(user.id) } },
+                    onSavePermissions = { permissions -> run { controller.updateAdminUserPermissions(user.id, permissions) } },
                 ) { limit, remaining ->
                     run { controller.updateAdminUserQuota(user.id, limit, remaining, page.week.takeIf { remaining != null }) }
                 }
@@ -316,16 +341,99 @@ private fun AdminUsers(
 }
 
 @Composable
+internal fun AdminOpenPermissionsControls(
+    current: ServicePermissions?,
+    loading: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+    onSave: (ServicePermissions) -> Unit,
+) {
+    var draft by rememberSaveable(current, stateSaver = permissionSelectionSaver) {
+        mutableStateOf(current ?: ServicePermissions.None)
+    }
+    AdminSection("全局功能开放") {
+        Text(
+            "开启后对所有已登录账号开放。关闭后按账号权限判断。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            "配套 API 仍受每周额度限制。用户可以自行选择是否开启云同步。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (current != null) {
+            PermissionChecks(draft, !loading, "admin-open-permissions") { draft = it }
+        }
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        ActionRow {
+            if (current != null) {
+                Button(
+                    onClick = { onSave(draft) },
+                    enabled = !loading && draft != current,
+                    modifier = Modifier.testTag("admin-open-permissions-save"),
+                ) { Text("保存开放设置") }
+            }
+            TextButton(
+                onClick = onRefresh,
+                enabled = !loading,
+                modifier = Modifier.testTag("admin-open-permissions-refresh"),
+            ) { Text("重新读取") }
+        }
+    }
+}
+
+@Composable
+private fun AdminRegistrationPolicyControls(
+    current: Boolean?,
+    loading: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+    onSave: (Boolean) -> Unit,
+) {
+    var draft by rememberSaveable(current) { mutableStateOf(current == true) }
+    AdminSection("注册设置") {
+        if (current != null) {
+            Row(
+                Modifier.fillMaxWidth().toggleable(
+                    value = draft, enabled = !loading, role = Role.Switch, onValueChange = { draft = it },
+                ).padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("开放自助注册", Modifier.weight(1f))
+                Switch(checked = draft, onCheckedChange = null, enabled = !loading)
+            }
+            Text(
+                "开启后，用户可以免邀请码注册并使用基础同步。关闭后，新用户凭邀请码注册。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        ActionRow {
+            if (current != null) {
+                Button(onClick = { onSave(draft) }, enabled = !loading && draft != current) { Text("保存注册设置") }
+            }
+            TextButton(onClick = onRefresh, enabled = !loading) { Text("重新读取注册设置") }
+        }
+    }
+}
+
+@Composable
 internal fun RegisteredUserQuotaCard(
     user: UserUsage,
     defaultLimit: Int?,
     loading: Boolean,
     onSetEnabled: ((Boolean) -> Unit)? = null,
     onResetPassword: (() -> Unit)? = null,
-    onRevokeManaged: (() -> Unit)? = null,
+    onSavePermissions: ((ServicePermissions) -> Unit)? = null,
     onSave: (Int?, Int?) -> Unit,
 ) {
-    var confirmingRevoke by remember(user.id, user.managedEligible) { mutableStateOf(false) }
+    val currentPermissions = user.servicePermissions
+    val canLockCurrentPermissions = currentPermissions == ServicePermissions.None && user.inviteRedeemable == true
+    var permissions by rememberSaveable(user.id, currentPermissions, stateSaver = permissionSelectionSaver) {
+        mutableStateOf(currentPermissions)
+    }
     var expanded by rememberSaveable(user.id) { mutableStateOf(false) }
     var followDefault by remember(user) { mutableStateOf(user.weeklyLimitOverride == null) }
     var limit by remember(user) { mutableStateOf((user.weeklyLimitOverride ?: user.weeklyLimit).toString()) }
@@ -334,18 +442,12 @@ internal fun RegisteredUserQuotaCard(
     AdminSection(user.username ?: user.id.take(12)) {
         if (!user.enabled) Text("账号已停用", color = MaterialTheme.colorScheme.error,
             style = MaterialTheme.typography.labelMedium)
-        if (confirmingRevoke) AlertDialog(
-            onDismissRequest = { confirmingRevoke = false },
-            title = { Text("取消免费资格？") },
-            text = { Text("${user.username ?: user.id} 仍可使用自己的 API Key。") },
-            confirmButton = { TextButton(onClick = { confirmingRevoke = false; onRevokeManaged?.invoke() }) { Text("取消资格") } },
-            dismissButton = { TextButton(onClick = { confirmingRevoke = false }) { Text("返回") } },
-        )
-        MetricRow("API 服务", if (user.managedEligible) "已开通免费资格" else "个人 API")
-        if (user.managedEligible) MetricRow("本周剩余 / 每周上限", "${user.weeklyRemaining} / ${user.weeklyLimit}")
+        MetricRow("服务权限", currentPermissions.summary())
+        if (currentPermissions.hasManagedApi) MetricRow("本周剩余 / 每周上限", "${user.weeklyRemaining} / ${user.weeklyLimit}")
+        val registration = if (user.registrationKind == "invitation") "邀请码注册" else "公开注册"
+        val quotaPolicy = if (user.weeklyLimitOverride == null) "跟随默认次数" else "个人单独设置"
         Text(
-            "${if (user.registrationKind == "invitation") "邀请码注册" else "公开注册"} · " +
-                if (user.weeklyLimitOverride == null) "跟随默认次数" else "个人单独设置",
+            if (currentPermissions.hasManagedApi) "$registration · $quotaPolicy" else registration,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -353,9 +455,7 @@ internal fun RegisteredUserQuotaCard(
             Text(if (expanded) "收起调整" else "管理账号")
         }
         if (expanded) {
-            if (onSetEnabled != null || onResetPassword != null || onRevokeManaged != null) ActionRow {
-                if (user.managedEligible && onRevokeManaged != null)
-                    OutlinedButton(onClick = { confirmingRevoke = true }, enabled = !loading) { Text("取消免费资格") }
+            if (onSetEnabled != null || onResetPassword != null) ActionRow {
                 onSetEnabled?.let { action ->
                     OutlinedButton(onClick = { action(!user.enabled) }, enabled = !loading,
                         modifier = Modifier.testTag("admin-user-status:${user.id}")) {
@@ -367,7 +467,18 @@ internal fun RegisteredUserQuotaCard(
                         modifier = Modifier.testTag("admin-user-reset:${user.id}")) { Text("重置密码") }
                 }
             }
-            if (user.managedEligible) Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            onSavePermissions?.let { save ->
+                PermissionChecks(permissions, !loading, "admin-user-permissions:${user.id}") { permissions = it }
+                if (canLockCurrentPermissions) {
+                    Text("保存后，此账号的权限由管理员调整。", style = MaterialTheme.typography.bodySmall)
+                }
+                OutlinedButton(
+                    onClick = { save(permissions) },
+                    enabled = !loading && (permissions != currentPermissions || canLockCurrentPermissions),
+                    modifier = Modifier.testTag("admin-user-save-permissions:${user.id}"),
+                ) { Text("保存权限") }
+            }
+            if (currentPermissions.hasManagedApi) Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(followDefault, { followDefault = it }, enabled = !loading,
                         modifier = Modifier.testTag("admin-user-follow-default:${user.id}"))
@@ -403,19 +514,22 @@ internal fun RegistrationInvitationControls(
     loading: Boolean,
     onToggle: () -> Unit,
     onRefresh: () -> Unit,
-    onCreate: (Int, Int) -> Unit,
+    onCreate: (Int, Int, ServicePermissions) -> Unit,
 ) {
     var count by rememberSaveable { mutableStateOf("1") }
     var days by rememberSaveable { mutableStateOf("7") }
+    var permissions by rememberSaveable(stateSaver = permissionSelectionSaver) { mutableStateOf(ServicePermissions.All) }
     var problem by remember { mutableStateOf<String?>(null) }
-    AdminSection("免费服务邀请码") {
+    AdminSection("注册邀请码") {
         TextButton(onClick = onToggle, modifier = Modifier.testTag("admin-invitations-toggle")) {
             Text(if (expanded) "收起邀请码" else "生成与查看未使用邀请码")
         }
         if (expanded) {
-            Text("每个邀请码可为一个账号开通免费服务，兑换后失效。", style = MaterialTheme.typography.bodySmall)
+            Text("每个邀请码仅限使用一次，勾选的权限会授予使用该邀请码的账号。", style = MaterialTheme.typography.bodySmall)
             NumberField("生成数量", count, !loading) { count = it }
             NumberField("有效天数", days, !loading) { days = it }
+            Text("开通权限", style = MaterialTheme.typography.labelLarge)
+            PermissionChecks(permissions, !loading, "admin-invite-permissions") { permissions = it }
             problem?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             ActionRow {
                 Button(onClick = {
@@ -423,13 +537,51 @@ internal fun RegistrationInvitationControls(
                         val amount = requireNotNull(count.toIntOrNull()?.takeIf { it in 1..100 }) { "每次可生成1到100个邀请码。" }
                         val duration = requireNotNull(days.toIntOrNull()?.takeIf { it in 1..365 }) { "有效天数应为1到365天。" }
                         problem = null
-                        onCreate(amount, duration)
+                        onCreate(amount, duration, permissions)
                     } catch (error: IllegalArgumentException) { problem = error.message }
                 }, enabled = !loading, modifier = Modifier.testTag("admin-invitations-create")) { Text("生成邀请码") }
                 TextButton(onClick = onRefresh, enabled = !loading) { Text("刷新列表") }
             }
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
         }
+    }
+}
+
+private val permissionSelectionSaver = listSaver<ServicePermissions, Boolean>(
+    save = { listOf(it.chatApi, it.imageApi, it.cloudSync) },
+    restore = { ServicePermissions(it[0], it[1], it[2]) },
+)
+
+private fun ServicePermissions.summary() = buildList {
+    if (chatApi) add("聊天 API")
+    if (imageApi) add("生图 API")
+    if (cloudSync) add("云同步")
+}.joinToString("、").ifEmpty { "未开通" }
+
+@Composable
+private fun PermissionChecks(
+    permissions: ServicePermissions,
+    enabled: Boolean,
+    tag: String,
+    onChange: (ServicePermissions) -> Unit,
+) {
+    ActionRow {
+        PermissionCheck("聊天 API", permissions.chatApi, enabled, "$tag:chat") { onChange(permissions.copy(chatApi = it)) }
+        PermissionCheck("生图 API", permissions.imageApi, enabled, "$tag:image") { onChange(permissions.copy(imageApi = it)) }
+        PermissionCheck("云同步", permissions.cloudSync, enabled, "$tag:sync") { onChange(permissions.copy(cloudSync = it)) }
+    }
+}
+
+@Composable
+private fun PermissionCheck(label: String, checked: Boolean, enabled: Boolean, tag: String, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.heightIn(min = 48.dp).toggleable(checked, enabled = enabled, role = Role.Checkbox, onValueChange = onChange)
+            .testTag(tag).padding(horizontal = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(checked, onCheckedChange = null, enabled = enabled)
+        Text(label, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -447,6 +599,7 @@ internal fun RegistrationInvitationCard(invitation: AdminRegistrationInvite) {
                     copied = true
                 }, modifier = Modifier.testTag("admin-invitation-copy:${invitation.id}")) { Text(if (copied) "已复制" else "复制邀请码") }
             } else Text("这条邀请码未提供完整内容，请刷新列表。", style = MaterialTheme.typography.bodySmall)
+            Text("权限 · ${invitation.permissions.summary()}", style = MaterialTheme.typography.bodySmall)
             Text("到期时间 · ${readableServerTime(invitation.expiresAt)}", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

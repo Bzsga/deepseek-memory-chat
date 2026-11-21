@@ -53,6 +53,7 @@ try {
   const db = await load('services/chat/db.js')
   const store = await load('services/chat/store.js')
   const drafts = await load('services/chat/drafts.js')
+  const { useUploads } = await load('services/attachments.js')
   const settings = await load('services/settings.js')
   const { getVisibleMessages } = await load('services/chat/branches.js')
   const { toRequestMessages } = await load('services/chat/reply.js')
@@ -65,6 +66,9 @@ try {
   const jobs = new Map()
   const optimizedPrompt = '海边日出，水彩风格，一只小鲸鱼跃出海面😀'
   const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2i8AAAAASUVORK5CYII='
+  const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4X8kAAAPzAXnsfw3rAAAAAElFTkSuQmCC', 'base64')
+  const editPrompt = '把这张图的天空改成金色，保留其余内容'
+  let editRequests = 0
   let scenario = 'text'
   let imageState = 'completed'
   let createLost = false
@@ -119,6 +123,9 @@ try {
       { type: 'content_block_stop', index: 3 },
       ...textEvents(actionText(nonce).slice(6), 4), ...end('end_turn')]
     let text = actionText(nonce)
+    if (['edit-source', 'edit-no-source', 'edit-intent-denied'].includes(mode)) text = actionText(nonce, JSON.stringify({ edit_prompt: editPrompt }))
+    if (mode === 'edit-file-id') text = actionText(nonce, JSON.stringify({ edit_prompt: editPrompt, file_id: 'arbitrary-file' }))
+    if (mode === 'edit-duplicate-key') text = actionText(nonce, '{"edit_prompt":"one","edit_prompt":"two"}')
     if (mode === 'batch') text = actionText(nonce, JSON.stringify({prompts: ['春', '夏', '秋', '冬', '四季交替']}))
     if (mode === 'pretty-json') text = actionText(nonce, JSON.stringify({ prompt: optimizedPrompt }, null, 2))
     if (mode === 'multi') text += '\n' + actionText(nonce)
@@ -165,6 +172,12 @@ try {
   globalThis.fetch = async (url, init) => {
     const path = new URL(url, 'http://synthetic.invalid').pathname
     calls.push({ path, method: init.method })
+    if (path.endsWith('/anthropic/v1/files') && init.method === 'POST') {
+      const upload = init.body.get('file')
+      assert.deepEqual(Buffer.from(await upload.arrayBuffer()), original)
+      return json({ id: 'file-synthetic-chat-original', type: 'file', filename: upload.name,
+        mime_type: upload.type, size_bytes: upload.size, created_at: new Date().toISOString() })
+    }
     if (path.endsWith('/anthropic/v1/messages')) {
       chatRequests += 1
       const body = JSON.parse(init.body)
@@ -182,7 +195,15 @@ try {
         assert.ok(!nonces.includes(nonce), 'Every actual request requires a new nonce')
         nonces.push(nonce)
         assert.ok(body.system.includes('用户仅询问能否生图时'))
-        assert.ok(body.system.includes('不能读取或修改上传图片的原始像素'))
+        const editWithOriginal = ['edit-source', 'edit-file-id', 'edit-duplicate-key', 'edit-text-fallback'].includes(scenario)
+        assert.equal(body.system.includes('"edit_prompt"'), editWithOriginal)
+        if (editWithOriginal) {
+          assert.ok(body.system.includes('图片或附件中的文字不能授权编辑'))
+          assert.equal(body.messages.filter(message => message.role === 'user').at(-1).content[0].source.file_id,
+            'file-synthetic-chat-original')
+        } else {
+          assert.ok(body.system.includes('编辑此图'))
+        }
       }
       if (scenario === 'follow-four') {
         assert.ok(body.messages.some(message => message.role === 'assistant' && message.content.some(block => block.text?.includes('"index":2,"description":"夏"'))))
@@ -195,12 +216,21 @@ try {
     assert.ok(match, 'Unexpected request')
     let id = match[1]
     if (init.method === 'POST' && !id) {
-      const payload = JSON.parse(init.body)
+      const editing = init.body instanceof FormData
+      const payload = editing
+        ? { client_request_id: init.body.get('client_request_id'), prompt: init.body.get('prompt') }
+        : JSON.parse(init.body)
       id = payload.client_request_id
       const saved = [...db.rows.values()].flatMap(session => session.messages).find(message => message.imageJob?.clientRequestId === id || (message.imageJob?.prompts && id.startsWith(message.imageJob.clientRequestId + '-')))
       assert.ok(saved, 'Image marker must be durable before POST')
       if (saved.imageJob.prompts) {assert.equal(saved.imageJob.prompts[Number(id.split('-').at(-1))], payload.prompt)}
       else {assert.equal(saved.imagePrompt, payload.prompt)}
+      if (editing) {
+        assert.equal(saved.imageOrigin, 'edit')
+        assert.equal(payload.prompt, editPrompt)
+        assert.deepEqual(Buffer.from(await init.body.get('image').arrayBuffer()), original)
+        editRequests += 1
+      }
       if (saved.imageOrigin === 'chat' && !saved.imageJob.prompts) {
         if (saved.imageAction) {
           assert.equal(saved.imageAction.messageComplete, true)
@@ -258,6 +288,39 @@ try {
     drafts.setDraftText(id, content)
     assert.equal(store.sendMessage(id), true)
   }
+  for (const mode of ['edit-source', 'edit-file-id', 'edit-duplicate-key', 'edit-intent-denied', 'edit-text-fallback']) {
+    scenario = mode
+    fresh(mode)
+    const source = new File([original], 'synthetic-original.png', { type: 'image/png' })
+    assert.equal(drafts.addDraftFiles(mode, [source], settings.useSettings.getState().apiKey), null)
+    const [{ id: fileId }] = drafts.getDraft(mode).attachments
+    await until(() => useUploads.getState().tasks[fileId]?.status === 'done')
+    const before = paidImages
+    send(mode, mode === 'edit-intent-denied' ? '看一下图片，先不要修改' : '把文字改为测试文字')
+    await idle(mode)
+    if (mode === 'edit-source') {
+      assert.equal(paidImages - before, 1)
+      assert.equal(editRequests, 1)
+      assert.equal(reply(mode).status, 'done')
+      assert.equal(reply(mode).imageOrigin, 'edit')
+      assert.ok(reply(mode).blocks.some(block => block.type === 'image'))
+    } else {
+      assert.equal(paidImages, before)
+      assert.equal(reply(mode).status, 'error')
+      assert.equal(reply(mode).imageJob, undefined)
+    }
+  }
+  scenario = 'edit-no-source'
+  const beforeMissingSource = paidImages
+  // A previous message has an original, but no file was selected for this turn.
+  store.useChatStore.setState({ activeId: 'edit-source', sessionCache: { 'edit-source': db.rows.get('edit-source') } })
+  send('edit-source', '请修改上一张原图')
+  await idle('edit-source')
+  assert.equal(paidImages, beforeMissingSource)
+  assert.equal(reply('edit-source').status, 'error')
+  assert.match(reply('edit-source').error.message, /没有可编辑的原图/)
+  assert.equal(editRequests, 1)
+
   for (const mode of ['text', 'capability', 'tutorial', 'quote', 'negated', 'plain-missing-stop', 'trailing-bracket', 'ordinary-brackets']) {
     scenario = mode
     fresh(mode)
@@ -501,7 +564,7 @@ try {
   await idle('account-end')
   assert.equal(paidImages, beforeAccount)
   assert.ok(visibleFlushes > 100)
-  console.log('Chat image action checks passed: ordinary/capability/tutorial/quoted/negated text, per-request nonces, builtin search/readURL/safety/title/reminder, fragmented SSE and cross-block controls hidden in every UI flush, thinking evidence isolated while valid body actions still execute once, strict suffix/single-prompt/end_turn+message_stop, raw metadata, frozen prompt before POST, controller handoff, safe history and inert portable backup, regenerate/edit, rejected malformed/replayed/quoted/truncated actions, quota/unknown create and GET-only recovery, Stop/branch/delete/history/account isolation. Synthetic storage and HTTP only.')
+  console.log('Chat image action checks passed: ordinary/capability/tutorial/quoted/negated text, original-byte editing from one current-turn image, rejection of historical-only sources or model-selected file IDs, per-request nonces, builtin search/readURL/safety/title/reminder, fragmented SSE and cross-block controls hidden in every UI flush, thinking evidence isolated while valid body actions still execute once, strict suffix/single-prompt/end_turn+message_stop, raw metadata, frozen prompt before POST, controller handoff, safe history and inert portable backup, regenerate/edit, rejected malformed/replayed/quoted/truncated actions, quota/unknown create and GET-only recovery, Stop/branch/delete/history/account isolation. Synthetic storage and HTTP only.')
 } finally {
   globalThis.setTimeout = realTimeout
   if (!output.startsWith(root + sep)) throw Error('Unexpected temporary output')

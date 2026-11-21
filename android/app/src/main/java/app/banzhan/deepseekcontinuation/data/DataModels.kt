@@ -28,6 +28,12 @@ data class AppState(
     val adminConfig: AdminConfig? = null,
     val adminLoading: Boolean = false,
     val adminError: String? = null,
+    val adminOpenPermissions: ServicePermissions? = null,
+    val adminOpenPermissionsLoading: Boolean = false,
+    val adminOpenPermissionsError: String? = null,
+    val adminSelfServiceRegistration: Boolean? = null,
+    val adminSelfServiceRegistrationLoading: Boolean = false,
+    val adminSelfServiceRegistrationError: String? = null,
     val adminStats: AdminStats? = null,
     val adminStatsLoading: Boolean = false,
     val adminStatsError: String? = null,
@@ -235,7 +241,7 @@ internal val AppState.organizationSettings: ServiceSettings
     get() {
         val defaults = ServiceSettings()
         val provider = chatProvider ?: return defaults
-        if (provider.mode == "managed" && account.currentUser?.managedEligible == true)
+        if (provider.mode == "managed" && account.currentUser?.servicePermissions?.chatApi == true)
             return defaults.copy(mode = "companion")
         if (provider.mode != "personal") return defaults
         val base = SummaryNetwork.checkedBase(provider.baseUrl)

@@ -1,7 +1,7 @@
-import { useActiveImageProvider } from '../../services/imageProvider.js'
-import { isGuestWorkspace } from '../../services/runtime.js'
+import { activeImageProvider, useActiveImageProvider } from '../../services/imageProvider.js'
+import { getRuntime, isSessionActive, subscribeRuntimeUser } from '../../services/runtime.js'
 import clsx from 'clsx'
-import { memo, useCallback, useEffect, useId, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import {
   IconGlobeLanguageOutline14,
   IconCloseOutline16,
@@ -30,7 +30,7 @@ import {
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import { IconButton } from '../base/IconButton.js'
 import { Tooltip } from '../base/Tooltip.js'
-import { ensureApiKey, openSettings } from '../settings/settingsDialogState.js'
+import { ensureApiKey, openChatProvider } from '../settings/settingsDialogState.js'
 import { DragMask, useFileDrop } from './DragMask.js'
 import { showToast } from '../base/toastState.js'
 import {
@@ -39,6 +39,13 @@ import {
   normalizeUploadFiles,
   useUploads,
 } from '../../services/attachments.js'
+import {
+  IMAGE_EDIT_ACCEPT,
+  MAX_IMAGE_EDIT_COUNT,
+  MAX_IMAGE_EDIT_MB,
+  MAX_IMAGE_EDIT_TOTAL_MB,
+  resolveImageEditSources,
+} from '../../services/imageEditSource.js'
 import { DraftAttachments } from './DraftAttachments.js'
 import { useVoiceInput } from './useVoiceInput.js'
 import { VoiceButton } from './VoiceButton.js'
@@ -46,6 +53,8 @@ import { Spectrum } from './Spectrum.js'
 import { AddIcon, CameraIcon, ChatIcon, FileIcon, ImageIcon } from './ComposerIcons.js'
 import { useTranslate } from '../../i18n/index.js'
 import styles from './ChatInput.module.css'
+
+type ImageReference = { file: File; url: string }
 
 /** 输入框：自适应高度的文本框 + 文件 + 深度思考与智能搜索开关 + 语音输入 + 发送 / 停止 */
 export const ChatInput = memo(function ChatInput({ sessionId }: { sessionId: string | null }) {
@@ -58,12 +67,16 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const imageProvider = useActiveImageProvider()
   const locale = useSettings(state => state.locale)
   const needsConfiguration = useSettings(state => !state.apiKey)
+  const canRedeemInvite = useSyncExternalStore(subscribeRuntimeUser, () => getRuntime().user.invite_redeemable)
   const [imageCount, setImageCount] = useState(1)
   const [imageSelected, setImageMode] = useState(false)
+  const [imageReferences, setImageReferences] = useState<ImageReference[]>([])
+  const imageReferencesRef = useRef<ImageReference[]>([])
   const [uploadOpen, setUploadOpen] = useState(false)
   const uploadPanelId = useId()
   const imageAvailable = imageProvider !== null
-  const imageMode = imageAvailable && imageSelected
+  const imageMode = imageSelected
+  const editMode = imageMode && imageReferences.length > 0
   const draft = useDrafts((state) => state.drafts.get(sessionId) ?? EMPTY_DRAFT)
   const { text, attachments } = draft
   const setText = (value: string) => setDraftText(sessionId, value)
@@ -77,15 +90,91 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const search = useSettings((state) => state.search)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
+  const editInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
+  const updateImageReferences = useCallback((next: ImageReference[]) => {
+    for (const reference of imageReferencesRef.current) {
+      if (!next.includes(reference)) {
+        URL.revokeObjectURL(reference.url)
+      }
+    }
+    imageReferencesRef.current = next
+    setImageReferences(next)
+  }, [])
+
+  useEffect(() => () => {
+    for (const reference of imageReferencesRef.current) {
+      URL.revokeObjectURL(reference.url)
+    }
+  }, [])
+
+  const addImageReferences = useCallback((files: File[]) => {
+    const current = imageReferencesRef.current
+    const selection = resolveImageEditSources([...current.map((reference) => reference.file), ...files])
+    if ('error' in selection) {
+      showToast(selection.error)
+      return false
+    }
+    const added = selection.sources
+      .slice(current.length)
+      .map((file) => ({ file, url: URL.createObjectURL(file) }))
+    updateImageReferences([...current, ...added])
+    return true
+  }, [updateImageReferences])
+
+  useEffect(() => {
+    if (sessionId === null) {
+      return
+    }
+    let focusFrame = 0
+    const useImageForEdit = (event: Event) => {
+      if (!(event instanceof CustomEvent) || event.detail?.sessionId !== sessionId) {
+        return
+      }
+      const state = useChatStore.getState()
+      if (
+        !isSessionActive() || !activeImageProvider() || state.activeId !== sessionId || state.importingHistory ||
+        Object.hasOwn(state.streaming, sessionId) || !(event.detail.source instanceof File)
+      ) {
+        event.preventDefault()
+        return
+      }
+      if (getDraft(sessionId).attachments.length > 0) {
+        showToast({ key: 'imageTextOnly' })
+        event.preventDefault()
+        return
+      }
+      if (!addImageReferences([event.detail.source])) {
+        event.preventDefault()
+        return
+      }
+      setImageMode(true)
+      setUploadOpen(false)
+      cancelAnimationFrame(focusFrame)
+      if (!isMobile) {
+        focusFrame = requestAnimationFrame(() => textareaRef.current?.focus({ preventScroll: true }))
+      }
+    }
+    document.addEventListener('deepseek:use-image-for-edit', useImageForEdit)
+    return () => {
+      cancelAnimationFrame(focusFrame)
+      document.removeEventListener('deepseek:use-image-for-edit', useImageForEdit)
+    }
+  }, [sessionId, isMobile, addImageReferences])
+
   const acceptFiles = (files: File[]) => {
-    if (files.length === 0 || useChatStore.getState().importingHistory || !ensureApiKey()) {
+    if (files.length === 0 || !isSessionActive() || useChatStore.getState().importingHistory) {
       return
     }
     if (imageMode) {
-      showToast(t('imageTextOnly'))
+      if (!streaming) {
+        addImageReferences(files)
+      }
+      return
+    }
+    if (!ensureApiKey()) {
       return
     }
     const error = addDraftFiles(
@@ -151,9 +240,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
       useChatStore.subscribe((state, previous) => {
         if (state.importingHistory && !previous.importingHistory) {
           cancelVoice()
+          updateImageReferences([])
         }
       }),
-    [cancelVoice]
+    [cancelVoice, updateImageReferences]
   )
 
   // 移动端录音时用频谱替代输入框内容
@@ -164,26 +254,43 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     !importingHistory &&
     !streaming &&
     voice.status === 'idle' &&
-    (imageMode ? !!text.trim() && attachments.length === 0 && text.length <= 8000 : draftReady)
+    (imageMode ? imageAvailable && !!text.trim() && attachments.length === 0 && text.length <= 8000 : draftReady)
 
   const send = () => {
-    if (
-      useChatStore.getState().importingHistory ||
-      voice.status !== 'idle' ||
-      !prepareDraftMessage(getDraft(sessionId), useUploads.getState().tasks)
-    ) {
+    if (useChatStore.getState().importingHistory || streaming || voice.status !== 'idle') {
       return
     }
     // 文本与上传完成态由提交动作读取最新快照，不使用上一次渲染的草稿。
-    if (
-      imageMode &&
-      (getDraft(sessionId).attachments.length > 0 || getDraft(sessionId).text.length > 8000)
-    ) {
+    const currentDraft = getDraft(sessionId)
+    if (imageMode && currentDraft.attachments.length > 0) {
+      showToast(t('imageTextOnly'))
+      return
+    }
+    if (imageMode && currentDraft.text.length > 8000) {
       showToast(t('imagePromptLimit'))
       return
     }
-    if ((!imageMode && !ensureApiKey()) || !(imageMode ? sendImageMessage(sessionId, imageCount) : sendMessage(sessionId))) {
+    if (!imageMode) {
+      if (!prepareDraftMessage(currentDraft, useUploads.getState().tasks)) {
+        return
+      }
+      if (!ensureApiKey()) {
+        if (isMobile) {
+          textareaRef.current?.blur()
+        }
+        return
+      }
+    }
+    const references = imageReferencesRef.current
+    const sources = references.length > 0 ? references.map((reference) => reference.file) : undefined
+    const sent = imageMode
+      ? sendImageMessage(sessionId, sources ? 1 : imageCount, sources)
+      : sendMessage(sessionId)
+    if (!sent) {
       return
+    }
+    if (imageMode) {
+      updateImageReferences([])
     }
     stopReadAloud()
     if (isMobile) {
@@ -192,6 +299,8 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
       textareaRef.current?.focus()
     }
   }
+
+  const placeholder = t(editMode ? 'imageEditPromptPlaceholder' : imageMode ? 'imagePromptPlaceholder' : 'chatInputPlaceholderChat')
 
   return (
     <div
@@ -202,14 +311,14 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
         }
       }}
     >
-      {needsConfiguration ? (
+      {needsConfiguration && !imageMode ? (
         <div className={styles.modeRow}>
-          <button type="button" className={styles.modeTab} onClick={() => openSettings('general')}>
-            {t(isGuestWorkspace() ? 'chatProviderGuestSetup' : 'chatProviderSetup')}
+          <button type="button" className={styles.modeTab} aria-haspopup="dialog" onClick={openChatProvider}>
+            {t(canRedeemInvite ? 'chatProviderSetup' : 'chatProviderGuestSetup')}
           </button>
         </div>
       ) : null}
-      {imageAvailable ? (
+      {imageAvailable || imageMode ? (
         <div className={styles.modeRow}>
           <div className={styles.modeTabs} role="group" aria-label={t('composerMode')}>
             <button
@@ -226,26 +335,65 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
               type="button"
               className={clsx(styles.modeTab, imageMode && styles.modeActive)}
               aria-pressed={imageMode}
-              disabled={streaming || importingHistory}
+              disabled={streaming || importingHistory || !imageAvailable}
               onClick={() => changeMode(true)}
             >
               <ImageIcon />
               {t('imageMode')}
             </button>
           </div>
-          {imageMode && <select aria-label={locale === 'zh-CN' ? '生成张数' : 'Image count'} value={imageCount} onChange={event => setImageCount(Number(event.target.value))}>
-            {[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{locale === 'zh-CN' ? `${n} 张` : `${n} image${n === 1 ? '' : 's'}`}</option>)}
-          </select>}
-          {imageMode ? <span className={styles.imageHint}>{imageProvider === 'personal' ? (locale === 'zh-CN' ? '使用个人生图 API，由服务商计费。' : 'Billed by your image provider.') : t('imageManagedQuotaHint')}</span> : null}
+          {imageMode && !editMode ? (
+            <select
+              className={styles.imageCount}
+              aria-label={locale === 'zh-CN' ? '生成张数' : 'Image count'}
+              value={imageCount}
+              onChange={(event) => setImageCount(Number(event.target.value))}
+            >
+              {[1, 2, 3, 4, 5].map((count) => (
+                <option key={count} value={count}>
+                  {locale === 'zh-CN' ? `${count} 张` : `${count} image${count === 1 ? '' : 's'}`}
+                </option>
+              ))}
+            </select>
+          ) : null}
+          {imageMode ? (
+            <span className={styles.imageHint}>
+              {imageProvider === 'personal'
+                ? locale === 'zh-CN' ? '使用个人生图 API，由服务商计费。' : 'Billed by your image provider.'
+                : t(imageProvider === 'managed' ? 'imageManagedQuotaHint' : 'imageProviderUnavailable')}
+            </span>
+          ) : null}
         </div>
       ) : null}
       <DraftAttachments items={attachments} onRetry={retryFile} onRemove={removeFile} />
+      {editMode ? (
+        <ul className={styles.imageReferences} role="list" aria-label={t('imageEditChooseSource')}>
+          {imageReferences.map((reference, index) => {
+            const label = t('imageEditRemoveSource', { index: index + 1, name: reference.file.name })
+            return (
+              <li key={reference.url} className={clsx(styles.attachment, styles.imageReference)} title={reference.file.name}>
+                <img src={reference.url} alt={reference.file.name} />
+                <button
+                  type="button"
+                  className={styles.remove}
+                  aria-label={label}
+                  title={label}
+                  disabled={streaming || importingHistory}
+                  onClick={() => updateImageReferences(imageReferencesRef.current.filter((item) => item !== reference))}
+                >
+                  <IconCloseOutline16 />
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      ) : null}
       <div className={styles.textareaWrapper}>
         <textarea
           ref={textareaRef}
           className={clsx(styles.textarea, recording && isMobile && styles.textareaHidden)}
-          placeholder={t(imageMode ? 'imagePromptPlaceholder' : 'chatInputPlaceholderChat')}
-          aria-label={t(imageMode ? 'imagePromptPlaceholder' : 'chatInputPlaceholderChat')}
+          placeholder={placeholder}
+          aria-label={placeholder}
           rows={2}
           // 移动端不自动聚焦，避免一打开就弹出键盘
           autoFocus={!isMobile}
@@ -325,7 +473,19 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
               </Tooltip>
             </>
           ) : (
-            <span className={styles.imageHint}>{t('imageModeHint')}</span>
+            <button
+              type="button"
+              className={styles.toggle}
+              title={t('imageEditSourceHint', { count: MAX_IMAGE_EDIT_COUNT, size: MAX_IMAGE_EDIT_MB, total: MAX_IMAGE_EDIT_TOTAL_MB })}
+              disabled={streaming || importingHistory || imageReferences.length >= MAX_IMAGE_EDIT_COUNT}
+              onClick={() => {
+                textareaRef.current?.blur()
+                editInputRef.current?.click()
+              }}
+            >
+              <ImageIcon />
+              <span>{t('imageEditChooseSource')}</span>
+            </button>
           )}
         </div>
         <div className={styles.right}>
@@ -358,7 +518,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             <button
               type="button"
               className={clsx(styles.sendButton, !canSend && styles.disabled)}
-              aria-label={t(imageMode ? 'generateImage' : 'send')}
+              aria-label={t(editMode ? 'editImage' : imageMode ? 'generateImage' : 'send')}
               disabled={!canSend}
               onClick={send}
             >
@@ -387,6 +547,20 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             <span>{t('chooseFiles')}</span>
           </button>
         </div>
+      ) : null}
+      {imageMode ? (
+        <input
+          ref={editInputRef}
+          type="file"
+          multiple
+          hidden
+          accept={IMAGE_EDIT_ACCEPT}
+          data-upload-kind="image-edit"
+          onChange={(event) => {
+            acceptFiles(Array.from(event.target.files ?? []))
+            event.target.value = ''
+          }}
+        />
       ) : null}
       <input
         ref={imageInputRef}
@@ -424,7 +598,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           event.target.value = ''
         }}
       />
-      {dragging ? <DragMask /> : null}
+      {dragging ? <DragMask imageEdit={imageMode} /> : null}
     </div>
   )
 }

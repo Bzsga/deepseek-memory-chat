@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState, type HTMLAttributes } from 'react'
+import { useEffect, useMemo, useRef, type HTMLAttributes } from 'react'
 import { useTranslate } from '../../i18n/index.js'
+import { resolveImageEditSource } from '../../services/imageEditSource.js'
+import { useActiveImageProvider } from '../../services/imageProvider.js'
 import { isNativeConnected } from '../../services/nativeBridge.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
 import { ImageViewer, type ImagePressHandlers } from './ImageViewer.js'
+import { useImageOverlayHistory } from './useImageOverlayHistory.js'
 import styles from './ImageViewer.module.css'
 
 /** The save link carries original bytes through the existing native Blob download handler. */
@@ -12,16 +15,28 @@ export const useImageActions = ({
   url,
   blob,
   name,
+  mimeType,
   alt,
+  editSessionId,
 }: {
   url: string | null | undefined
   blob: Blob | null | undefined
   name: string
+  mimeType?: string
   alt: string
+  editSessionId?: string
 }) => {
   const t = useTranslate()
-  const [preview, setPreview] = useState<string | null>(null)
-  const [menu, setMenu] = useState<string | null>(null)
+  const imageProvider = useActiveImageProvider()
+  const { preview, menu, openPreview, openOptions, closePreview, closeOptions } =
+    useImageOverlayHistory(url)
+  const editSource = useMemo(() => {
+    if (!editSessionId || !imageProvider || !blob || (!preview && !menu)) {
+      return undefined
+    }
+    const result = resolveImageEditSource([new File([blob], name, { type: mimeType || blob.type })])
+    return 'source' in result ? result.source : undefined
+  }, [editSessionId, imageProvider, blob, preview, menu, name, mimeType])
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const origin = useRef<{ id: number; x: number; y: number } | null>(null)
   const suppressClickUntil = useRef(0)
@@ -36,7 +51,7 @@ export const useImageActions = ({
     if (url && blob) {
       cancelPress()
       suppressClickUntil.current = Date.now() + 800
-      setMenu(url)
+      openOptions()
     }
   }
   const press: ImagePressHandlers = {
@@ -86,7 +101,7 @@ export const useImageActions = ({
         return
       }
       if (url && blob) {
-        setPreview(url)
+        openPreview()
       }
     },
   }
@@ -104,7 +119,7 @@ export const useImageActions = ({
       anchor.hidden = true
       document.body.append(anchor)
       anchor.click()
-      setMenu(null)
+      closeOptions()
     } catch {
       showToast({ key: 'imageSaveFailed', type: 'error' })
     } finally {
@@ -116,31 +131,49 @@ export const useImageActions = ({
     }
   }
 
+  const edit = editSource && editSessionId
+    ? () => {
+        const accepted = document.dispatchEvent(new CustomEvent('deepseek:use-image-for-edit', {
+          cancelable: true,
+          detail: { sessionId: editSessionId, source: editSource },
+        }))
+        if (accepted) {
+          closePreview()
+        }
+      }
+    : undefined
+
   return {
     handlers,
     overlay: (
       <>
-        {url && preview === url ? (
+        {url && preview ? (
           <ImageViewer
             url={url}
             name={name}
             alt={alt}
             press={press}
-            menuOpen={menu === url}
+            menuOpen={menu}
             onMenu={openMenu}
-            onClose={() => setPreview(null)}
+            onEdit={edit}
+            onClose={closePreview}
           />
         ) : null}
-        {url && menu === url ? (
+        {url && menu ? (
           <Modal
             title={t('imageOptions')}
             requireBackdropPointerDown
-            onClose={() => setMenu(null)}
+            onClose={closeOptions}
             footer={
               <div className={styles.menuActions}>
-                <Button variant="outlined" onClick={() => setMenu(null)}>
+                <Button variant="outlined" onClick={closeOptions}>
                   {t('cancel')}
                 </Button>
+                {edit ? (
+                  <Button variant="outlined" onClick={edit}>
+                    {t('imageEditThisImage')}
+                  </Button>
+                ) : null}
                 <Button onClick={save}>
                   {t(isNativeConnected() ? 'imageSaveToAlbum' : 'imageSave')}
                 </Button>

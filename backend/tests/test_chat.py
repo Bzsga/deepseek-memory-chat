@@ -11,7 +11,7 @@ from fastapi import FastAPI, Response
 from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 
-from account_fixtures import managed_account
+from account_fixtures import legacy_personal_account, managed_account
 from app.chat import ChatProvider, ImageProvider, MAX_BODY, build_chat_router, load_image_provider
 from app.config import Settings
 from app.store import Store
@@ -81,7 +81,10 @@ def test_runtime_uses_registered_identity_and_only_personal_weekly_quota(environ
     assert response.status_code == 401 and response.headers["X-Session-Expired"] == "1"
     response = client.get("/chat/api/runtime", headers=identity(first))
     assert response.status_code == 200
-    assert response.json()["user"]["id"] == first["user"]["id"]
+    user = response.json()["user"]
+    assert user["id"] == first["user"]["id"]
+    assert user["permissions"] == {"chat_api": True, "image_api": True, "cloud_sync": True}
+    assert user["invite_redeemable"] is False
     assert response.json()["weekly_quota"]["user_weekly_remaining"] == 20
     assert "weekly_limit" not in response.json()["weekly_quota"]
     assert "synthetic-private-key" not in response.text
@@ -90,13 +93,14 @@ def test_runtime_uses_registered_identity_and_only_personal_weekly_quota(environ
 
 def test_personal_account_uses_cookie_redemption_and_revocation_blocks_all_managed_calls(environment):
     store, _first, _second, calls, client = environment
-    personal = store.accounts.register("personal_only", PASSWORD)
+    personal = legacy_personal_account(store, "personal_only", PASSWORD)
     headers = identity(personal)
     invite = {"invitation_code": store.accounts.create_invites(1, 1)["invitations"][0]["code"]}
     url = "/chat/api/redeem-invite"
     assert client.post(url, headers={**headers, "Origin": "https://example.invalid"}, json=invite).status_code == 403
     assert client.post(url, headers={**headers, "X-Chat-User-Id": "old-user"}, json=invite).status_code == 409
-    assert client.get("/chat/api/runtime", headers=headers).json()["user"]["managed_eligible"] is False
+    user = client.get("/chat/api/runtime", headers=headers).json()["user"]
+    assert user["managed_eligible"] is False and user["invite_redeemable"] is True
     redeemed = client.post(url, headers=headers, json=invite)
     assert redeemed.status_code == 200 and redeemed.json()["user"]["managed_eligible"]
     assert client.post("/chat/anthropic/v1/messages", headers=headers, json=message()).status_code == 200
@@ -105,27 +109,103 @@ def test_personal_account_uses_cookie_redemption_and_revocation_blocks_all_manag
     assert client.post(url, headers=headers, json=invite).status_code == 400
     for route in ("anthropic/v1/messages", "anthropic/v1/files", "v1/tools/tts", "v1/tools/asr", "api/images", "api/image-jobs"):
         denied = client.post("/chat/" + route, headers=headers, json=message())
-        assert denied.status_code == 403 and denied.json()["error"]["code"] == "managed_ineligible"
+        code = "image_ineligible" if route.startswith("api/image") else "managed_ineligible"
+        assert denied.status_code == 403 and denied.json()["error"]["code"] == code
     assert len(calls) == 1 and len(records(store)) == 1
 
 
-def test_browser_registers_before_redeeming_invitation(environment):
+def test_browser_signup_requires_one_invite_and_starts_with_managed_access(environment):
     store, _first, _second, calls, client = environment
+    store.accounts.set_registration_policy(False)
     form = client.get("/chat/register").text
     assert 'name="username"' in form and 'name="password"' in form
-    assert 'invitation_code' not in form and 'API Key' not in form
+    assert 'name="invitation_code"' in form and 'API Key' not in form
+    assert 'name="invitation_code"' not in client.get("/chat/login").text
     code = store.accounts.create_invites(1, 7)["invitations"][0]["code"]
     fields = {"username": "browser_signup", "password": PASSWORD}
-    legacy = client.post("/chat/register", data={**fields, "invitation_code": code}, headers={"Origin": ORIGIN})
-    assert legacy.status_code == 422 and "注册后" in legacy.text and code not in legacy.text
-    registered = client.post("/chat/register", data=fields, headers={"Origin": ORIGIN}, follow_redirects=False)
-    assert registered.status_code == 303
+    missing = client.post("/chat/register", data=fields, headers={"Origin": ORIGIN})
+    assert missing.status_code == 422 and "注册需要邀请码" in missing.text
+    invalid_code = "synthetic-invalid-code"
+    invalid = client.post("/chat/register", data={**fields, "invitation_code": invalid_code}, headers={"Origin": ORIGIN})
+    assert invalid.status_code == 400 and invalid_code not in invalid.text
+    registered = client.post("/chat/register", data={**fields, "invitation_code": code},
+        headers={"Origin": ORIGIN}, follow_redirects=False)
+    assert registered.status_code == 303 and code not in registered.text
     token = registered.cookies["deepseek_session"]
     owner = store.accounts.authenticate(token)
-    assert not store.accounts.me(owner)["user"]["managed_eligible"]
-    redeemed = client.post("/chat/api/redeem-invite", json={"invitation_code": code},
-                           headers=identity({"token": token, "user": {"id": owner}}))
-    assert redeemed.status_code == 200 and redeemed.json()["user"]["managed_eligible"]
+    assert store.accounts.me(owner)["user"]["registration_kind"] == "invitation"
+    runtime = client.get("/chat/api/runtime", headers=identity({"token": token, "user": {"id": owner}})).json()
+    assert runtime["user"]["managed_eligible"] and runtime["weekly_quota"]["user_weekly_remaining"] == 20
+    duplicate = client.post("/chat/register", data={**fields, "username": "another_signup", "invitation_code": code},
+        headers={"Origin": ORIGIN}, follow_redirects=False)
+    assert duplicate.status_code == 400 and code not in duplicate.text
+    assert not calls
+
+
+def test_browser_self_service_signup_without_code_gets_sync_access(environment):
+    store, _first, _second, calls, client = environment
+    form = client.get("/chat/register").text
+    assert "邀请码（选填）" in form
+    invalid = client.post("/chat/register",
+                          data={"username": "ordinary_signup", "password": PASSWORD, "invitation_code": "invalid-invite"},
+                          headers={"Origin": ORIGIN})
+    assert invalid.status_code == 400 and "invalid-invite" not in invalid.text
+    registered = client.post("/chat/register",
+                             data={"username": "ordinary_signup", "password": PASSWORD, "invitation_code": ""},
+                             headers={"Origin": ORIGIN}, follow_redirects=False)
+    assert registered.status_code == 303
+    token = registered.cookies["deepseek_session"]
+    account = store.accounts.me(store.accounts.authenticate(token))
+    assert account["user"]["permissions"] == {"chat_api": False, "image_api": False, "cloud_sync": True}
+    assert account["user"]["invite_redeemable"] and account["quota"]["user_weekly_remaining"] == 0
+    assert not calls
+
+
+@pytest.mark.parametrize("image_enabled", [True, False], ids=["image-only", "sync-only"])
+def test_browser_signup_accepts_scoped_invite(environment, image_enabled):
+    store, _first, _second, calls, _client = environment
+    permissions = {"chat_api": False, "image_api": image_enabled, "cloud_sync": not image_enabled}
+    code = store.accounts.create_invites(1, 7, permissions=permissions)["invitations"][0]["code"]
+    dispatched = []
+
+    def handler(request):
+        dispatched.append(request)
+        return httpx.Response(200, json={"data": [{"b64_json": PNG}]})
+
+    with custom_client(store, handler, IMAGE_PROVIDER) as client:
+        response = client.post("/chat/register", data={"username": "scoped_signup", "password": PASSWORD,
+            "invitation_code": code}, headers={"Origin": ORIGIN}, follow_redirects=False)
+        assert response.status_code == 303
+        token = response.cookies["deepseek_session"]
+        headers = identity({"token": token, "user": {"id": store.accounts.authenticate(token)}})
+        runtime = client.get("/chat/api/runtime", headers=headers).json()
+        assert runtime["user"]["permissions"] == permissions
+        assert runtime["user"]["managed_eligible"] is False and runtime["user"]["invite_redeemable"] is False
+        assert runtime["features"]["image_generation"] is image_enabled
+        assert runtime["image_model"] == (IMAGE_PROVIDER.model if image_enabled else None)
+        quota = client.get("/chat/api/quota", headers=headers).json()
+        assert quota["permissions"] == permissions
+        assert quota["user_weekly_remaining"] == (20 if image_enabled else 0)
+        denied = client.post("/chat/anthropic/v1/messages", json=message(), headers=headers)
+        assert denied.status_code == 403 and denied.json()["error"]["code"] == "managed_ineligible"
+        images = client.post("/chat/api/images", json={"prompt": "Synthetic image"}, headers=headers)
+        if image_enabled:
+            assert images.status_code == 200 and client.get("/chat/api/quota", headers=headers).json()["user_weekly_remaining"] == 19
+        else:
+            assert images.status_code == 403 and images.json()["error"]["code"] == "image_ineligible"
+    assert len(dispatched) == int(image_enabled) and not calls
+
+
+def test_browser_redeem_returns_scoped_invitation_permissions(environment):
+    store, _first, _second, calls, client = environment
+    personal = legacy_personal_account(store, "scoped_redeemer", PASSWORD)
+    permissions = {"chat_api": False, "image_api": True, "cloud_sync": False}
+    code = store.accounts.create_invites(1, 7, permissions=permissions)["invitations"][0]["code"]
+    response = client.post("/chat/api/redeem-invite", json={"invitation_code": code}, headers=identity(personal))
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["user"]["managed_eligible"] is False and payload["user"]["invite_redeemable"] is False
+    assert payload["user"]["permissions"] == payload["quota"]["permissions"] == permissions
     assert not calls
 
 
@@ -245,13 +325,66 @@ def test_common_quota_blocks_new_chat_before_upstream_dispatch(environment):
     assert not calls and not records(store)
 
 
-def custom_client(store, handler, image_provider=None):
+def custom_client(store, handler, image_provider=None, *, provider_loader=None):
     app = FastAPI()
     app.include_router(build_chat_router(store,
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        provider_loader=lambda: ChatProvider("https://api.deepseek.com", "deepseek-flash", "synthetic-private-key"),
+        provider_loader=provider_loader or (lambda: ChatProvider("https://api.deepseek.com", "deepseek-flash", "synthetic-private-key")),
         image_provider_loader=lambda: image_provider))
     return TestClient(app, base_url=ORIGIN)
+
+
+@pytest.mark.parametrize("failure", [ValueError, FileNotFoundError, KeyError])
+def test_managed_chat_configuration_failure_has_specific_code_without_dispatch(environment, failure):
+    store, first, _second, _calls, _client = environment
+    path = "/chat/anthropic/v1/messages"
+    loads = []
+    dispatches = []
+
+    def loader():
+        loads.append(True)
+        raise failure("synthetic-private-provider-error")
+
+    def handler(request):
+        dispatches.append(request)
+        return httpx.Response(500)
+
+    with custom_client(store, handler, provider_loader=loader) as isolated:
+        unauthenticated = isolated.post(path, json=message(), headers={"Origin": ORIGIN})
+        assert unauthenticated.status_code == 401
+        assert "code" not in unauthenticated.json()["error"] and not loads
+        response = isolated.post(path, json=message(), headers=identity(first))
+        if failure is ValueError:
+            models = isolated.get("/chat/models", headers=identity(first))
+            assert models.status_code == 503 and "code" not in models.json()["error"]
+    assert response.status_code == 503 and response.json()["error"]["code"] == "managed_chat_unavailable"
+    assert "synthetic-private-provider-error" not in response.text
+    assert not dispatches and not records(store)
+    assert store.quota(first["user"]["id"])["user_weekly_remaining"] == 20
+
+
+@pytest.mark.parametrize("upstream_status,status,code", [
+    (401, 502, "managed_chat_unavailable"),
+    (403, 502, "managed_chat_unavailable"),
+    (429, 429, None),
+    (500, 502, None),
+])
+def test_only_managed_chat_upstream_auth_rejection_has_setup_code(environment, upstream_status, status, code):
+    store, first, _second, _calls, _client = environment
+    dispatches = []
+
+    def handler(request):
+        dispatches.append(request)
+        return httpx.Response(upstream_status, content=b"synthetic raw provider detail")
+
+    with custom_client(store, handler) as isolated:
+        response = isolated.post("/chat/anthropic/v1/messages", json=message(), headers=identity(first))
+        models = isolated.get("/chat/models", headers=identity(first))
+    assert response.status_code == status and response.json()["error"].get("code") == code
+    assert "synthetic raw provider detail" not in response.text
+    assert len(dispatches) == 2 and models.status_code == status and models.json()["error"].get("code") is None
+    assert [(row["kind"], row["status"]) for row in records(store)] == [("chat", "failed")]
+    assert store.quota(first["user"]["id"])["user_weekly_remaining"] == 19
 
 
 def test_upstream_redirect_is_not_followed_and_sent_call_stays_counted(environment):

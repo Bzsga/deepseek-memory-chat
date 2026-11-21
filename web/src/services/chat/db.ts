@@ -27,7 +27,7 @@ export type SyncSessionState = {
   writerId?: string
 }
 
-export type SyncControl = { id: 'control'; generation: number; cursor: number }
+export type SyncControl = { id: 'control'; generation: number; cursor: number; attachmentGeneration?: number }
 
 interface ChatDB extends DBSchema {
   /** 当前使用的会话，界面读写都在这里 */
@@ -496,6 +496,7 @@ export const saveSyncControl = async (
     return false
   }
   await tx.store.put({
+    ...(previous?.generation === value.generation ? previous : {}),
     ...value,
     cursor:
       previous?.generation === value.generation

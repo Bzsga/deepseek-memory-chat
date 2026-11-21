@@ -2,6 +2,9 @@
 import asyncio
 import base64
 from contextlib import asynccontextmanager
+from email import policy
+from email.parser import BytesParser
+import hashlib
 import json
 import threading
 import time
@@ -12,9 +15,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from account_fixtures import managed_account
-from app.chat import ChatProvider, ImageProvider, build_chat_router
+from app.chat import ChatProvider, ImageProvider, MAX_IMAGE_EDIT_BODY, build_chat_router
 from app.config import Settings
 from app.image_jobs import ImageJobError, ImageJobs
+from app.main import BoundedBodyMiddleware
 from app.store import Store
 
 
@@ -99,11 +103,17 @@ def test_job_survives_creation_response_and_recovers_with_one_dispatch_owner_and
         release.set()
         wait_until(lambda: client.get(path, headers=headers(first)).json()["status"] == "completed")
         assert client.get(path + "/result", headers=headers(first)).json() == RESULT
+        owner = first["user"]["id"]
+        store.accounts.set_permissions(owner, {"chat_api": True, "image_api": False, "cloud_sync": True})
+        rejected = client.post("/chat/api/image-jobs", json=body, headers=headers(first))
+        assert rejected.status_code == 403 and rejected.json()["error"]["code"] == "image_ineligible"
+        assert client.get(path, headers=headers(first)).json()["status"] == "completed"
         assert client.get(path + "/result", headers=headers(first)).json() == RESULT
         assert client.post(path + "/cancel", headers=headers(first)).json()["status"] == "completed"
         assert client.get(path + "/result", headers=headers(first)).status_code == 200
         assert len(dispatched) == 1 and calls(store) == [{"kind": "image", "status": "success"}]
-        assert store.quota(first["user"]["id"])["user_weekly_remaining"] == 19
+        assert store.quota(owner)["user_weekly_remaining"] == 19
+        store.accounts.set_permissions(owner, {"chat_api": True, "image_api": True, "cloud_sync": True})
         with store.connection() as db:
             row = dict(db.execute("SELECT * FROM image_jobs").fetchone())
         assert body["prompt"] not in json.dumps(row) and "prompt" not in row
@@ -116,6 +126,131 @@ def test_job_survives_creation_response_and_recovers_with_one_dispatch_owner_and
         assert not result_path.exists()
         assert client.post("/chat/api/image-jobs", json=body, headers=headers(first)).json()["status"] == "expired"
         assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("source_count", [1, 4])
+def test_edit_upload_reuses_managed_job_recovery_and_dispatches_originals_once(owners, source_count, monkeypatch):
+    store, first, second, directory = owners
+    jobs = ImageJobs(store, directory)
+    dispatched = []
+    sources = [
+        (b"\x89PNG\r\n\x1a\nfirst image\x80\r\n", "image/png", "png"),
+        (b"\xff\xd8\xffsecond image", "image/jpeg", "jpg"),
+        (b"RIFF\xff\xff\xff\xffWEBPthird image", "image/webp", "webp"),
+        (b"\x89PNG\r\n\x1a\nfourth image", "image/png", "png"),
+    ][:source_count]
+    prompt = "把背景换成白色"
+    key = "synthetic-stable-edit-id"
+    job_path = "/chat/api/image-jobs"
+    path = f"{job_path}/{key}"
+
+    async def handler(request):
+        envelope = f"Content-Type: {request.headers['Content-Type']}\r\n\r\n".encode("ascii")
+        message = BytesParser(policy=policy.default).parsebytes(envelope + request.content)
+        fields, images = {}, []
+        for part in message.iter_parts():
+            field_name = part.get_param("name", header="content-disposition")
+            if part.get_filename():
+                images.append((field_name, part))
+            else:
+                fields[field_name] = part
+        dispatched.append((request, fields, images))
+        if fields["prompt"].get_payload(decode=True) == b"unsupported":
+            return httpx.Response(405, json={"error": "private upstream diagnostics"})
+        return httpx.Response(200, json={"data": [{"b64_json": PNG}]})
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        await jobs.start()
+        try:
+            yield
+        finally:
+            await jobs.stop()
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(build_chat_router(store, image_jobs=jobs,
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        provider_loader=lambda: ChatProvider("https://api.deepseek.com", "deepseek-flash", "synthetic-key"),
+        image_provider_loader=lambda: PROVIDER))
+    data = {"client_request_id": key, "prompt": prompt}
+    app.add_middleware(BoundedBodyMiddleware, max_bytes=65536)
+    files = [("image", (f"local-name.{extension}", content, mime_type))
+        for content, mime_type, extension in sources]
+    account_headers = headers(first)
+
+    with TestClient(app, base_url=ORIGIN) as client:
+        def unreadable_body():
+            yield b""
+            raise AssertionError("Unauthenticated image upload body was read")
+
+        assert client.post(job_path, content=unreadable_body(),
+            headers={"Content-Type": "multipart/form-data; boundary=synthetic"}).status_code == 401
+        assert client.post(job_path, data=data, files=files).status_code == 401
+        assert client.post(job_path, data=data, files=files,
+            headers={**account_headers, "Origin": "https://other.invalid"}).status_code == 403
+        assert client.post(job_path, data=data, files=files[:1] * 5,
+            headers=account_headers).json()["error"]["code"] == "image_edit_invalid"
+        assert client.post(job_path, data=data, files={"image": ("invalid.gif", b"GIF89a!", "image/gif")},
+            headers=account_headers).status_code == 415
+        assert client.post(job_path, data=data, files=files,
+            headers={**account_headers, "Content-Length": str(MAX_IMAGE_EDIT_BODY + 1)}).status_code == 413
+        with monkeypatch.context() as limits:
+            limits.setattr("app.chat.MAX_IMAGE_BYTES", len(sources[0][0]) - 1)
+            oversized = client.post(job_path, data=data, files=files[:1], headers=account_headers)
+            assert oversized.status_code == 413 and "12 MiB" in oversized.json()["error"]["message"]
+        with monkeypatch.context() as limits:
+            limits.setattr("app.chat.MAX_IMAGE_EDIT_TOTAL", len(sources[0][0]) * 2 - 1)
+            oversized = client.post(job_path, data=data, files=files[:1] * 2, headers=account_headers)
+            assert oversized.status_code == 413 and "24 MiB" in oversized.json()["error"]["message"]
+        assert not dispatched and not calls(store)
+
+        accepted = client.post(job_path, data=data, files=files, headers=account_headers)
+        assert accepted.status_code == 202
+        duplicate = client.post(job_path, data=data, files=files, headers=account_headers)
+        assert duplicate.status_code == 200 and duplicate.json()["id"] == accepted.json()["id"]
+        assert client.post(job_path, json=data, headers=account_headers).status_code == 409
+        if source_count > 1:
+            assert client.post(job_path, data=data, files=list(reversed(files)), headers=account_headers).status_code == 409
+            assert client.post(job_path, data=data, files=files[:1], headers=account_headers).status_code == 409
+        assert client.post(job_path, data=data,
+            files=[("image", ("different.png", sources[0][0] + b"diff", "image/png")), *files[1:]],
+            headers=account_headers).status_code == 409
+        wait_until(lambda: client.get(path, headers=account_headers).json()["status"] == "completed")
+        assert client.get(path + "/result", headers=account_headers).json() == RESULT
+        assert client.get(path + "/result", headers=headers(second)).status_code == 404
+        assert len(dispatched) == 1 and calls(store) == [{"kind": "image", "status": "success"}]
+        request, fields, images = dispatched[0]
+        assert request.url.path == "/v1/images/edits" and set(fields) == {"prompt", "model", "n"}
+        assert len(images) == source_count
+        for index, ((field_name, part), (content, mime_type, extension)) in enumerate(zip(images, sources), 1):
+            assert field_name == ("image" if source_count == 1 else "image[]")
+            assert part.get_filename() == (f"source.{extension}" if source_count == 1 else f"source-{index}.{extension}")
+            assert part.get_content_type() == mime_type and part.get_payload(decode=True) == content
+        assert fields["prompt"].get_payload(decode=True).decode("utf-8") == prompt
+        assert fields["model"].get_payload(decode=True).decode("utf-8") == PROVIDER.model
+        assert fields["n"].get_payload(decode=True) == b"1"
+        with store.connection() as db:
+            row = dict(db.execute("SELECT * FROM image_jobs").fetchone())
+        if source_count == 1:
+            old_digest = hashlib.sha256(hashlib.sha256(prompt.encode("utf-8")).digest() + sources[0][0])
+            assert row["prompt_hash"] == "edit:" + old_digest.hexdigest()
+        else:
+            assert row["prompt_hash"].startswith("edit-multi:")
+        assert prompt not in json.dumps(row, ensure_ascii=False)
+        artifact = directory / (row["id"] + ".json")
+        assert json.loads(artifact.read_bytes()) == RESULT
+        assert store.quota(first["user"]["id"])["user_weekly_remaining"] == 19
+
+        rejected_key = "synthetic-edit-unsupported"
+        rejected = client.post(job_path, data={"client_request_id": rejected_key, "prompt": "unsupported"},
+            files=files, headers=account_headers)
+        assert rejected.status_code == 202
+        rejected_path = f"{job_path}/{rejected_key}"
+        wait_until(lambda: client.get(rejected_path, headers=account_headers).json()["status"] == "failed")
+        failure = client.get(rejected_path, headers=account_headers).json()["error"]
+        assert failure["code"] == "image_edit_unsupported" and "private upstream diagnostics" not in failure["message"]
+        assert len(dispatched) == 2 and all(request.url.path == "/v1/images/edits" for request, *_parts in dispatched)
+        assert store.quota(first["user"]["id"])["user_weekly_remaining"] == 18
 
 
 def test_cancel_before_create_and_completion_commit_race_keep_result(owners):

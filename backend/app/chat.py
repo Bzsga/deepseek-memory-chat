@@ -28,7 +28,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from .admin_access import _client_ip
-from .image_jobs import ImageJobError
+from .image_jobs import ImageEditSource, ImageJobError
 from .store import ServiceError, digest
 
 
@@ -36,11 +36,17 @@ PREFIX = "/chat"
 PUBLIC_API_PATH = "/deepseek-api"
 WEB_PATH = "/deepseek/"
 COOKIE_NAME = "deepseek_session"
+CHAT_PERMISSION_REQUIRED = "当前账号没有配套聊天权限，可以使用个人 API。"
+IMAGE_PERMISSION_REQUIRED = "当前账号没有配套生图权限，可以使用个人生图 API。"
 MAX_BODY = 70 * 1024 * 1024
 MAX_SMALL_RESPONSE = 256 * 1024
 MAX_IMAGE_RESPONSE = 32 * 1024 * 1024
 IMAGE_HEARTBEAT_SECONDS = 5
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_IMAGE_EDIT_COUNT = 4
+MAX_IMAGE_EDIT_TOTAL = 24 * 1024 * 1024
+MAX_IMAGE_EDIT_BODY = MAX_IMAGE_EDIT_TOTAL + 64 * 1024
+EDIT_IMAGE_EXTENSIONS = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_USER_DATA_BYTES = 32 * 1024 * 1024
 MAX_ASR_BYTES = 8 * 1024 * 1024
@@ -60,6 +66,7 @@ KINDS = {"/anthropic/v1/messages": "chat", "/anthropic/v1/files": "file",
          "/v1/tools/asr": "asr", "/v1/tools/tts": "tts"}
 COMMON_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                   "Referrer-Policy": "same-origin"}
+MANAGED_CHAT_UNAVAILABLE = "managed_chat_unavailable"
 
 
 @dataclass(frozen=True)
@@ -113,6 +120,46 @@ def _image_type(raw):
     if len(raw) >= 16 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _parse_image_edit(body, content_type):
+    try:
+        if len(content_type) > 4096 or any(char in content_type for char in "\r\n"):
+            raise ValueError
+        envelope = ("Content-Type: " + content_type + "\r\nMIME-Version: 1.0\r\n\r\n").encode("ascii")
+        multipart = BytesParser(policy=policy.default).parsebytes(envelope + body)
+        if not multipart.is_multipart() or multipart.defects:
+            raise ValueError
+        document, sources, total = {}, [], 0
+        for part in multipart.iter_parts():
+            if part.is_multipart() or part.defects or part.get_content_disposition() != "form-data":
+                raise ValueError
+            name = part.get_param("name", header="content-disposition")
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                raise ValueError
+            if name == "image" and part.get_filename():
+                if not payload or len(sources) >= MAX_IMAGE_EDIT_COUNT:
+                    raise ValueError
+                if len(payload) > MAX_IMAGE_BYTES:
+                    raise ChatError(413, "每张原图最多支持 12 MiB，请缩小后重新上传。", code="image_edit_too_large")
+                total += len(payload)
+                if total > MAX_IMAGE_EDIT_TOTAL:
+                    raise ChatError(413, "原图合计最多支持 24 MiB，请缩小后重新上传。", code="image_edit_too_large")
+                detected = _image_type(payload)
+                declared = part.get_content_type()
+                if detected not in EDIT_IMAGE_EXTENSIONS or declared not in {detected, "application/octet-stream"}:
+                    raise ChatError(415, "改图支持 JPG、PNG 和 WebP，请检查原图格式。", code="image_edit_format")
+                sources.append(ImageEditSource(payload, detected))
+            elif name in {"client_request_id", "prompt"} and name not in document and part.get_filename() is None:
+                document[name] = payload.decode("utf-8")
+            else:
+                raise ValueError
+        if not sources or set(document) != {"client_request_id", "prompt"}:
+            raise ValueError
+    except (ValueError, UnicodeError, TypeError, RecursionError):
+        raise ChatError(400, "请提供 1 至 4 张原图、修改要求和请求编号。", code="image_edit_invalid") from None
+    return document, tuple(sources)
 
 
 def _validate_file_upload(body, content_type):
@@ -174,7 +221,7 @@ def _validate_file_upload(body, content_type):
     return detected
 
 
-def _image_provider_failure(status, retry_after=None):
+def _image_provider_failure(status, retry_after=None, *, editing=False):
     failures = {
         400: (422, "图片描述或生成参数未被服务接受，请调整描述后重试。", "image_request_rejected"),
         401: (503, "生图服务鉴权失败，请联系管理员检查配置。", "image_provider_auth"),
@@ -186,6 +233,10 @@ def _image_provider_failure(status, retry_after=None):
         429: (429, "生图服务请求过多，请稍后重试。", "image_rate_limited"),
         504: (504, "图片生成等待超时，未收到确定结果。请稍后手动重试。", "image_timeout"),
     }
+    if editing:
+        unsupported = (422, "当前生图服务或模型暂不支持编辑原图，请检查生图配置。", "image_edit_unsupported")
+        rejected = (422, "生图服务未接受这次编辑，请检查原图、修改要求与模型的编辑能力。", "image_edit_rejected")
+        failures.update({400: rejected, 404: unsupported, 405: unsupported, 415: rejected, 422: rejected, 501: unsupported})
     result_status, message, code = failures.get(status,
         (502, "生图服务暂时无法完成请求，请稍后手动重试。", "image_provider_unavailable"))
     headers = {}
@@ -391,7 +442,7 @@ def _files(store, operation, owner_id, file_id):
 
 
 def _personal_quota(quota):
-    return {name: quota[name] for name in ("managed_eligible", "user_weekly_limit", "user_weekly_used", "user_weekly_reserved",
+    return {name: quota[name] for name in ("managed_eligible", "permissions", "user_weekly_limit", "user_weekly_used", "user_weekly_reserved",
                                          "user_weekly_remaining", "reset_at") if name in quota}
 
 
@@ -438,15 +489,23 @@ def _validated_images(images):
     return result
 
 
-def _auth_page(register=False, error=""):
+def _auth_page(register=False, error="", *, self_service=False):
     action, title = ("register", "创建账号") if register else ("login", "欢迎回来")
+    register_prompt = "还没有账号？" if self_service else "有邀请码？"
     link = (f'已有账号？<a href="{PUBLIC_API_PATH}{PREFIX}/login">登录</a>' if register else
-            f'还没有账号？<a href="{PUBLIC_API_PATH}{PREFIX}/register">注册</a>')
+            f'{register_prompt}<a href="{PUBLIC_API_PATH}{PREFIX}/register">注册</a>')
+    invite_label = "邀请码（选填）" if self_service else "邀请码"
+    required_invite = "" if self_service else " required"
+    introduction = '<p>普通账号可开启多端同步。有邀请码可在注册时兑换配套服务。</p>' if register and self_service else ""
+    invitation = (f'<label for="invitation_code">{invite_label}</label><input id="invitation_code" name="invitation_code" '
+                  f'autocomplete="off" autocapitalize="none" spellcheck="false"{required_invite} maxlength="128">'
+                  if register else "")
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · DeepSeek 记忆聊天</title><style>*{{box-sizing:border-box}}body{{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;background:#f7f8fc;color:#24252b;font:15px system-ui,sans-serif}}main{{width:min(100%,400px);padding:30px;border-radius:20px;background:white;border:1px solid #e8eaf0}}h1{{font-size:24px;margin:0 0 10px}}p{{color:#747987;line-height:1.6}}label{{display:block;margin:16px 0 8px}}input,button{{width:100%;min-height:44px;border-radius:10px;font:inherit}}input{{border:1px solid #d9dde8;padding:10px 12px}}button{{border:0;margin-top:22px;background:#4d6bfe;color:white}}a{{color:#4d6bfe}}.error{{color:#b83737}}@media(prefers-color-scheme:dark){{body{{background:#1b1c20;color:#eee}}main{{background:#232429;border-color:#363942}}input{{background:#1c1d21;color:#eee;border-color:#444957}}}}</style>
-<main><h1>{title}</h1>
+<main><h1>{title}</h1>{introduction}
 <form method="post" action="{PUBLIC_API_PATH}{PREFIX}/{action}"><label for="username">用户名</label><input id="username" name="username" autocomplete="username" required minlength="3" maxlength="32">
 <label for="password">密码</label><input id="password" name="password" type="password" autocomplete="{'new-password' if register else 'current-password'}" required minlength="8" maxlength="128">
+{invitation}
 <p class="error" role="alert">{html.escape(error)}</p><button type="submit">{'注册' if register else '登录'}</button></form><p>{link}</p></main></html>'''
 
 
@@ -490,11 +549,16 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
+    async def account_page(register, error="", status=200):
+        policy = await asyncio.to_thread(store.accounts.registration_policy)
+        return HTMLResponse(_auth_page(register, error, self_service=policy["self_service"]),
+                            status_code=status, headers=COMMON_HEADERS)
+
     async def auth(request, register=False):
         if request.method == "GET":
             if await asyncio.to_thread(store.accounts.authenticate, _token(request)):
                 return RedirectResponse(WEB_PATH, status_code=303, headers=COMMON_HEADERS)
-            return HTMLResponse(_auth_page(register), headers=COMMON_HEADERS)
+            return await account_page(register)
         if not _origin_ok(request, origin):
             raise ChatError(403, "请从本站发起操作。")
         fields = parse_qs((await _body(request, 8192)).decode("utf-8"), max_num_fields=4)
@@ -506,7 +570,7 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             else:
                 result = await asyncio.to_thread(store.accounts.login, username, password, _client_ip(request))
         except ServiceError as error:
-            return HTMLResponse(_auth_page(register, error.message), status_code=error.status, headers=COMMON_HEADERS)
+            return await account_page(register, error.message, error.status)
         response = RedirectResponse(WEB_PATH, status_code=303, headers=COMMON_HEADERS)
         response.set_cookie(COOKIE_NAME, result["token"], max_age=30 * 86400,
                             path=PUBLIC_API_PATH, secure=True, httponly=True, samesite="strict")
@@ -543,22 +607,27 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
     async def runtime(request: Request):
         try:
             _session, owner_id, account = await context(request, require_claim=False)
+            user = account["user"]
+            permissions = user["permissions"]
             model = "deepseek-flash"
-            if account["user"]["managed_eligible"]:
+            if permissions["chat_api"]:
                 try:
                     model = provider_loader().model
                 except (ValueError, OSError, KeyError, TypeError):
                     pass  # Account access and personal API setup work independently of managed credentials.
-            try:
-                image_provider = image_provider_loader()
-            except (ValueError, OSError, KeyError, TypeError):
-                image_provider = None
+            image_provider = None
+            if permissions["image_api"]:
+                try:
+                    image_provider = image_provider_loader()
+                except (ValueError, OSError, KeyError, TypeError):
+                    pass
             return JSONResponse({"provider": "DeepSeek", "model": model,
                 "features": {"search": True, "files": True, "speech": True,
                              "image_generation": image_provider is not None},
                 "image_model": image_provider.model if image_provider else None,
-                "user": {"id": str(owner_id), "username": account["user"]["username"], "role": account["user"]["role"],
-                         "managed_eligible": account["user"]["managed_eligible"]},
+                "user": {"id": str(owner_id), "username": user["username"], "role": user["role"],
+                         "managed_eligible": permissions["chat_api"], "permissions": permissions,
+                         "invite_redeemable": user["invite_redeemable"]},
                 "weekly_quota": _personal_quota(account["quota"])}, headers=COMMON_HEADERS)
         except (ChatError, ServiceError) as error:
             return _error(error.status, error.message, getattr(error, "headers", None))
@@ -589,19 +658,32 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
         except (ChatError, ServiceError) as error:
             return _error(error.status, error.message, getattr(error, "headers", None))
 
-    async def generate_image(request, token, owner_id, provider, prompt, *, watch_disconnect):
+    async def generate_image(request, token, owner_id, provider, prompt, *, watch_disconnect, sources=()):
         client, upstream, call_id, outcome = None, None, None, "failed"
         read_task = None
 
         async def perform():
             nonlocal client, upstream, call_id, read_task, outcome
             client = client_factory()
-            outgoing = client.build_request("POST", provider.origin + "/v1/images/generations",
-                headers={"Authorization": "Bearer " + provider.api_key, "Content-Type": "application/json",
+            fields = {"model": provider.model, "prompt": prompt, "n": 1}
+            if not sources:
+                route = "generations"
+                body = {"json": {**fields, "size": provider.size}}
+            else:
+                route = "edits"
+                multiple = len(sources) > 1
+                field_name = "image[]" if multiple else "image"
+                files = []
+                for index, source in enumerate(sources, start=1):
+                    extension = EDIT_IMAGE_EXTENSIONS[source.mime_type]
+                    name = f"source-{index}.{extension}" if multiple else f"source.{extension}"
+                    files.append((field_name, (name, source.content, source.mime_type)))
+                body = {"data": fields, "files": files}
+            outgoing = client.build_request("POST", f"{provider.origin}/v1/images/{route}",
+                headers={"Authorization": "Bearer " + provider.api_key,
                          "Accept": "application/json", "Accept-Encoding": "identity",
                          "User-Agent": "DeepSeek-Memory-Chat/2.0"},
-                json={"model": provider.model, "prompt": prompt, "n": 1, "size": provider.size},
-                timeout=httpx.Timeout(provider.timeout, connect=15, write=30, pool=15))
+                timeout=httpx.Timeout(provider.timeout, connect=15, write=30, pool=15), **body)
             debit = asyncio.create_task(asyncio.to_thread(store.begin_chat_call, owner_id, "image",
                                                          account_session_hash=digest(token)))
             try:
@@ -615,7 +697,8 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             upstream = await open_upstream(client, outgoing, request, token, owner_id,
                                            watch_disconnect=watch_disconnect)
             if not 200 <= upstream.status_code < 300:
-                raise _image_provider_failure(upstream.status_code, upstream.headers.get("Retry-After"))
+                raise _image_provider_failure(upstream.status_code, upstream.headers.get("Retry-After"),
+                                              editing=bool(sources))
             if "application/json" not in upstream.headers.get("Content-Type", "").lower():
                 raise ChatError(502, "生图服务返回了异常格式，请联系管理员检查接口。", code="image_invalid_response")
             chunks, length = [], 0
@@ -641,6 +724,8 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                 chunks.append(chunk)
                 read_task = asyncio.create_task(anext(iterator))
             result = {"images": _image_output(json.loads(b"".join(chunks))), "model": provider.model}
+            if sources and len(result["images"]) != 1:
+                raise ValueError("Unexpected edit output count")
             if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_IMAGE_RESPONSE:
                 raise ChatError(502, "生成图片超过保存上限，请联系管理员调整输出尺寸。", code="image_too_large")
             outcome = "success"
@@ -677,9 +762,10 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                     await asyncio.to_thread(store.finish_chat_call, call_id, outcome)
 
     if image_jobs is not None:
-        async def generate_background(token, owner_id, provider, prompt):
+        async def generate_background(token, owner_id, provider, prompt, *, sources=()):
             try:
-                return await generate_image(None, token, owner_id, provider, prompt, watch_disconnect=False)
+                return await generate_image(None, token, owner_id, provider, prompt,
+                                            watch_disconnect=False, sources=sources)
             except (ChatError, ServiceError) as error:
                 raise ImageJobError(error.status, error.message,
                     getattr(error, "code", None) or "image_job_failed") from None
@@ -697,10 +783,16 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             if request.url.query or not _origin_ok(request, origin):
                 raise ChatError(403, "请从本站发起操作。")
             token, owner_id, account = await context(request)
-            if not account["user"]["managed_eligible"]:
-                raise ChatError(403, account["quota"]["message"], code="managed_ineligible")
+            if not account["user"]["permissions"]["image_api"]:
+                raise ChatError(403, IMAGE_PERMISSION_REQUIRED, code="image_ineligible")
+            content_type = request.headers.get("content-type", "")
+            sources = ()
             try:
-                document = json.loads(await _body(request, 32768))
+                if content_type.split(";", 1)[0].strip().lower() == "multipart/form-data":
+                    raw = await _body(request, MAX_IMAGE_EDIT_BODY, "原图合计最多支持 24 MiB，请缩小后重新上传。")
+                    document, sources = await asyncio.to_thread(_parse_image_edit, raw, content_type)
+                else:
+                    document = json.loads(await _body(request, 32768))
                 if (not isinstance(document, dict) or set(document) != {"prompt", "client_request_id"}
                         or not isinstance(document["prompt"], str)
                         or not 1 <= len(document["prompt"].strip()) <= 8000):
@@ -712,7 +804,7 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             except (ValueError, OSError, KeyError, TypeError):
                 provider = None
             result, created = await background_images().create(owner_id, document["client_request_id"],
-                document["prompt"].strip(), token, provider)
+                document["prompt"].strip(), token, provider, sources=sources)
             return JSONResponse(result, status_code=202 if created else 200, headers=COMMON_HEADERS)
         except (ChatError, ServiceError, ImageJobError) as error:
             return _error(error.status, error.message, getattr(error, "headers", None), getattr(error, "code", None))
@@ -785,8 +877,8 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             if request.url.query or not _origin_ok(request, origin):
                 raise ChatError(403, "请从本站发起操作。")
             token, owner_id, account = await context(request)
-            if not account["user"]["managed_eligible"]:
-                raise ChatError(403, account["quota"]["message"], code="managed_ineligible")
+            if not account["user"]["permissions"]["image_api"]:
+                raise ChatError(403, IMAGE_PERMISSION_REQUIRED, code="image_ineligible")
             try:
                 document = json.loads(await _body(request, 32768))
                 if (not isinstance(document, dict) or set(document) != {"prompt"}
@@ -819,19 +911,21 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
         if request.method != "GET" and not _origin_ok(request, origin):
             raise ChatError(403, "请从本站发起操作。")
         token, owner_id, account = await context(request)
-        if not account["user"]["managed_eligible"] and not deletion:
-            raise ChatError(403, account["quota"]["message"], code="managed_ineligible")
+        if not deletion and not account["user"]["permissions"]["chat_api"]:
+            raise ChatError(403, CHAT_PERMISSION_REQUIRED, code="managed_ineligible")
         body = b""
         if request.method == "POST":
             if route == "/v1/tools/asr":
                 body = await _body(request, MAX_ASR_BYTES + 65536, "录音超过 8 MiB，请缩短后重试。")
             else:
                 body = await _body(request)
+        managed_chat = route == "/anthropic/v1/messages"
         try:
             provider = provider_loader()
         except (ValueError, OSError, KeyError, TypeError):
-            raise ChatError(503, "聊天服务配置暂不可用。") from None
-        if route == "/anthropic/v1/messages":
+            raise ChatError(503, "聊天服务配置暂不可用。",
+                            code=MANAGED_CHAT_UNAVAILABLE if managed_chat else None) from None
+        if managed_chat:
             try:
                 document = json.loads(body)
                 if not isinstance(document, dict) or not isinstance(document.get("messages"), list) or not document["messages"]:
@@ -926,6 +1020,9 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             await client.aclose()
             if call_id:
                 await asyncio.to_thread(store.finish_chat_call, call_id, "failed")
+            if managed_chat and upstream.status_code in (401, 403):
+                raise ChatError(status, "配套聊天服务暂不可用，可以配置个人 API 后重试。",
+                                code=MANAGED_CHAT_UNAVAILABLE)
             raise asr_failure or ChatError(status, message)
         if route == "/v1/tools/asr":
             outcome = "failed"

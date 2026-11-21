@@ -67,6 +67,8 @@ class AppController internal constructor(application: Application, databaseName:
     private val sessionMutex = Mutex()
     private val quotaMutex = Mutex()
     private val adminMutex = Mutex()
+    private val adminOpenPermissionsMutex = Mutex()
+    private val adminRegistrationPolicyMutex = Mutex()
     private val adminStatsMutex = Mutex()
     private val adminUsersMutex = Mutex()
     private val adminRegistrationMutex = Mutex()
@@ -126,7 +128,7 @@ class AppController internal constructor(application: Application, databaseName:
                     } catch (_: Exception) {
                         accountError = "账户登录信息无法读取，请重新登录。"
                     }
-                    settings = settings.forAccount(currentAccount?.user?.managedEligible == true)
+                    settings = settings.forAccount(currentAccount?.user?.servicePermissions?.chatApi == true)
                     if (settings != migrated) storeSettings(settings)
                     politicalExport.setAccountSession(currentAccount)
                     val chatProvider = restoreChatProvider(currentAccount)
@@ -153,7 +155,7 @@ class AppController internal constructor(application: Application, databaseName:
     fun clearNotice() = mutableState.update { it.copy(notice = null) }
 
     suspend fun importFile(bytes: ByteArray, fileName: String): List<String> =
-        importSource(bytes, fileName) { DeepSeekImporter.parse(bytes, fileName) }
+        importSource(bytes, fileName) { DeepSeekImporter.parse(bytes, fileName, getApplication<Application>().cacheDir) }
 
     suspend fun importShare(document: DeepSeekShareDocument, link: DeepSeekShareLink): List<String> =
         importSource(document.bytes, "DeepSeek分享-${link.id}.json") { document.result }
@@ -211,7 +213,10 @@ class AppController internal constructor(application: Application, databaseName:
     private fun restoreChatProvider(session: AccountSession?): NativeChatProvider? {
         if (session != null && session.serviceUrl.trimEnd('/') != CHAT_API) return null
         val encoded = credentials.get(chatProviderSlot(session?.user?.id))
-        return encoded.takeIf { it.isNotEmpty() }?.let { appJson.decodeFromString(it) }
+        if (encoded.isNotEmpty()) return appJson.decodeFromString(encoded)
+        if (session?.user?.servicePermissions?.chatApi != true) return null
+        val defaults = ServiceSettings()
+        return NativeChatProvider("managed", defaults.baseUrl, defaults.model, "")
     }
 
     suspend fun updateChatProvider(ownerId: String, mode: String, apiKey: String?, baseUrl: String?, model: String?): Unit = withContext(Dispatchers.IO) {
@@ -232,7 +237,7 @@ class AppController internal constructor(application: Application, databaseName:
                 credentials.put(chatProviderSlot(user?.id), appJson.encodeToString(provider))
                 mutableState.update { it.copy(chatProvider = provider, quota = null, quotaError = null) }
             }
-            mode == "managed" && user?.managedEligible == false
+            mode == "managed" && user?.servicePermissions?.chatApi == false
         }
         // The chat page can redeem an invitation while the native account profile is cached.
         // Revalidate through the account service before offering managed organization.
@@ -245,8 +250,8 @@ class AppController internal constructor(application: Application, databaseName:
             val changedService = cleaned.companionUrl != state.value.settings.companionUrl
             if (changedService) clearAccountLocked()
             val selected = if (changedService) cleaned.forAccount(false) else cleaned
-            require(selected.mode != "companion" || currentAccount?.user?.managedEligible == true) {
-                "请先登录并兑换免费服务邀请码。"
+            require(selected.mode != "companion" || currentAccount?.user?.servicePermissions?.chatApi == true) {
+                "免费记忆整理需要账号开通免费聊天 API。"
             }
             storeSettings(selected)
             val changed = cleaned.apiKey != settings.apiKey.trim() || cleaned.trialToken != settings.trialToken.trim()
@@ -256,8 +261,13 @@ class AppController internal constructor(application: Application, databaseName:
         }
     }
 
-    suspend fun registerAccount(username: String, password: String) =
-        authenticateAccount { service -> accountNetwork.register(service, username, password) }
+    suspend fun registerAccount(username: String, password: String, invitationCode: String) =
+        authenticateAccount { service -> accountNetwork.register(service, username, password, invitationCode) }
+
+    suspend fun selfServiceRegistrationOpen(): Boolean = withContext(Dispatchers.IO) {
+        ready.await()
+        accountNetwork.selfServiceRegistration(state.value.settings.companionUrl)
+    }
 
     suspend fun loginAccount(username: String, password: String) =
         authenticateAccount { service -> accountNetwork.login(service, username, password) }
@@ -275,7 +285,7 @@ class AppController internal constructor(application: Application, databaseName:
                     require(state.value.settings.companionUrl == service) { "服务地址已改变，请在当前地址重新登录。" }
                     credentials.put("current_account", appJson.encodeToString(result.session))
                     val settings = state.value.settings
-                    val selected = settings.forAccount(result.session.user.managedEligible,
+                    val selected = settings.forAccount(result.session.user.servicePermissions.chatApi,
                         settings.apiKey.isBlank())
                     if (settings != selected) storeSettings(selected)
                     currentAccount = result.session
@@ -313,13 +323,14 @@ class AppController internal constructor(application: Application, databaseName:
                     val updated = session.copy(user = profile.user)
                     credentials.put("current_account", appJson.encodeToString(updated))
                     val settings = state.value.settings
-                    val selected = settings.forAccount(profile.user.managedEligible, !session.user.managedEligible)
+                    val selected = settings.forAccount(profile.user.servicePermissions.chatApi, !session.user.servicePermissions.chatApi)
                     if (settings != selected) storeSettings(selected)
                     currentAccount = updated
                     bindAdminSession(updated)
                     politicalExport.setAccountSession(updated)
-                    mutableState.update { it.copy(settings = selected, account = AccountState(profile.user), quota = profile.quota,
-                        quotaLoading = false, quotaError = null) }
+                    val chatProvider = state.value.chatProvider ?: restoreChatProvider(updated)
+                    mutableState.update { it.copy(settings = selected, chatProvider = chatProvider,
+                        account = AccountState(profile.user), quota = profile.quota, quotaLoading = false, quotaError = null) }
                 }
             } catch (error: Exception) {
                 handleAccountFailure(session.token, error)
@@ -464,8 +475,8 @@ class AppController internal constructor(application: Application, databaseName:
         if (requireFreeMode) {
             require(snapshot.mode == "companion") { "当前使用自己的 AI 服务。" }
             val session = requireAccountSession()
-            require(session.user.managedEligible && session.serviceUrl == snapshot.companionUrl) {
-                "请在聊天 API 设置中填写个人 Key，或兑换免费服务邀请码。"
+            require(session.user.servicePermissions.chatApi && session.serviceUrl == snapshot.companionUrl) {
+                "请在聊天 API 设置中填写个人 Key，或联系管理员开通免费聊天 API。"
             }
             return snapshot.copy(trialToken = session.token)
         }
@@ -513,7 +524,7 @@ class AppController internal constructor(application: Application, databaseName:
             require(sameCurrentOrganizationSettings(snapshot)) { "服务设置已改变，请重新检查后开始。" }
             if (quota.managedEligible == false) {
                 refreshAccount()
-                error("免费资格已取消，请在聊天 API 设置中填写个人 Key。")
+                error("免费聊天 API 未开通，请在聊天 API 设置中填写个人 Key。")
             }
             mutableState.update { it.copy(quota = quota, quotaLoading = false, quotaError = null) }
             quota
@@ -536,6 +547,101 @@ class AppController internal constructor(application: Application, databaseName:
         require(currentAccount != null) { "需要管理员账号。" }
         refreshAccount()
         require(state.value.developerPrefs.sessionToken.isNotBlank()) { "当前账号没有管理权限。" }
+    }
+
+    suspend fun refreshAdminOpenPermissions() = requestAdminOpenPermissions()
+
+    suspend fun updateAdminOpenPermissions(permissions: ServicePermissions) = requestAdminOpenPermissions(permissions)
+
+    private suspend fun requestAdminOpenPermissions(update: ServicePermissions? = null) {
+        val requested = state.value
+        val access = requested.developerPrefs
+        withContext(Dispatchers.IO) {
+            ready.await()
+            adminOpenPermissionsMutex.withLock {
+                val current = state.value
+                if (current.developerPrefs != access) throw CancellationException("管理登录状态已改变")
+                if (update != null) {
+                    require(current.adminOpenPermissions != null &&
+                        current.adminOpenPermissions == requested.adminOpenPermissions) { "请先刷新并确认当前全局开关。" }
+                    if (update == current.adminOpenPermissions) return@withLock
+                }
+                publishAdmin(access) {
+                    it.copy(adminOpenPermissionsLoading = true, adminOpenPermissionsError = null)
+                }
+                try {
+                    val confirmed = withDeveloperSession(access) {
+                        if (update == null) AdminNetwork.getOpenPermissions(it)
+                        else AdminNetwork.updateOpenPermissions(it, update)
+                    }
+                    publishAdmin(access) {
+                        it.copy(adminOpenPermissions = confirmed,
+                            quota = if (update == null) it.quota else null,
+                            quotaError = if (update == null) it.quotaError else null)
+                    }
+                } catch (error: Exception) {
+                    publishAdmin(access) {
+                        val message = when {
+                            error is CancellationException -> null
+                            update == null -> error.message ?: "全局开关读取失败。"
+                            (error as? SummaryFailure)?.ambiguous == true -> "全局开关保存结果暂不明确，请刷新确认。"
+                            else -> error.message ?: "全局开关保存失败，请刷新确认。"
+                        }
+                        it.copy(adminOpenPermissions = null, adminOpenPermissionsError = message)
+                    }
+                    throw error
+                } finally {
+                    publishAdmin(access) { it.copy(adminOpenPermissionsLoading = false) }
+                }
+            }
+        }
+    }
+
+    suspend fun refreshAdminRegistrationPolicy() = requestAdminRegistrationPolicy()
+
+    suspend fun updateAdminRegistrationPolicy(selfService: Boolean) =
+        requestAdminRegistrationPolicy(selfService)
+
+    private suspend fun requestAdminRegistrationPolicy(update: Boolean? = null) {
+        val requested = state.value
+        val access = requested.developerPrefs
+        withContext(Dispatchers.IO) {
+            ready.await()
+            adminRegistrationPolicyMutex.withLock {
+                val current = state.value
+                if (current.developerPrefs != access) throw CancellationException("管理登录状态已改变")
+                if (update != null) {
+                    require(current.adminSelfServiceRegistration != null &&
+                        current.adminSelfServiceRegistration == requested.adminSelfServiceRegistration) {
+                        "请先重新读取注册设置。"
+                    }
+                    if (update == current.adminSelfServiceRegistration) return@withLock
+                }
+                publishAdmin(access) {
+                    it.copy(adminSelfServiceRegistrationLoading = true, adminSelfServiceRegistrationError = null)
+                }
+                try {
+                    val confirmed = withDeveloperSession(access) {
+                        if (update == null) AdminNetwork.getRegistrationPolicy(it)
+                        else AdminNetwork.updateRegistrationPolicy(it, update)
+                    }
+                    publishAdmin(access) { it.copy(adminSelfServiceRegistration = confirmed) }
+                } catch (error: Exception) {
+                    publishAdmin(access) {
+                        val message = when {
+                            error is CancellationException -> null
+                            error is SummaryFailure && error.statusCode == 404 -> "当前服务端未提供注册设置。"
+                            error is SummaryFailure && error.ambiguous -> "注册设置保存结果暂不明确，请重新读取。"
+                            else -> error.message ?: "注册设置请求失败，请重新读取。"
+                        }
+                        it.copy(adminSelfServiceRegistration = null, adminSelfServiceRegistrationError = message)
+                    }
+                    throw error
+                } finally {
+                    publishAdmin(access) { it.copy(adminSelfServiceRegistrationLoading = false) }
+                }
+            }
+        }
     }
 
     suspend fun refreshAdminConfig() = withContext(Dispatchers.IO) {
@@ -640,7 +746,12 @@ class AppController internal constructor(application: Application, databaseName:
     suspend fun setAdminUserEnabled(userId: String, enabled: Boolean) =
         changeAdminUser { AdminNetwork.setUserEnabled(it, userId, enabled) }
 
-    suspend fun revokeAdminUserManaged(userId: String) = changeAdminUser { AdminNetwork.revokeManaged(it, userId) }
+    suspend fun updateAdminUserPermissions(userId: String, permissions: ServicePermissions) {
+        changeAdminUser { AdminNetwork.updateUserPermissions(it, userId, permissions) }
+        if (state.value.account.currentUser?.id == userId) {
+            updateAccountProfile(expectedOwnerId = userId) { accountNetwork.me(it) }
+        }
+    }
 
     private suspend fun changeAdminUser(action: suspend (DeveloperPrefs) -> Unit) = withContext(Dispatchers.IO) {
         ready.await()
@@ -695,13 +806,13 @@ class AppController internal constructor(application: Application, databaseName:
         }
     }
 
-    suspend fun createAdminRegistrationInvites(count: Int, validDays: Int) = withContext(Dispatchers.IO) {
+    suspend fun createAdminRegistrationInvites(count: Int, validDays: Int, permissions: ServicePermissions) = withContext(Dispatchers.IO) {
         ready.await()
         adminRegistrationMutex.withLock {
             mutableState.update { it.copy(adminRegistrationLoading = true, adminRegistrationError = null) }
             try {
                 val access = state.value.developerPrefs
-                val created = withDeveloperSession(access) { AdminNetwork.createRegistrationInvites(it, count, validDays) }
+                val created = withDeveloperSession(access) { AdminNetwork.createRegistrationInvites(it, count, validDays, permissions) }
                 publishAdmin(access) { current ->
                     current.copy(adminRegistrationInvites =
                         (created + current.adminRegistrationInvites.orEmpty()).distinctBy { it.id })
@@ -754,6 +865,8 @@ class AppController internal constructor(application: Application, databaseName:
         adminFeedbackRequest.incrementAndGet()
         adminFeedbackDetailRequest.incrementAndGet()
         mutableState.update { it.copy(developerPrefs = prefs, adminConfig = null, adminLoading = false, adminError = error,
+            adminOpenPermissions = null, adminOpenPermissionsLoading = false, adminOpenPermissionsError = null,
+            adminSelfServiceRegistration = null, adminSelfServiceRegistrationLoading = false, adminSelfServiceRegistrationError = null,
             adminStats = null, adminStatsLoading = false, adminStatsError = null,
             adminUsers = null, adminUsersLoading = false, adminUsersError = null,
             adminRegistrationInvites = null, adminRegistrationLoading = false, adminRegistrationError = null,
@@ -1609,7 +1722,7 @@ class AppController internal constructor(application: Application, databaseName:
                 clearAccountLocked()
                 politicalExport.suspendAccountTasks()
             }
-            val selected = restoredSettings.forAccount(currentAccount?.user?.managedEligible == true)
+            val selected = restoredSettings.forAccount(currentAccount?.user?.servicePermissions?.chatApi == true)
             storeSettings(selected)
             mutableState.update { it.copy(settings = selected, quota = null, quotaLoading = false, quotaError = null) }
             refresh(reloadConversations = true)

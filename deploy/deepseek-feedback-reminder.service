@@ -1,0 +1,17 @@
+[Unit]
+Description=Send a reminder for pending DeepSeek feedback
+After=deepseek.service serverchan-relay.service
+
+[Service]
+Type=oneshot
+User=deepseek-continuation
+Group=deepseek-continuation
+EnvironmentFile=/opt/serverchan-relay/.env
+UnsetEnvironment=SERVERCHAN_API_URL SERVERCHAN_UID
+ExecStart=/usr/bin/python3 -I /opt/deepseek/ops/pending_feedback_reminder.py
+TimeoutStartSec=25s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077

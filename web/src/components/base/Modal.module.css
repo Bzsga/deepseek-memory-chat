@@ -17,6 +17,17 @@
   }
 }
 
+/* Keep the previous dialogs mounted for navigation, but paint only the active one. */
+@media (max-width: 767px), (pointer: coarse) {
+  .overlay {
+    backdrop-filter: none;
+  }
+
+  .overlay[data-modal-obscured] {
+    display: none;
+  }
+}
+
 .content {
   display: flex;
   flex-direction: column;

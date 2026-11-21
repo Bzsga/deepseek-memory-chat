@@ -83,8 +83,9 @@ def test_admin_cli_emits_one_use_account_invite(settings, monkeypatch, capsys):
     store = Store(settings)
     store.initialize()
     assert store.accounts.list_invites()["invitations"][0]["code"] == code
-    owner = store.accounts.register("cli_invited", "synthetic-password")["user"]["id"]
-    assert store.accounts.redeem_invite(owner, code)["user"]["managed_eligible"]
+    account = store.accounts.register("cli_invited", "synthetic-password", invitation_code=code)
+    assert account["user"]["managed_eligible"]
+    assert account["user"]["registration_kind"] == "invitation"
     assert store.accounts.list_invites()["total"] == 0
 
 

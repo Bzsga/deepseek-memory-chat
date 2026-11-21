@@ -47,5 +47,7 @@ class OrganizationProviderTest {
         assertEquals("companion", managed.mode)
         assertEquals(CHAT_API, managed.companionUrl)
         assertTrue(managed.trialToken.isEmpty())
+        val imageOnly = user.copy(permissions = ServicePermissions.None.copy(imageApi = true))
+        assertEquals("byok", state.copy(account = AccountState(imageOnly)).organizationSettings.mode)
     }
 }

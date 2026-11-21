@@ -217,7 +217,7 @@ const message: Read<ChatMessage> = (value) => {
   return {
     ...(imageAction ? { image_action: imageAction } : {}),
     ...(imagePrompt !== undefined ? { image_prompt: imagePrompt } : {}),
-    ...('image_origin' in item ? { image_origin: oneOf('chat')(item.image_origin) } : {}),
+    ...('image_origin' in item ? { image_origin: oneOf('chat', 'edit')(item.image_origin) } : {}),
     ...('image_generation' in item ? { image_generation: boolean(item.image_generation) } : {}),
     ...('image_model' in item ? { image_model: string(item.image_model) } : {}),
     ...('generated_images' in item

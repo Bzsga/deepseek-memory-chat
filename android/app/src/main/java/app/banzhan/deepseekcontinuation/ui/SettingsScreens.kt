@@ -71,30 +71,34 @@ internal fun LocalSettingsIndex(
 ) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { AccountSummaryCard(state, onAccount) }
         items(listOf(NativeSettingsSection.DATA to "本机记忆资料",
             NativeSettingsSection.ABOUT to "版本与更新", NativeSettingsSection.DEVELOPER to "开发者选项")
             .filter { (section, _) -> section != NativeSettingsSection.DEVELOPER || state.developerPrefs.sessionToken.isNotEmpty() }) { (section, label) ->
             OutlinedButton(onClick = { onOpen(section) }, modifier = Modifier.fillMaxWidth()) { Text(label) }
         }
+        item { AccountSummaryCard(state, onAccount) }
     }
 }
 
 @Composable
 private fun AccountSummaryCard(state: AppState, onAccount: () -> Unit) {
     val user = state.account.currentUser
+    val permissions = user?.servicePermissions
     Card(onClick = onAccount,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Outlined.AccountCircle, null, tint = Blue)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(user?.username ?: "登录 / 注册", fontWeight = FontWeight.SemiBold)
+                Text(user?.username ?: "账号与同步", fontWeight = FontWeight.SemiBold)
                 Text(
-                    if (user == null) "登录账号，或注册新账号"
-                    else if (!user.managedEligible) "使用个人 API"
-                    else state.quota?.userWeeklyRemaining?.let { "本周还可用 $it 次" }
-                        ?: "管理账户与个人免费次数",
+                    when {
+                        permissions == null -> "登录后可管理多端同步"
+                        permissions.hasManagedApi -> state.quota?.userWeeklyRemaining?.let { "本周还可用 $it 次" }
+                            ?: "管理账户与个人免费次数"
+                        permissions.cloudSync -> "已开通云同步"
+                        else -> "使用个人 API"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

@@ -76,7 +76,13 @@ export const UserMessage = memo(function UserMessage({
             <MessageFile
               key={file.id}
               file={file}
-              onRetry={retryUploadId ? () => retryUpload(sessionId, retryUploadId) : null}
+              sessionId={sessionId}
+              editDisabled={busy}
+              onRetry={retryUploadId ? () => {
+                if (ensureApiKey()) {
+                  retryUpload(sessionId, retryUploadId)
+                }
+              } : null}
             />
           ))}
         </div>

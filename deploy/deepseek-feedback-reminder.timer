@@ -1,0 +1,9 @@
+[Unit]
+Description=Check pending DeepSeek feedback at noon in Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 Asia/Shanghai
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

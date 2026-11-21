@@ -18,7 +18,13 @@ type ImageState = {
   url: string | null
 }
 
-export const GeneratedImage = ({ image }: { image: GeneratedImageInfo }) => {
+export const GeneratedImage = ({
+  image,
+  editSessionId,
+}: {
+  image: GeneratedImageInfo
+  editSessionId?: string
+}) => {
   const t = useTranslate()
   const [state, setState] = useState<ImageState | null>(null)
   const [retry, setRetry] = useState(0)
@@ -28,7 +34,9 @@ export const GeneratedImage = ({ image }: { image: GeneratedImageInfo }) => {
     url: current?.url,
     blob: current?.blob,
     name: image.name,
+    mimeType: image.mimeType,
     alt: image.prompt,
+    editSessionId,
   })
 
   useEffect(() => {

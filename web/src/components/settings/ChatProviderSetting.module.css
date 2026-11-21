@@ -58,7 +58,7 @@
 .option:focus-visible,
 .keyInput:focus-visible {
   outline: 2px solid var(--dsw-alias-brand-primary);
-  outline-offset: 2px;
+  outline-offset: -2px;
 }
 
 .option:disabled,

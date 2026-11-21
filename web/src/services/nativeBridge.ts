@@ -9,9 +9,17 @@ const pending = new Map<
 let port: MessagePort | undefined
 let supportsSettingsSections = false
 let organizationUsesChatProvider = false
+let supportsImageOverlayHistory = false
 let privateCapabilities = { provider: false, theme: false }
+let supportsPersonalImage = false
+const imageFrameListeners = new Set<(frame: Record<string, unknown>) => void>()
 export const nativePreferenceChannel = (kind: 'provider' | 'theme') =>
   privateCapabilities[kind] ? port : undefined
+export const nativePersonalImageChannel = () => supportsPersonalImage ? port : undefined
+export const subscribeNativeImageFrames = (listener: (frame: Record<string, unknown>) => void) => {
+  imageFrameListeners.add(listener)
+  return () => {imageFrameListeners.delete(listener)}
+}
 let bound = false
 let receiveContinuation: ((payload: unknown, id: string) => Promise<void>) | undefined
 let sequence = 0
@@ -21,6 +29,8 @@ export const nativeSettingsAccess = () =>
   !port ? 'web' : supportsSettingsSections ? 'sections' : 'legacy'
 export const hasSeparateOrganizationSettings = () =>
   !!port && supportsSettingsSections && !organizationUsesChatProvider
+export const canUseImageOverlayHistory = () =>
+  port ? supportsImageOverlayHistory : !/\bAndroid\b[^)]*;\s*wv\)/.test(navigator.userAgent)
 export type NativeSettingsSection = 'service' | 'data' | 'about' | 'developer'
 export const openNativeSettings = (section?: NativeSettingsSection) =>
   sendNative('settings.open', supportsSettingsSections && section ? { section } : undefined)
@@ -46,6 +56,8 @@ const close = () => {
   port = undefined
   supportsSettingsSections = false
   organizationUsesChatProvider = false
+  supportsImageOverlayHistory = false
+  supportsPersonalImage = false
   privateCapabilities = { provider: false, theme: false }
   for (const item of pending.values()) {
     clearTimeout(item.timer)
@@ -87,6 +99,8 @@ export const bindNativeBridge = (
       organizationUsesChatProvider?: unknown
       chatProvider?: unknown
       themePreference?: unknown
+      imageOverlayHistory?: unknown
+      personalImage?: unknown
     }
     try {
       hello = JSON.parse(event.data) as typeof hello
@@ -107,6 +121,8 @@ export const bindNativeBridge = (
     }
     supportsSettingsSections = hello.settingsSections === true
     organizationUsesChatProvider = host && hello.organizationUsesChatProvider === true
+    supportsImageOverlayHistory = host && hello.imageOverlayHistory === true
+    supportsPersonalImage = host && hello.personalImage === true
     port = channel
     channel.onmessage = async (message: MessageEvent<unknown>) => {
       if (
@@ -130,6 +146,10 @@ export const bindNativeBridge = (
         return
       }
       const id = value.id
+      if (supportsPersonalImage && typeof value.type === 'string' && value.type.startsWith('image.')) {
+        imageFrameListeners.forEach((listener) => listener(value))
+        return
+      }
       if (value.type === 'ack') {
         const task = pending.get(id)
         if (task) {

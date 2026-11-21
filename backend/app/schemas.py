@@ -75,6 +75,11 @@ class AccountRegisterRequest(AccountLoginRequest):
     invitation_code: str | None = Field(default=None, max_length=128, repr=False)
 
 
+class AccountRegistrationPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    self_service: bool
+
+
 class AccountInviteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     invitation_code: str = Field(min_length=1, max_length=128, repr=False)

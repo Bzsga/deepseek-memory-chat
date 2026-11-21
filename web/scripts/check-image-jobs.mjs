@@ -60,6 +60,47 @@ try {
   let offline = false
   let holdGet
   const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2i8AAAAASUVORK5CYII='
+  const originalBytes = Buffer.from(image, 'base64')
+  const { createImageJob } = await load('services/api/imageJobs.js')
+  const { MAX_IMAGE_EDIT_COUNT, MAX_IMAGE_EDIT_MB, MAX_IMAGE_EDIT_TOTAL_MB,
+    resolveImageEditSource, resolveImageEditSources } = await load('services/imageEditSource.js')
+  const original = resolveImageEditSource([
+    new File([originalBytes], 'original.PNG', { type: 'application/octet-stream' }),
+  ]).source
+  assert.ok(original)
+  assert.equal(original.type, 'image/png')
+  assert.equal(original.name, 'original.PNG')
+  assert.equal(resolveImageEditSource([original, original]).error.key, 'imageEditSourceCount')
+  assert.equal(resolveImageEditSource([new File(['gif'], 'original.gif')]).error.key, 'imageEditSourceInvalid')
+  assert.equal(resolveImageEditSource([
+    new File([new Uint8Array(MAX_IMAGE_EDIT_MB * 1024 * 1024 + 1)], 'large.png'),
+  ]).error.key, 'uploadMaxMBSize')
+  const secondOriginal = new File([originalBytes, Uint8Array.of(1, 2, 3)], 'reference.png', { type: 'image/png' })
+  const references = [original, secondOriginal]
+  assert.deepEqual(resolveImageEditSources(references).sources, references)
+  assert.deepEqual(resolveImageEditSources(Array(MAX_IMAGE_EDIT_COUNT + 1).fill(original)).error,
+    { key: 'imageEditReferenceCount', params: { count: MAX_IMAGE_EDIT_COUNT } })
+  const maxFile = new File([new ArrayBuffer(MAX_IMAGE_EDIT_MB * 1024 * 1024)], 'full.png', { type: 'image/png' })
+  assert.deepEqual(resolveImageEditSources([maxFile, maxFile]).sources, [maxFile, maxFile])
+  assert.deepEqual(resolveImageEditSources([maxFile, maxFile, original]).error,
+    { key: 'imageEditReferenceTotalSize', params: { size: MAX_IMAGE_EDIT_TOTAL_MB } })
+  assert.throws(() => createImageJob('empty-input-check', '无参考图', new AbortController().signal, []), /参考图/)
+  const editSubmissions = []
+  const assertEditUpload = async (init, expectedSources, field = 'image') => {
+    assert.ok(init.body instanceof FormData)
+    assert.equal(new Headers(init.headers).has('Content-Type'), false, 'Fetch sets the multipart boundary')
+    assert.ok(!init.keepalive, 'Image upload must not use the smaller keepalive body limit')
+    const actual = init.body.getAll(field)
+    assert.equal(init.body.has(field === 'image' ? 'image[]' : 'image'), false)
+    assert.equal(actual.length, expectedSources.length)
+    for (const [index, source] of actual.entries()) {
+      const expected = expectedSources[index]
+      assert.ok(source instanceof File)
+      assert.equal(source.type, expected.type)
+      assert.equal(source.name, expected.name)
+      assert.deepEqual(Buffer.from(await source.arrayBuffer()), Buffer.from(await expected.arrayBuffer()))
+    }
+  }
   const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
   const metadata = job => ({ id: job.id, client_request_id: job.id, status: job.status, model: 'synthetic-image',
     created_at: new Date().toISOString(), updated_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString(), has_result: job.status === 'completed',
@@ -73,8 +114,15 @@ try {
     assert.ok(match, `Unexpected external request ${path}`)
     let id = match[1]
     if (init.method === 'POST' && !id) {
-      const payload = JSON.parse(init.body)
-      id = payload.client_request_id
+      if (init.body instanceof FormData) {
+        await assertEditUpload(init, references)
+        id = init.body.get('client_request_id')
+        editSubmissions.push({ id, prompt: init.body.get('prompt') })
+      } else {
+        assert.equal(init.keepalive, true)
+        assert.equal(init.headers.get('Content-Type'), 'application/json')
+        id = JSON.parse(init.body).client_request_id
+      }
       const local = [...db.rows.values()].find(session => session.messages.some(message => message.imageJob?.clientRequestId === id))
       assert.ok(local, 'Stable request ID must be durable before create POST')
       assert.equal(db.summaries.get(local.id).pendingImageJob, true)
@@ -209,10 +257,59 @@ try {
   assert.equal(calls.filter(call => call.method === 'POST' && call.path.endsWith('/image-jobs')).length, offlineAttempts)
   assert.equal(jobs.has(offlineId), false)
 
+  fresh('managed-edit')
+  offline = true
+  drafts.setDraftText('managed-edit', '把原图的天空改成橙色')
+  assert.equal(store.sendImageMessage('managed-edit', 1, references), true)
+  await idle('managed-edit')
+  const editReply = reply('managed-edit')
+  const editId = editReply.imageJob.clientRequestId
+  const editQuestion = db.rows.get('managed-edit').messages.find(message => message.role === 'user')
+  assert.deepEqual(editQuestion.files.map(file => file.name), references.map(file => file.name))
+  for (const [index, file] of editQuestion.files.entries()) {
+    assert.deepEqual(Buffer.from(await db.files.get(file.id).arrayBuffer()),
+      Buffer.from(await references[index].arrayBuffer()))
+  }
+  assert.equal(editReply.imageOrigin, 'edit')
+  offline = false
+  assert.equal(store.resumeImageJob('managed-edit', editReply.id), true)
+  await idle('managed-edit')
+  assert.equal(reply('managed-edit').imageJob.error.code, 'image_job_not_found')
+  assert.equal(editSubmissions.length, 0)
+  state = 'completed'
+  assert.equal(store.retryImageJobSubmission('managed-edit', editReply.id), true)
+  await idle('managed-edit')
+  assert.deepEqual(editSubmissions, [{ id: editId, prompt: '把原图的天空改成橙色' }])
+  assert.equal(reply('managed-edit').status, 'done')
+  assert.equal(reply('managed-edit').imageOrigin, 'edit')
+  assert.ok(db.files.has(reply('managed-edit').blocks[0].id))
+  const { getVisibleMessages } = await load('services/chat/branches.js')
+  const editPath = () => getVisibleMessages(store.useChatStore.getState().sessionCache['managed-edit'])
+  store.regenerateReply('managed-edit', reply('managed-edit').id)
+  await idle('managed-edit')
+  assert.equal(editPath().at(-1).status, 'done')
+  assert.equal(editSubmissions.length, 2)
+  assert.notEqual(editSubmissions[1].id, editId)
+  assert.equal(editSubmissions[1].prompt, editSubmissions[0].prompt)
+  assert.equal(store.editMessage('managed-edit', editQuestion.id, '把同一张图的天空改成蓝色'), true)
+  await idle('managed-edit')
+  assert.equal(editPath().at(-1).status, 'done')
+  assert.deepEqual(editPath().at(-2).files.map(file => file.id), editQuestion.files.map(file => file.id))
+  assert.equal(editSubmissions.length, 3)
+  assert.equal(editSubmissions[2].prompt, '把同一张图的天空改成蓝色')
+  const managedRequestsBeforeMissingReference = calls.length
+  assert.equal(db.files.delete(editQuestion.files[1].id), true)
+  store.regenerateReply('managed-edit', editPath().at(-1).id)
+  await idle('managed-edit')
+  assert.equal(editPath().at(-1).imageJob.error.code, 'image_edit_original_missing')
+  assert.equal(calls.length, managedRequestsBeforeMissingReference)
+
   const originalFetch = globalThis.fetch
   const personalCalls = []
   let personalError = false
   let failOnce = false
+  let personalEditUnavailable = false
+  let personalSources = [original]
   globalThis.fetch = async (url, init) => {
     personalCalls.push(String(url))
     assert.equal(init.credentials, 'omit')
@@ -222,6 +319,15 @@ try {
     }
     assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer synthetic-image-key')
     if (String(url).endsWith('/models')) return response({data:[{id:'draw-test'}]})
+    if (String(url) === 'https://images.invalid/v1/images/edits') {
+      await assertEditUpload(init, personalSources, personalSources.length === 1 ? 'image' : 'image[]')
+      assert.equal(init.body.get('model'), 'draw-test')
+      assert.equal(init.body.get('prompt'), '删除右边的云')
+      assert.equal(init.body.get('n'), '1')
+      return personalEditUnavailable
+        ? response({error:{message:'Synthetic unsupported route'}}, 405)
+        : response({data:[{b64_json: image}]})
+    }
     assert.equal(String(url), 'https://images.invalid/v1/images/generations')
     assert.equal(JSON.parse(init.body).model, 'draw-test')
     if (failOnce) {failOnce = false; throw new TypeError('one lost response')}
@@ -250,6 +356,24 @@ try {
   assert.equal(personalCalls.filter(url => url.endsWith('/generations')).length - attempts, 5)
   assert.equal(reply('partial').blocks.filter(block => block.type === 'image' && db.files.has(block.id)).length, 4)
   assert.match(reply('partial').imageJob.error.message, /4\/5/)
+  const sendPersonalEdit = async (id, sources) => {
+    fresh(id)
+    drafts.setDraftText(id, '删除右边的云')
+    personalSources = sources
+    assert.equal(store.sendImageMessage(id, 1, sources), true)
+    await idle(id)
+  }
+  const generationCalls = personalCalls.filter(url => url.endsWith('/generations')).length
+  await assert.rejects(imageProvider.requestPersonalImage('无参考图', new AbortController().signal, []), /参考图/)
+  await sendPersonalEdit('personal-edit', [original])
+  assert.equal(reply('personal-edit').status, 'done')
+  await sendPersonalEdit('personal-edit-multiple', references)
+  assert.equal(reply('personal-edit-multiple').status, 'done')
+  personalEditUnavailable = true
+  await sendPersonalEdit('personal-edit-unavailable', references)
+  assert.match(reply('personal-edit-unavailable').imageJob.error.message, /图片编辑接口不可用/)
+  assert.equal(personalCalls.filter(url => url.endsWith('/generations')).length, generationCalls)
+  assert.equal(personalCalls.filter(url => url.endsWith('/edits')).length, 3)
   await imageProvider.forgetImageProvider()
   assert.equal(store.sendImageMessage('personal-failed'), false)
   assert.equal(imageProvider.activeImageProvider(), null)
@@ -285,7 +409,7 @@ try {
   await idle('account-ended')
   assert.equal(calls.filter(call => call.path.endsWith('/cancel')).length, cancelCalls)
   assert.equal(reply('account-ended').blocks.length, 0)
-  console.log('Image job checks passed: durable IDs before dispatch, lost create response and one generation, hidden/destroyed view recovery, pending-summary startup restore, deterministic files, portable backup isolation, explicit same-ID submission, persisted cancellation/tombstone, network pause without new job, deletion/import/account isolation. Synthetic HTTP and storage boundaries only.')
+  console.log('Image job checks passed: durable IDs before dispatch, lost create response and one generation, hidden/destroyed view recovery, pending-summary startup restore, deterministic files, portable backup isolation, explicit same-ID submission, ordered reference validation and persistence, managed edit recovery and branching, missing reference blocks all dispatch, personal single/multiple edit upload and no text-generation fallback, persisted cancellation/tombstone, network pause without new job, deletion/import/account isolation. Synthetic HTTP and storage boundaries only.')
 } finally {
   globalThis.setTimeout = realTimeout
   if (!output.startsWith(root + sep)) throw Error('Unexpected temporary output')

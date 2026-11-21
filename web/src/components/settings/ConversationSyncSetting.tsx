@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import clsx from 'clsx'
-import { KeyBackupSetting } from './KeyBackupSetting.js'
+import { KeyBackupControls } from './KeyBackupSetting.js'
 import { useTranslate } from '../../i18n/index.js'
 import {
   clearCloudConversations,
@@ -8,23 +8,27 @@ import {
   setConversationSyncEnabled,
   syncConversationsNow,
   useConversationSync,
+  type SyncScopes,
 } from '../../services/conversationSync.js'
 import { getRuntime, isSessionActive } from '../../services/runtime.js'
 import { useSettings } from '../../services/settings.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
+import { showConversationShareControls } from '../session/conversationShareVisibility.js'
 import settingStyles from './Settings.module.css'
 import styles from './ConversationSyncSetting.module.css'
 
-type Action = 'enable' | 'disable' | 'clear' | 'sync' | 'refresh'
+type Action = 'configure' | 'disable' | 'clear' | 'sync' | 'refresh'
+type Dialog = 'enable' | 'manage' | 'clear' | 'key'
 
 export const ConversationSyncSetting = ({ disabled }: { disabled: boolean }) => {
   const t = useTranslate()
   const locale = useSettings((state) => state.locale)
-  const { eligible, enabled, loading, syncing, error, lastSyncedAt, generation } =
+  const { eligible, enabled, loading, syncing, error, lastSyncedAt, generation, scopes, supportsAttachments } =
     useConversationSync()
-  const [confirmation, setConfirmation] = useState<'enable' | 'clear' | null>(null)
+  const [dialog, setDialog] = useState<Dialog | null>(null)
+  const [draft, setDraft] = useState<{ scopes: SyncScopes; generation: number } | null>(null)
   const [action, setAction] = useState<Action | null>(null)
   const pending = useRef(false)
   const labelId = useId()
@@ -79,21 +83,43 @@ export const ConversationSyncSetting = ({ disabled }: { disabled: boolean }) => 
     }
   }
 
-  const confirm = async () => {
-    if (confirmation === 'enable') {
-      if (await perform('enable', () => setConversationSyncEnabled(true))) {
-        setConfirmation(null)
-        if (useConversationSync.getState().enabled && isSessionActive()) {
-          await perform('sync', syncWithFeedback)
-        }
-      }
-    } else if (confirmation === 'clear') {
-      if (await perform('clear', clearCloudConversations)) {
-        setConfirmation(null)
-        showToast({ key: 'conversationSyncCleared' })
+  function openScopes() {
+    setDraft({
+      scopes: supportsAttachments && generation === 0 ? { ...scopes, attachments: false } : scopes,
+      generation,
+    })
+    setDialog(enabled ? 'manage' : 'enable')
+  }
+
+  const saveScopes = async () => {
+    if (draft && await perform('configure', () => setConversationSyncEnabled(true, draft.scopes, draft.generation))) {
+      setDialog(null)
+      if (useConversationSync.getState().enabled && isSessionActive()) {
+        await perform('sync', syncWithFeedback)
       }
     }
   }
+
+  const clear = async () => {
+    if (await perform('clear', clearCloudConversations)) {
+      setDialog(null)
+      showToast({ key: 'conversationSyncCleared' })
+    }
+  }
+
+  const scopeOptions = [
+    { id: 'conversations', label: t(supportsAttachments ? 'conversationSyncChatText' : 'conversationSyncChats'),
+      description: t(supportsAttachments ? 'conversationSyncChatTextDescription' : 'conversationSyncChatsDescription') },
+    { id: 'preferences', label: t('conversationSyncPreferences'), description: t('conversationSyncPreferencesDescription') },
+    { id: 'attachments', label: t('conversationSyncAttachments'), description: t('conversationSyncAttachmentsDescription') },
+  ] as const
+  const visibleOptions = scopeOptions.filter(({ id }) => id !== 'attachments' || supportsAttachments)
+  const scopeSummary = visibleOptions
+    .filter(({ id }) => scopes[id] && (id !== 'attachments' || scopes.conversations))
+    .map(({ label }) => label).join(' · ')
+  const choosing = eligible && (dialog === 'enable' || dialog === 'manage') && draft
+  const noScopesSelected = !draft?.scopes.conversations && !draft?.scopes.preferences
+  const changesPending = visibleOptions.some(({ id }) => draft?.scopes[id] !== scopes[id])
 
   const status = loading
     ? t('conversationSyncLoading')
@@ -133,13 +159,13 @@ export const ConversationSyncSetting = ({ disabled }: { disabled: boolean }) => 
               if (enabled) {
                 void perform('disable', () => setConversationSyncEnabled(false))
               } else {
-                setConfirmation('enable')
+                openScopes()
               }
             }}
           />
         </div>
         <p id={descriptionId} className={styles.description}>
-          {t(eligible ? 'conversationSyncDescription' : 'conversationSyncInviteOnly')}
+          {eligible ? (enabled ? scopeSummary : t('conversationSyncDescription')) : t('conversationSyncInviteOnly')}
         </p>
         {eligible || loading || busy ? (
           <p className={styles.status} role="status" aria-live="polite">
@@ -174,71 +200,105 @@ export const ConversationSyncSetting = ({ disabled }: { disabled: boolean }) => 
               )}
             </Button>
           ) : null}
-          {eligible || generation > 0 ? (
+          {enabled ? (
+            <button type="button" className={styles.secondaryAction} disabled={unavailable} aria-haspopup="dialog" onClick={openScopes}>
+              {t('conversationSyncManage')}
+            </button>
+          ) : generation > 0 ? (
             <Button
               variant="dangerOutlined"
               size="s"
               disabled={unavailable}
-              onClick={() => {
-                setConfirmation('clear')
-              }}
+              onClick={() => setDialog('clear')}
             >
               {t('conversationSyncClear')}
             </Button>
           ) : null}
-          {enabled && !disabled ? <KeyBackupSetting generation={generation} /> : null}
         </div>
       </div>
-      {confirmation && (confirmation !== 'enable' || eligible) ? (
+      {choosing || dialog === 'clear' || (dialog === 'key' && enabled) ? (
         <Modal
           title={t(
-            confirmation === 'enable' ? 'conversationSyncEnableTitle' : 'conversationSyncClearTitle'
+            dialog === 'key' ? 'keyBackupTitle' : dialog === 'clear' ? 'conversationSyncClearTitle' :
+              dialog === 'enable' ? 'conversationSyncEnableTitle' : 'conversationSyncManage'
           )}
           className={styles.confirmation}
+          closable
           onClose={() => {
             if (!busy) {
-              setConfirmation(null)
+              setDialog(null)
             }
           }}
           footer={
             <div className={styles.confirmActions}>
               <Button
                 variant="outlined"
-                autoFocus
                 disabled={busy}
-                onClick={() => setConfirmation(null)}
+                onClick={() => setDialog(dialog === 'key' ? 'manage' : null)}
               >
-                {t('cancel')}
+                {t(dialog === 'key' ? 'conversationSyncBackToSettings' : 'cancel')}
               </Button>
-              <Button
-                variant={confirmation === 'clear' ? 'danger' : 'primary'}
-                disabled={busy || disabled}
-                onClick={() => void confirm()}
-              >
-                {t(
-                  busy
-                    ? 'conversationSyncUpdating'
-                    : confirmation === 'enable'
-                      ? 'conversationSyncEnableConfirm'
-                      : 'conversationSyncClearConfirm'
-                )}
-              </Button>
+              {dialog === 'clear' ? (
+                <Button variant="danger" disabled={unavailable} onClick={() => void clear()}>
+                  {t(busy ? 'conversationSyncUpdating' : 'conversationSyncClearConfirm')}
+                </Button>
+              ) : choosing ? (
+                <Button disabled={unavailable || noScopesSelected || (dialog === 'manage' && !changesPending)} onClick={() => void saveScopes()}>
+                  {t(busy ? 'conversationSyncUpdating' : dialog === 'enable' ? 'conversationSyncEnableConfirm' : 'conversationSyncSaveScopes')}
+                </Button>
+              ) : null}
             </div>
           }
         >
-          <p className={styles.confirmText}>
-            {t(
-              confirmation === 'enable'
-                ? 'conversationSyncEnableDescription'
-                : 'conversationSyncClearDescription'
-            )}
-          </p>
-          {confirmation === 'enable' ? (
-            <p className={styles.confirmText}>{t('conversationSyncEnablePrivacy')}</p>
-          ) : (
-            <p className={styles.confirmText}>{t('conversationSyncClearShares')}</p>
-          )}
-          {problem ? (
+          {choosing ? (
+            <>
+              <p className={styles.confirmText}>{t(dialog === 'enable' ? 'conversationSyncEnableDescription' : 'conversationSyncPauseScope')}</p>
+              <div className={styles.scopeList}>
+                {visibleOptions.map(({ id, label, description }) => (
+                  <label className={styles.scopeOption} key={id}>
+                    <input
+                      type="checkbox"
+                      checked={draft.scopes[id] && (id !== 'attachments' || draft.scopes.conversations)}
+                      disabled={unavailable || (id === 'attachments' && !draft.scopes.conversations)}
+                      onChange={(event) => {
+                        const checked = event.target.checked
+                        setDraft({
+                          ...draft,
+                          scopes: {
+                            ...draft.scopes,
+                            [id]: checked,
+                            ...(supportsAttachments && id === 'conversations' && !checked ? { attachments: false } : {}),
+                          },
+                        })
+                      }}
+                    />
+                    <span>
+                      <span className={styles.scopeLabel}>{label}</span>
+                      <span className={styles.description}>{description}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              {dialog === 'manage' ? (
+                <div className={styles.scopeTools}>
+                  <button type="button" className={styles.secondaryAction} disabled={unavailable || !enabled} onClick={() => setDialog('key')}>
+                    {t('keyBackupTitle')}
+                  </button>
+                  <button type="button" className={clsx(styles.secondaryAction, styles.dangerAction)} disabled={unavailable} onClick={() => setDialog('clear')}>
+                    {t('conversationSyncClear')}
+                  </button>
+                </div>
+              ) : <p className={styles.description}>{t('conversationSyncKeyOptional')}</p>}
+            </>
+          ) : dialog === 'clear' ? (
+            <>
+              <p className={styles.confirmText}>{t('conversationSyncClearDescription')}</p>
+              <p className={styles.confirmText}>
+                {t(showConversationShareControls ? 'conversationSyncClearShares' : 'conversationSyncClearSharesHidden')}
+              </p>
+            </>
+          ) : <KeyBackupControls key={generation} generation={generation} />}
+          {problem && dialog !== 'key' ? (
             <p className={styles.error} role="alert">
               {problem}
             </p>

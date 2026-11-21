@@ -32,6 +32,9 @@ class BoundedBodyMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH"}:
             return await self.app(scope, receive, send)
+        # The image job route authenticates before applying its own bounded upload read.
+        if scope["method"] == "POST" and scope.get("path") == "/chat/api/image-jobs":
+            return await self.app(scope, receive, send)
         content = bytearray()
         max_bytes = (MAX_FEEDBACK_BODY_BYTES if scope["method"] == "POST" and scope.get("path") == "/v1/feedback"
                      else self.max_bytes)
@@ -127,7 +130,7 @@ def create_app(settings=None):
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
         if request.url.path == "/v1/accounts/register":
-            detail = ("请只填写用户名和密码注册，注册后可在 API 设置中兑换邀请码"
+            detail = ("邀请码格式不正确，请检查后重试。"
                       if any("invitation_code" in item["loc"] for item in error.errors())
                       else "账号信息格式不正确，请检查用户名和密码")
             return JSONResponse({"detail": detail}, status_code=422)
@@ -204,6 +207,11 @@ def create_app(settings=None):
     def register_account(body: AccountRegisterRequest, request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
         return store.accounts.register(body.username, body.password, body.invitation_code, _client_ip(request))
+
+    @app.get("/v1/accounts/registration")
+    def registration_policy(response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return store.accounts.registration_policy()
 
     @app.post("/v1/accounts/login")
     def login_account(body: AccountLoginRequest, request: Request, response: Response):

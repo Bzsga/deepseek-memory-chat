@@ -3,7 +3,6 @@ package app.banzhan.deepseekcontinuation.data
 import java.text.Normalizer
 import java.time.OffsetDateTime
 import kotlinx.coroutines.CancellationException
-import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -14,7 +13,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 
 /** Account operations are explicit and independent of anonymous/BYOK identities. */
 internal interface AccountTransport {
-    suspend fun register(serviceUrl: String, username: String, password: String): AccountAuthentication
+    suspend fun selfServiceRegistration(serviceUrl: String): Boolean = false
+    suspend fun register(serviceUrl: String, username: String, password: String, invitationCode: String): AccountAuthentication
     suspend fun login(serviceUrl: String, username: String, password: String): AccountAuthentication
     suspend fun me(session: AccountSession): AccountProfile
     suspend fun redeem(session: AccountSession, code: String): AccountProfile
@@ -24,11 +24,25 @@ internal interface AccountTransport {
 internal object AccountNetwork : AccountTransport {
     private val contentType = "application/json; charset=utf-8".toMediaType()
 
-    override suspend fun register(serviceUrl: String, username: String, password: String): AccountAuthentication {
-        val body = credentialsPayload(username, password)
+    override suspend fun selfServiceRegistration(serviceUrl: String): Boolean = try {
+        val request = Request.Builder().url(endpoint(serviceUrl, "registration")).get().build()
+        parseSelfServiceRegistration(accountExchange(request, emptyList(), mutation = false))
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        // Older services still accept a registration with a valid invitation.
+        false
+    }
+
+    internal fun parseSelfServiceRegistration(payload: String): Boolean =
+        objectResponse(payload).readAccountFlag("self_service") ?: error("注册设置缺少开放状态")
+
+    override suspend fun register(serviceUrl: String, username: String, password: String, invitationCode: String): AccountAuthentication {
+        val code = invitationCode.trimAccountWhitespace().takeIf { it.isNotEmpty() }
+        val body = credentialsPayload(username, password, invitationCode = code)
         val request = Request.Builder().url(endpoint(serviceUrl, "register"))
             .post(body.toRequestBody(contentType)).build()
-        val payload = accountExchange(request, listOf(password), registering = true)
+        val payload = accountExchange(request, listOfNotNull(password, code), registering = true)
         return parseResponse { parseAuthentication(serviceUrl, payload) }
     }
 
@@ -54,7 +68,7 @@ internal object AccountNetwork : AccountTransport {
             .post(body.toRequestBody(contentType)).build()
         val payload = accountExchange(request, listOf(session.token, code))
         return parseResponse {
-            parseProfile(payload).also { require(it.user.id == session.user.id && it.user.managedEligible) }
+            parseProfile(payload).also { require(it.user.id == session.user.id) }
         }
     }
 
@@ -64,10 +78,15 @@ internal object AccountNetwork : AccountTransport {
         accountExchange(request, listOf(session.token))
     }
 
-    internal fun credentialsPayload(username: String, password: String): String {
+    internal fun credentialsPayload(username: String, password: String, invitationCode: String? = null): String {
         val normalized = normalizedUsername(username)
         validatePassword(password)
-        return buildJsonObject { put("username", normalized); put("password", password) }.toString()
+        return buildJsonObject {
+            put("username", normalized)
+            put("password", password)
+            invitationCode?.trimAccountWhitespace()?.takeIf { it.isNotEmpty() }
+                ?.let { put("invitation_code", it) }
+        }.toString()
     }
 
     internal fun parseAuthentication(serviceUrl: String, payload: String): AccountAuthentication {
@@ -122,9 +141,12 @@ internal object AccountNetwork : AccountTransport {
         require(normalizedUsername(username) == username) { "账户用户名无效" }
         val kind = root.text("registration_kind")
         require(kind in setOf("public", "invitation")) { "账户注册方式无效" }
+        val permissions = root.readServicePermissions()
         return AccountUser(id, username, kind, root.timestamp("created_at"),
             role = (root["role"] as? JsonPrimitive)?.takeIf { it.isString && it.content == "admin" }?.content ?: "user",
-            managedEligible = (root["managed_eligible"] as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull == true)
+            managedEligible = permissions?.chatApi ?: (root.readAccountFlag("managed_eligible") == true),
+            permissions = permissions,
+            inviteRedeemable = root.readAccountFlag("invite_redeemable"))
     }
 
     private fun endpoint(serviceUrl: String, operation: String) =

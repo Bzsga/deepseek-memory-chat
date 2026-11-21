@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from account_fixtures import managed_account
 from app.config import Settings
 from app.share_import import MAX_SHARE_BYTES, build_share_import_router
 from app.store import Store
@@ -22,7 +23,7 @@ def owner(tmp_path):
     store = Store(Settings(db_path=str(tmp_path / "shares.sqlite3"), worker_enabled=False,
         api_enabled=True, api_key="synthetic-key", weekly_limit=100, user_weekly_limit=20))
     store.initialize()
-    account = store.accounts.register("synthetic_share", "synthetic-password-123")
+    account = managed_account(store, "synthetic_share")
     return store, account
 
 

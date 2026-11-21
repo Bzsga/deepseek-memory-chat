@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.webkit.WebView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -59,6 +60,8 @@ fun ContinuationApp(
     onIncomingImportConsumed: (String) -> Unit = {},
     onShareLinkReceived: (String) -> Unit = {},
     automaticUpdateChecks: Boolean = true,
+    webViewMajor: Int = WebView.getCurrentWebViewPackage()?.versionName?.substringBefore('.')?.toIntOrNull() ?: 0,
+    webViewHandlesIme: Boolean = false,
 ) {
     val state by controller.state.collectAsStateWithLifecycle()
     val politicalState by controller.politicalExport.state.collectAsStateWithLifecycle()
@@ -83,6 +86,7 @@ fun ContinuationApp(
     var advancedBranchId by rememberSaveable { mutableStateOf<String?>(null) }
     var chatSettingsReturn by rememberSaveable { mutableStateOf<String?>(null) }
     var accountReturn by rememberSaveable { mutableStateOf("settings") }
+    var resumeSyncAfterAccount by rememberSaveable { mutableStateOf(false) }
     var settingsReturn by rememberSaveable { mutableStateOf("settings") }
     var chatFragment by rememberSaveable { mutableStateOf("") }
     var preparationError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -175,8 +179,9 @@ fun ContinuationApp(
                 "progress"
             else "result"
     }
-    fun account(returnRoute: String) {
+    fun account(returnRoute: String, resumeSync: Boolean = false) {
         accountReturn = returnRoute
+        resumeSyncAfterAccount = resumeSync
         route = "account"
     }
     fun requireFreeAccount(returnRoute: String): Boolean {
@@ -720,7 +725,7 @@ fun ContinuationApp(
                                     imported(ids)
                                 },
                                 onMemories = { chatSettingsReturn = null; route = "archives" },
-                                onAccount = { account("chat") },
+                                onAccount = { resumeSync -> account("chat", resumeSync) },
                                 onSettings = { section -> openSettingsSection(section, fromChat = true) },
                                 onChatProvider = controller::updateChatProvider,
                                 onThemePreference = { userId, preference ->
@@ -729,6 +734,8 @@ fun ContinuationApp(
                                 },
                                 initialFragment = chatFragment,
                                 onReturnFromSettings = if (chatSettingsReturn != null) ::returnFromChatApiSettings else null,
+                                webViewMajor = webViewMajor,
+                                webViewHandlesIme = webViewHandlesIme,
                             )
                             "home" ->
                                 HomeScreen(
@@ -1048,8 +1055,13 @@ fun ContinuationApp(
                             "feedback" -> FeedbackScreen(state, controller, run)
                             "tasks" -> TasksScreen(state.tasks, controller, run,
                                 onAccount = { account("tasks") }) { openRecord(it) }
-                            "account" -> AccountScreen(state, busy, controller, run,
-                                onSignedIn = { route = accountReturn })
+                            "account" -> AccountScreen(state, busy, controller, run, onSignedIn = {
+                                if (accountReturn == "chat" && resumeSyncAfterAccount) {
+                                    chatFragment = NativeSettingsSection.DATA.returnFragment
+                                }
+                                resumeSyncAfterAccount = false
+                                route = accountReturn
+                            })
                             "about" ->
                                 AboutScreen(
                                     updateState = updateState,

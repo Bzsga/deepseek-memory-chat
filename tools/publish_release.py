@@ -5,11 +5,19 @@ import hashlib
 import importlib.util
 import json
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+if __package__:
+    from .cos_release import CosReleaseError, _verify_public, cos_release_plan, stage_cos_release
+else:
+    from cos_release import CosReleaseError, _verify_public, cos_release_plan, stage_cos_release
 
 
 PACKAGE_NAME = "app.banzhan.deepseekcontinuation"
@@ -19,6 +27,7 @@ REMOTE_ROOT = "/var/www/deepseek-continuation-updates"
 MAX_APK_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 32 * 1024
 NUMERIC_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+MIRROR_INCLUDE = 'include /etc/nginx/deepseek-continuation-mirrors/*.conf;\n'
 
 NGINX_SNIPPET = '''# Managed by Deepseek continuation publish_release.py.
 location = /continuation-updates/latest.json {
@@ -178,7 +187,7 @@ try:
         fail('site_target_changed')
     original = site.read_bytes()
     text = original.decode('utf-8')
-    if snippet.exists() and (snippet.is_symlink() or snippet.read_text() != expected):
+    if snippet.exists() and (snippet.is_symlink() or snippet.read_text() not in (expected, expected + PAYLOAD['mirror_include'])):
         fail('updates_snippet_manually_modified')
     existing = [line for line in text.splitlines() if '/continuation-updates' in line and 'location' in line]
     if existing:
@@ -380,8 +389,191 @@ print(json.dumps({'ok':True,'status':'stage_cleaned'}))
 '''
 
 
+ROUTE_COS = r'''
+import fcntl, hashlib, os, re, stat, subprocess, tempfile
+from pathlib import Path
+root = Path('/var/www/deepseek-continuation-updates')
+snippet = Path('/etc/nginx/snippets/deepseek-continuation-updates.conf')
+directory = Path('/etc/nginx/deepseek-continuation-mirrors')
+site = Path('/etc/nginx/sites-enabled/digimon_website')
+identity = ('schemaVersion', 'packageName', 'versionCode', 'versionName', 'apkUrl', 'apkSize', 'sha256', 'minSdk')
+
+def fail(code):
+    raise RuntimeError(code)
+
+def read_manifest(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 32768:
+        fail('latest_manifest_invalid')
+    return json.loads(path.read_text(encoding='utf-8'))
+
+def atomic_write(path, data, original=None):
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + path.name + '-', suffix='.tmp', delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(data)
+            stream.flush()
+            if original is not None and hasattr(os, 'chown'):
+                os.chown(temporary, original.st_uid, original.st_gid)
+            temporary.chmod(stat.S_IMODE(original.st_mode) if original is not None else 0o644)
+            os.fsync(stream.fileno())
+        except BaseException:
+            stream.close()
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def nginx(arguments):
+    return subprocess.run(arguments, capture_output=True, timeout=20).returncode == 0
+
+try:
+    manifest = PAYLOAD['manifest']
+    version, digest = manifest['versionCode'], manifest['sha256']
+    if type(version) is not int or not 1 <= version <= 2147483647 or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        fail('cos_route_identity_invalid')
+    if any(path.is_symlink() or not path.is_dir() for path in (root, root/'apks', root/'apks'/str(version))):
+        fail('managed_path_modified')
+    release_lock = root/'.publish.lock'
+    if release_lock.is_symlink():
+        fail('managed_path_modified')
+    with release_lock.open('a+b') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        latest = read_manifest(root/'latest.json')
+        if any(latest.get(key) != manifest[key] for key in identity):
+            fail('cos_route_latest_mismatch')
+        apk = root/'apks'/str(version)/f'deepseek-continuation-{version}.apk'
+        if apk.is_symlink() or not apk.is_file() or apk.stat().st_size != manifest['apkSize']:
+            fail('cos_route_static_apk_missing')
+        with apk.open('rb') as package:
+            checksum = hashlib.sha256()
+            for chunk in iter(lambda: package.read(1048576), b''):
+                checksum.update(chunk)
+        if checksum.hexdigest() != digest:
+            fail('cos_route_static_apk_mismatch')
+
+        if (site.resolve(strict=True) != Path('/etc/nginx/sites-available/digimon_website')
+                or site.read_text(encoding='utf-8').count('include /etc/nginx/snippets/deepseek-continuation-updates.conf;') != 1):
+            fail('updates_include_inconsistent')
+        if snippet.is_symlink() or not snippet.is_file():
+            fail('updates_snippet_manually_modified')
+        original = snippet.read_bytes()
+        original_stat = snippet.stat()
+        expected = PAYLOAD['snippet'].encode('utf-8')
+        updated = expected + PAYLOAD['mirror_include'].encode('utf-8')
+        if original not in (expected, updated):
+            fail('updates_snippet_manually_modified')
+
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            fail('cos_route_directory_modified')
+        route = directory/f'apk-{version}.conf'
+        route_bytes = PAYLOAD['route'].encode('utf-8')
+        if route.is_symlink() or (route.exists() and (not route.is_file() or route.read_bytes() != route_bytes)):
+            fail('cos_route_conflict')
+        if route.exists() and original == updated:
+            # A previous invocation may have stopped after writing both files but before reloading.
+            if not nginx(['nginx', '-t']):
+                fail('nginx_validation_failed')
+            if not nginx(['systemctl', 'reload', 'nginx']):
+                fail('nginx_reload_failed')
+            status = 'already_routed'
+        else:
+            created_directory = created_route = changed_snippet = reload_attempted = False
+            try:
+                if not directory.exists():
+                    directory.mkdir(mode=0o755)
+                    created_directory = True
+                if not route.exists():
+                    atomic_write(route, route_bytes)
+                    created_route = True
+                if original != updated:
+                    atomic_write(snippet, updated, original_stat)
+                    changed_snippet = True
+                if not nginx(['nginx', '-t']):
+                    fail('nginx_validation_failed')
+                reload_attempted = True
+                if not nginx(['systemctl', 'reload', 'nginx']):
+                    fail('nginx_reload_failed')
+                status = 'routed'
+            except BaseException:
+                try:
+                    if changed_snippet:
+                        atomic_write(snippet, original, original_stat)
+                    if created_route:
+                        route.unlink()
+                    if created_directory:
+                        directory.rmdir()
+                    if reload_attempted and not (nginx(['nginx', '-t']) and nginx(['systemctl', 'reload', 'nginx'])):
+                        fail('cos_route_restore_failed')
+                except Exception:
+                    fail('cos_route_restore_failed')
+                raise
+    print(json.dumps({'ok': True, 'status': status, 'versionCode': version, 'url': PAYLOAD['url']}))
+except Exception as error:
+    print(json.dumps({'ok': False, 'error': str(error) if isinstance(error, RuntimeError) else 'cos_route_failed'}))
+    raise SystemExit(1)
+'''
+
+
 def prepare_hosting(client):
-    return remote_python(client, PREPARE_HOSTING, {"snippet": NGINX_SNIPPET})
+    return remote_python(client, PREPARE_HOSTING, {"snippet": NGINX_SNIPPET, "mirror_include": MIRROR_INCLUDE})
+
+
+def verify_cos_route(apk_path, manifest, target):
+    url, size, digest = target["url"], manifest["apkSize"], manifest["sha256"]
+    with Path(apk_path).open("rb") as apk:
+        prefix = apk.read(4)
+    curl = shutil.which("curl")
+    if curl is None:
+        _verify_public(url, size, digest, prefix)
+        return
+    with tempfile.TemporaryDirectory(prefix="deepseek-cos-route-") as directory:
+        downloaded = Path(directory) / "mirror"
+        headers = Path(directory) / "headers"
+
+        def fetch(maximum, byte_range=None):
+            command = [curl, "-q", "--silent", "--proto", "=https", "--max-time", "120",
+                       "--max-filesize", str(maximum), "--header", "Accept-Encoding: identity",
+                       "--header", "Cache-Control: no-cache", "--dump-header", str(headers),
+                       "--output", str(downloaded), "--write-out", "%{http_code}"]
+            if byte_range:
+                command.extend(("--range", byte_range))
+            return subprocess.run([*command, "--", url], capture_output=True, timeout=125)
+
+        try:
+            full = fetch(size)
+            if full.returncode or full.stdout != b"200":
+                raise CosReleaseError("cos_public_download_failed")
+            if downloaded.stat().st_size != size or file_sha256(downloaded) != digest:
+                raise CosReleaseError("cos_public_apk_mismatch")
+            partial = fetch(4, "0-3")
+            expected_range = f"content-range: bytes 0-3/{size}".encode()
+            if (partial.returncode or partial.stdout != b"206" or downloaded.read_bytes() != prefix
+                    or expected_range not in headers.read_bytes().lower().splitlines()):
+                raise CosReleaseError("cos_public_range_invalid")
+        except (OSError, subprocess.SubprocessError):
+            raise CosReleaseError("cos_public_download_failed") from None
+
+
+def route_cos(client, manifest, target):
+    if target != cos_release_plan(manifest):
+        raise CosReleaseError("cos_target_mismatch")
+    version = manifest["versionCode"]
+    path = f"{PREFIX}/apks/{version}/deepseek-continuation-{version}.apk"
+    if manifest["apkUrl"] != ORIGIN + path:
+        raise PublishError("apk_url_invalid")
+    url = target["url"]
+    route = (
+        "# Managed by Deepseek continuation publish_release.py.\n"
+        f"location = {path} {{\n"
+        "    if ($request_method !~ ^(GET|HEAD)$) { return 405; }\n"
+        '    add_header Cache-Control "no-store" always;\n'
+        f"    return 302 {url};\n"
+        "}\n"
+    )
+    return remote_python(client, ROUTE_COS, {"manifest": manifest, "snippet": NGINX_SNIPPET,
+                                           "mirror_include": MIRROR_INCLUDE, "route": route, "url": url})
 
 
 def publish(client, apk_path, manifest, signer):
@@ -404,16 +596,23 @@ def publish(client, apk_path, manifest, signer):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="验证并发布续聊助手静态 APK 更新")
+    parser = argparse.ArgumentParser(description="验证并发布 DeepSeek 记忆聊天 APK 更新")
     commands = parser.add_subparsers(dest="command", required=True)
     hosting = commands.add_parser("prepare-hosting")
     hosting.add_argument("--ssh-helper", required=True)
     release = commands.add_parser("publish")
-    release.add_argument("--apk", required=True)
-    release.add_argument("--verified-metadata", required=True)
+    stage = commands.add_parser("stage-cos", help="上传并验证 COS 镜像")
+    route = commands.add_parser("route-cos", help="将当前已发布 APK 的下载入口接入已验证的 COS 镜像")
+    for command in (release, stage, route):
+        command.add_argument("--apk", required=True)
+        command.add_argument("--verified-metadata", required=True)
+        command.add_argument("--dry-run", action="store_true")
     release.add_argument("--changelog-file")
     release.add_argument("--ssh-helper")
-    release.add_argument("--dry-run", action="store_true")
+    release.add_argument("--cos", action="store_true", help="发布前先验证 COS 镜像，发布后启用 COS 下载")
+    route.add_argument("--ssh-helper")
+    stage.set_defaults(cos=True, changelog_file=None)
+    route.set_defaults(cos=True, changelog_file=None)
     args = parser.parse_args(argv)
     client = None
     try:
@@ -423,15 +622,34 @@ def main(argv=None):
         else:
             notes = read_json(args.changelog_file) if args.changelog_file else []
             manifest, signer = prepare_release(args.apk, args.verified_metadata, notes)
+            cos_target = cos_release_plan(manifest) if args.cos else None
             if args.dry_run:
                 result = {"ok": True, "status": "dry_run", "manifest": manifest,
                           "signature_assertion_bound_to_apk": True, "remote_checked": False}
+                if cos_target is not None:
+                    result["cos"] = cos_target
+            elif args.command == "stage-cos":
+                result = {"ok": True, **stage_cos_release(args.apk, manifest, cos_target)}
+            elif args.command == "route-cos":
+                client = connect(args.ssh_helper)
+                verify_cos_route(args.apk, manifest, cos_target)
+                result = route_cos(client, manifest, cos_target)
             else:
                 client = connect(args.ssh_helper)
+                mirror = stage_cos_release(args.apk, manifest, cos_target) if cos_target is not None else None
                 result = publish(client, args.apk, manifest, signer)
+                if mirror is not None:
+                    result["cos"] = mirror
+                    try:
+                        result["cosRoute"] = route_cos(client, manifest, cos_target)
+                    except Exception as error:
+                        code = error.code if isinstance(error, (PublishError, CosReleaseError)) else "cos_route_failed"
+                        print(json.dumps({"ok": False, "error": code, "release_published": True,
+                                          "result": result}, ensure_ascii=True, separators=(",", ":")))
+                        return 2
         print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
         return 0
-    except PublishError as error:
+    except (PublishError, CosReleaseError) as error:
         print(json.dumps({"ok": False, "error": error.code}))
         return 2
     except Exception:

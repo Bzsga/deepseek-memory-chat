@@ -78,10 +78,11 @@ def configuration_fingerprint(settings):
 
 
 class ServiceError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, code=None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.code = code
 
 
 def digest(secret):
@@ -206,6 +207,31 @@ class Store:
                 user_id TEXT NOT NULL REFERENCES registered_accounts(user_id), week TEXT NOT NULL,
                 limit_total INTEGER NOT NULL CHECK(limit_total>=0), PRIMARY KEY(user_id,week)
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS global_feature_access (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                chat_api INTEGER NOT NULL CHECK(chat_api IN (0,1)),
+                image_api INTEGER NOT NULL CHECK(image_api IN (0,1)),
+                cloud_sync INTEGER NOT NULL CHECK(cloud_sync IN (0,1))
+            )""")
+            db.execute("INSERT OR IGNORE INTO global_feature_access VALUES(1,0,0,0)")
+
+    @staticmethod
+    def open_permissions(db) -> dict[str, bool]:
+        row = db.execute("SELECT chat_api,image_api,cloud_sync FROM global_feature_access WHERE id=1").fetchone()
+        return {name: bool(row[name]) for name in row.keys()}
+
+    def get_open_permissions(self) -> dict[str, bool]:
+        with self.connection() as db:
+            return self.open_permissions(db)
+
+    def set_open_permissions(self, permissions: dict[str, bool]) -> dict[str, bool]:
+        from .accounts import PERMISSION_NAMES, validate_permissions
+
+        validate_permissions(permissions)
+        with self.connection(write=True) as db:
+            db.execute("UPDATE global_feature_access SET chat_api=?,image_api=?,cloud_sync=? WHERE id=1",
+                       tuple(int(permissions[name]) for name in PERMISSION_NAMES))
+            return self.open_permissions(db)
 
     def _settings(self, db):
         row = db.execute("SELECT data FROM runtime_config WHERE id=1").fetchone()
@@ -264,17 +290,20 @@ class Store:
             "reset_at": reset_at(now),
         }
         if owner_id is not None:
+            from .accounts import account_permissions
             base_limit = settings.user_weekly_limit
-            account = db.execute("SELECT weekly_limit_override, managed_eligible FROM registered_accounts WHERE user_id=?", (owner_id,)).fetchone()
+            account = db.execute("""SELECT weekly_limit_override,disabled,managed_eligible,chat_api,image_api,cloud_sync,self_service_cloud
+                FROM registered_accounts WHERE user_id=?""", (owner_id,)).fetchone()
+            permissions = account_permissions(account, self.open_permissions(db))
             if account is not None and account["weekly_limit_override"] is not None:
                 base_limit = account["weekly_limit_override"]
             this_week = db.execute("SELECT limit_total FROM account_weekly_caps WHERE user_id=? AND week=?",
                                    (owner_id, local_week(now))).fetchone()
             effective_limit = this_week["limit_total"] if this_week is not None else base_limit
-            if account is not None and not account["managed_eligible"]:
+            if account is not None and not (permissions["chat_api"] or permissions["image_api"]):
                 effective_limit = 0
             result.update({
-                "managed_eligible": bool(account and account["managed_eligible"]),
+                "managed_eligible": permissions["chat_api"], "permissions": permissions,
                 "user_weekly_limit": effective_limit, "user_weekly_used": row["user_used"],
                 "user_weekly_reserved": reserved["user_reserved"],
                 "user_weekly_remaining": max(0, effective_limit - row["user_used"] - reserved["user_reserved"]),
@@ -376,7 +405,7 @@ class Store:
         caps.update({row["name"]: row["micros"] for row in db.execute("SELECT * FROM budget_caps")})
         return caps
 
-    def _quota(self, db, owner_id, settings=None, timestamp=None):
+    def _quota(self, db, owner_id, settings=None, timestamp=None, *, permission="chat_api"):
         settings = settings or self._settings(db)
         now = time.time() if timestamp is None else timestamp
         caps = self._caps(db, settings)
@@ -409,9 +438,10 @@ class Store:
             message = "本周次数已用完或已被排队任务预留，北京时间下周一零点重置"
         if settings.mock_mode:
             message = "模拟模式，仅验证流程，不调用真实模型" if enabled else "模拟模式预算尚未配置完整"
-        if not weekly["managed_eligible"]:
+        if not weekly["permissions"][permission]:
             enabled = False
-            message = "请填写个人 DeepSeek API Key，或兑换邀请码开通免费服务"
+            message = ("当前账号未开通配套生图服务。" if permission == "image_api"
+                       else "当前账号未开通配套聊天服务，请使用个人 DeepSeek API Key。")
         automatic_fallback = bool(getattr(settings, "fallback_providers", ())) and (
             access_mode == "public" and not settings.cost_known and not settings.mock_mode
         )
@@ -430,6 +460,7 @@ class Store:
     def quota(self, owner_id, db=None):
         if db is None:
             with self.connection() as connection:
+                connection.execute("BEGIN")
                 return self.quota(owner_id, db=connection)
         quota = self._quota(db, owner_id)
         return {key: value for key, value in quota.items() if not key.endswith("micros")}
@@ -449,9 +480,11 @@ class Store:
             if account_session_hash is not None and not self.accounts.is_session_active_hash(account_session_hash, db=db):
                 raise ServiceError(401, "登录已失效，请重新登录")
             now = time.time()
-            quota = self._quota(db, owner_id, timestamp=now)
-            if not quota["managed_eligible"]:
-                raise ServiceError(403, quota["message"])
+            permission = "image_api" if kind == "image" else "chat_api"
+            quota = self._quota(db, owner_id, timestamp=now, permission=permission)
+            if not quota["permissions"][permission]:
+                code = "image_ineligible" if kind == "image" else "managed_ineligible"
+                raise ServiceError(403, quota["message"], code)
             if not quota["enabled"]:
                 raise ServiceError(503, quota["message"])
             if quota["weekly_remaining"] <= 0 or quota["user_weekly_remaining"] <= 0:

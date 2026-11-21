@@ -277,10 +277,14 @@ const MIME_BY_EXT: Record<string, string> = {
   tiff: 'image/tiff',
 }
 
-/** 取文件的 MIME：优先用浏览器给出的类型，缺失时按扩展名推断 */
+/** 优先使用报告的 MIME，通用二进制类型也允许按受支持的图片扩展名推断。 */
 export const resolveMimeType = (file: File) => {
-  const type = file.type.toLowerCase() || MIME_BY_EXT[getFileExt(file.name)] || ''
-  return type === 'image/jpg' ? 'image/jpeg' : type === 'image/x-png' ? 'image/png' : type
+  const reported = file.type.toLowerCase()
+  const inferred = MIME_BY_EXT[getFileExt(file.name)] ?? ''
+  if (!reported || (reported === 'application/octet-stream' && isImage(inferred))) {
+    return inferred
+  }
+  return reported === 'image/jpg' ? 'image/jpeg' : reported === 'image/x-png' ? 'image/png' : reported
 }
 
 /** Camera providers may return an unnamed image or a content-provider filename. */

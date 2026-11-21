@@ -1,14 +1,15 @@
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { useSettings } from '../../services/settings.js'
 import {
   configureImageProvider,
   forgetImageProvider,
   imageModels,
-  managedImageAvailable,
   useActiveImageProvider,
   useImageProvider,
+  useManagedImageAvailable,
 } from '../../services/imageProvider.js'
-import { useChatProvider } from '../../services/chatProvider.js'
+import { nativePersonalImageChannel, subscribeNativeBridge } from '../../services/nativeBridge.js'
+import { getRuntime, subscribeRuntimeUser } from '../../services/runtime.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
@@ -39,8 +40,9 @@ export function ImageProviderSetting() {
 
 function ImageProviderForm({ title, onClose }: { title: string; onClose: () => void }) {
   const zh = useSettings((state) => state.locale === 'zh-CN')
-  useChatProvider((state) => state.managedEligible)
-  const included = managedImageAvailable()
+  const native = useSyncExternalStore(subscribeNativeBridge, () => !!nativePersonalImageChannel())
+  const included = useManagedImageAvailable()
+  const permitted = useSyncExternalStore(subscribeRuntimeUser, () => getRuntime().user.permissions.image_api)
   const current = useImageProvider()
   const [mode, setMode] = useState(current.mode === 'managed' && !included ? 'off' : current.mode)
   const [base, setBase] = useState(current.base)
@@ -136,7 +138,9 @@ function ImageProviderForm({ title, onClose }: { title: string; onClose: () => v
               <option value="managed" disabled={!included}>
                 {included
                   ? zh ? '配套免费生图' : 'Included image service'
-                  : zh ? '配套生图不可用' : 'Included service unavailable'}
+                  : permitted
+                    ? zh ? '配套生图暂不可用' : 'Included image service temporarily unavailable'
+                    : zh ? '账号未开通配套生图' : 'Included image service is unavailable for this account'}
               </option>
               <option value="personal">{zh ? '个人生图 API' : 'Personal image API'}</option>
             </select>
@@ -163,9 +167,10 @@ function ImageProviderForm({ title, onClose }: { title: string; onClose: () => v
                 API Key
                 <input
                   className={styles.keyInput}
-                  type="password"
-                  autoComplete="new-password"
+                  type="text"
+                  autoComplete="off"
                   autoCapitalize="none"
+                  autoCorrect="off"
                   spellCheck={false}
                   value={key}
                   onChange={(event) => {
@@ -191,8 +196,12 @@ function ImageProviderForm({ title, onClose }: { title: string; onClose: () => v
               </div>
               <p className={styles.description}>
                 {zh
-                  ? '需使用允许浏览器跨域访问、兼容 OpenAI 生图接口的服务。密钥在本机加密保存，绘图费用由所选服务商收取。'
-                  : 'Use a service that allows browser requests and supports OpenAI-compatible image generation. Your key is encrypted locally and your provider bills each generation.'}
+                  ? native
+                    ? 'App 会直连你填写的生图服务，密钥在本机加密保存，费用以该服务商为准。'
+                    : '请填写兼容 OpenAI 生图接口、允许跨域访问的服务。密钥在本机加密保存，费用以该服务商为准。'
+                  : native
+                    ? 'The app connects directly to your image provider. Your key is encrypted on this device and your provider handles billing.'
+                    : 'Use an OpenAI-compatible image provider that allows cross-origin requests. Your key is encrypted on this device and your provider handles billing.'}
               </p>
             </>
           ) : null}

@@ -4,14 +4,22 @@ package app.banzhan.deepseekcontinuation.ui
 
 import android.text.format.DateFormat
 import android.text.format.Formatter
+import android.widget.Toast
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -37,6 +45,7 @@ internal fun AppUpdateBanner(
     modifier: Modifier = Modifier,
 ) {
     val manifest = state.manifest ?: return
+    var showNotes by rememberSaveable(manifest.versionCode) { mutableStateOf(false) }
     Surface(
         modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.primaryContainer,
@@ -65,8 +74,20 @@ internal fun AppUpdateBanner(
                         else "稍后"
                     )
                 }
+                if (manifest.changelog.isNotEmpty()) {
+                    TextButton(onClick = { showNotes = true }) { Text("查看更新内容") }
+                }
             }
         }
+    }
+    if (showNotes && manifest.changelog.isNotEmpty()) {
+        val closeNotes = { showNotes = false }
+        AlertDialog(
+            onDismissRequest = closeNotes,
+            title = { Text("${manifest.versionName} 更新内容") },
+            text = { UpdateNotes(manifest.changelog, Modifier.verticalScroll(rememberScrollState())) },
+            confirmButton = { TextButton(onClick = closeNotes) { Text("关闭") } },
+        )
     }
 }
 
@@ -81,6 +102,8 @@ internal fun AppUpdateCard(
     onInstall: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val activeTransfer = state.status == AppUpdateStatus.DOWNLOADING || state.status == AppUpdateStatus.VERIFYING
     OutlinedCard(
         modifier = modifier.fillMaxWidth(),
@@ -105,11 +128,20 @@ internal fun AppUpdateCard(
                         fontWeight = FontWeight.SemiBold,
                     )
                 }
-                OutlinedButton(
-                    onClick = onCheck,
-                    enabled = !state.checking && !activeTransfer,
-                ) {
-                    Text(if (state.checking) "正在检查…" else "检查更新")
+                Column(horizontalAlignment = Alignment.End) {
+                    OutlinedButton(
+                        onClick = onCheck,
+                        enabled = !state.checking && !activeTransfer,
+                    ) {
+                        Text(if (state.checking) "正在检查…" else "检查更新")
+                    }
+                    TextButton(onClick = {
+                        try {
+                            uriHandler.openUri("https://digimonlegend.com/deepseek/changelog.html")
+                        } catch (_: IllegalArgumentException) {
+                            Toast.makeText(context, "无法打开更新历史，请检查默认浏览器。", Toast.LENGTH_SHORT).show()
+                        }
+                    }) { Text("更新历史") }
                 }
             }
             if (state.checking) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -128,7 +160,10 @@ internal fun AppUpdateCard(
                     onCancelDownload,
                     onInstall,
                 )
-                if (state.manifest.changelog.isNotEmpty()) UpdateNotes(state.manifest.changelog)
+                if (state.manifest.changelog.isNotEmpty()) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    UpdateNotes(state.manifest.changelog, heading = "本次更新")
+                }
             }
         }
     }
@@ -165,10 +200,11 @@ private fun UpdateSummary(manifest: AppUpdateManifest, showReleaseDate: Boolean)
 }
 
 @Composable
-private fun UpdateNotes(notes: List<String>) {
-    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("本次更新", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+private fun UpdateNotes(notes: List<String>, modifier: Modifier = Modifier, heading: String? = null) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (heading != null) {
+            Text(heading, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        }
         notes.forEach { note ->
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("•", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodyMedium)

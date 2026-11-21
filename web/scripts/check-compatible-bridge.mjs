@@ -26,7 +26,13 @@ try {
   // Isolate the transport and bridge; actual provider mutations still run through their public entry points.
   writeFileSync(
     file('personalKeyVault'),
-    `let saved;export const readPersonalApiKey=async()=>saved;export const hasPersonalApiKey=async()=>!!saved;export const storePersonalApiKey=async(apiKey,target)=>saved={scope:crypto.randomUUID(),apiKey,...target};export const removePersonalApiKey=async()=>{saved=undefined}`
+    `const saved = new Map();
+    export const readPersonalApiKey = async (purpose = 'chat') => saved.get(purpose);
+    export const hasPersonalApiKey = async (purpose = 'chat') => saved.has(purpose);
+    export const storePersonalApiKey = async (apiKey, target, purpose = 'chat') => {
+      const entry = {scope:crypto.randomUUID(), apiKey, ...target}; saved.set(purpose, entry); return entry;
+    };
+    export const removePersonalApiKey = async (purpose = 'chat') => { saved.delete(purpose) };`
   )
   writeFileSync(
     file('chat/store'),
@@ -51,9 +57,9 @@ try {
   }
   const runtime = await load('runtime')
   runtime.initializeRuntime({
-    user: { id: 'local', role: 'user', managed_eligible: true },
+    user: { id: 'local', username: 'synthetic', role: 'user', managed_eligible: true },
     model: 'test',
-    features: {},
+    features: { image_generation: true },
   })
   const provider = await load('chatProvider'),
     bridge = await load('nativeBridge'),
@@ -61,13 +67,21 @@ try {
     settings = await load('settings')
   const pause = () => new Promise((resolve) => setTimeout(resolve, 0)),
     sent = []
-  const establish = (trusted, source, flags) => {
+  const establish = (trusted, source, flags, receiveImage) => {
     const channel = {
       start() {},
       close() {},
       postMessage(text) {
         const msg = JSON.parse(text)
         sent.push(msg)
+        if (msg.type.startsWith('image.')) {
+          assert.ok(receiveImage, 'Only an authenticated image-capable port may receive image frames')
+          const reply = (type, payload) => channel.onmessage({
+            data: JSON.stringify({ version: 1, type, id: msg.id, ...payload }),
+          })
+          receiveImage(msg, reply)
+          return
+        }
         queueMicrotask(() =>
           channel.onmessage({
             data: JSON.stringify({ version: 1, type: 'ack', id: msg.id, ok: true }),
@@ -287,6 +301,130 @@ try {
   await importArchiveFrame({finished: true}, () => true)
   const {useMobileSider} = await import(pathToFileURL(join(out, 'src/components/sider/mobileSiderState.js')))
   assert.equal(useMobileSider.getState().open, true)
+
+  const images = await load('imageProvider')
+  const imageBase = 'https://image.qa.invalid/compatible/v1'
+  const imageKey = 'SYNTHETIC_PERSONAL_IMAGE_KEY'
+  const imageModel = 'synthetic-image-model'
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64')
+  const modelResponse = { data: [{ id: imageModel }, { id: imageModel }, { id: '' }] }
+  const imageResponse = { data: [{ b64_json: png.toString('base64') }] }
+  const held = new Map(), inflight = new Set(), dispatched = []
+  let maxInflight = 0
+  const awaitingAck = new Set()
+  const finish = (reply, result) => {
+    const value = JSON.stringify(result)
+    reply('image.result', { data: value.slice(0, 21) })
+    reply('image.result', { data: value.slice(21) })
+    reply('image.done')
+  }
+  const imageSpecs = new Map()
+  establish(true, null, { ...flags, personalImage: true }, (msg, reply) => {
+    assert.equal(msg.version, 1)
+    if (msg.type === 'image.request' || msg.type === 'image.chunk') {
+      assert.equal(awaitingAck.has(msg.id), false, 'Each upload frame waits for its acknowledgement')
+      awaitingAck.add(msg.id)
+      if (msg.type === 'image.request') imageSpecs.set(msg.id, msg)
+      queueMicrotask(() => {
+        awaitingAck.delete(msg.id)
+        reply('image.ack')
+      })
+    } else if (msg.type === 'image.run') {
+      assert.equal(awaitingAck.has(msg.id), false)
+      const { operation, prompt } = imageSpecs.get(msg.id)
+      dispatched.push(prompt ?? operation)
+      if (prompt?.startsWith('batch-')) {
+        inflight.add(msg.id)
+        maxInflight = Math.max(maxInflight, inflight.size)
+        held.set(prompt, () => {
+          inflight.delete(msg.id)
+          finish(reply, imageResponse)
+        })
+      } else {
+        queueMicrotask(() => {
+          if (prompt === 'provider error') reply('image.error', { message: '合成服务错误（HTTP 503）。' })
+          else finish(reply, operation === 'models' ? modelResponse : imageResponse)
+        })
+      }
+    } else {
+      assert.equal(msg.type, 'image.cancel')
+      inflight.delete(msg.id)
+    }
+  })
+  const browserImageRequests = []
+  globalThis.fetch = async (url, init) => {
+    browserImageRequests.push({ url, init })
+    throw new TypeError('Simulated browser CORS rejection')
+  }
+  await images.initializeImageProvider()
+  assert.equal(images.managedImageAvailable(), true)
+  assert.deepEqual(await images.imageModels('https://image.qa.invalid/', imageKey), [imageModel])
+  assert.equal([...imageSpecs.values()].at(-1).url, 'https://image.qa.invalid/v1/models')
+  await images.configureImageProvider('personal', imageBase + '/', imageKey, imageModel)
+  assert.equal(images.activeImageProvider(), 'personal')
+  assert.deepEqual(await images.imageModels(imageBase, ''), [imageModel])
+  assert.equal([...imageSpecs.values()].at(-1).key, imageKey)
+  const freshSignal = () => new AbortController().signal
+  const result = await images.requestPersonalImage('生成测试图', freshSignal())
+  const generation = [...imageSpecs.values()].at(-1)
+  assert.deepEqual([generation.operation, generation.url, generation.key, generation.model, generation.prompt],
+    ['generate', imageBase + '/images/generations', imageKey, imageModel, '生成测试图'])
+  assert.equal(result.model, imageModel)
+  assert.deepEqual(Buffer.from(await result.images[0].blob.arrayBuffer()), png)
+  const seed = Buffer.alloc(96 * 1024 + 17, 0x8a)
+  png.copy(seed)
+  const jpeg = Buffer.from([255, 216, 255, 217])
+  const refs = [new File([seed], '参考.png', { type: 'image/png' }), new File([jpeg], 'photo.jpg', { type: 'image/jpeg' })]
+  await images.requestPersonalImage('编辑两张图', freshSignal(), refs)
+  const edit = [...imageSpecs.values()].at(-1)
+  assert.equal(edit.operation, 'edit')
+  assert.equal(edit.url, imageBase + '/images/edits')
+  assert.deepEqual(edit.files, refs.map(file => ({ name: file.name, mime: file.type, size: file.size })))
+  const chunks = sent.filter(frame => frame.type === 'image.chunk' && frame.id === edit.id)
+  assert.deepEqual(chunks.map(chunk => chunk.index), [0, 0, 1])
+  for (const [index, original] of [seed, jpeg].entries()) {
+    assert.deepEqual(Buffer.concat(chunks.filter(chunk => chunk.index === index)
+      .map(chunk => Buffer.from(chunk.data, 'base64'))), original)
+  }
+  await assert.rejects(images.requestPersonalImage('provider error', freshSignal()), /HTTP 503/)
+  assert.equal(dispatched.filter(prompt => prompt === 'provider error').length, 1)
+
+  const controls = Array.from({ length: 5 }, () => new AbortController())
+  const batch = controls.map((control, index) =>
+    images.requestPersonalImage(`batch-${index}`, control.signal).then(() => 'success', error => error.name))
+  await pause()
+  assert.deepEqual([...held.keys()], ['batch-0', 'batch-1'])
+  controls[4].abort()
+  controls[0].abort()
+  await pause()
+  assert.deepEqual([...held.keys()], ['batch-0', 'batch-1', 'batch-2'])
+  const stopped = [...imageSpecs.values()].find(frame => frame.prompt === 'batch-0')
+  assert.equal(sent.filter(frame => frame.type === 'image.cancel' && frame.id === stopped.id).length, 1)
+  held.get('batch-1')()
+  await pause()
+  assert.deepEqual([...held.keys()], ['batch-0', 'batch-1', 'batch-2', 'batch-3'])
+  held.get('batch-2')()
+  held.get('batch-3')()
+  assert.deepEqual(await Promise.all(batch), ['AbortError', 'success', 'success', 'success', 'AbortError'])
+  assert.equal(maxInflight, 2)
+  assert.equal(browserImageRequests.length, 0)
+
+  establish(true, null, flags)
+  await assert.rejects(images.imageModels(imageBase, ''), /跨域访问/)
+  establish(false, null, { ...flags, personalImage: true })
+  await assert.rejects(images.requestPersonalImage('浏览器请求', freshSignal()), /跨域访问/)
+  establish(true, window, { ...flags, personalImage: true })
+  await assert.rejects(images.imageModels(imageBase, ''), /跨域访问/)
+  assert.deepEqual(browserImageRequests.map(({ url, init }) => [url, init.method]), [
+    [imageBase + '/models', 'GET'], [imageBase + '/images/generations', 'POST'], [imageBase + '/models', 'GET'],
+  ])
+  for (const { init } of browserImageRequests) {
+    assert.equal(init.credentials, 'omit')
+    assert.equal(new Headers(init.headers).get('authorization'), 'Bearer ' + imageKey)
+  }
+
+  establish(true, null, flags)
+  await pause()
   runtime.invalidateSession('login', false)
   const before = sent.length
   settings.setThemePreference('dark')
@@ -294,7 +432,7 @@ try {
   assert.equal(sent.length, before)
   detach()
   console.log(
-    'Verified Android provider/theme bridge, account binding, endpoint/key mutation/clear, cloud and local theme, direct and compatible reply parameters, SSE failures, abort and single-dispatch transport. Zero real model calls.'
+    'Verified Android provider/theme and personal image bridges, trusted capability, multi-reference framing, abort and bounded concurrency, browser fallback, account binding, reply parameters and SSE. Zero real model calls.'
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

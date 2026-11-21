@@ -4,33 +4,11 @@ import { useChatProvider } from '../../services/chatProvider.js'
 import { keyBackupSession, type KeyEnvelope } from '../../services/keyBackup.js'
 import type { SyncDocument } from '../../services/cloudPreferences.js'
 import { Button } from '../base/Button.js'
-import { Modal } from '../base/Modal.js'
 import fields from './ChatProviderSetting.module.css'
 import styles from './ConversationSyncSetting.module.css'
 
 type Action = 'save' | 'restore' | 'remove'
-export function KeyBackupSetting({ generation }: { generation: number }) {
-  const t = useTranslate()
-  const [open, setOpen] = useState(false)
-  return (
-    <>
-      <Button variant="outlined" size="s" aria-haspopup="dialog" onClick={() => setOpen(true)}>
-        {t('keyBackupTitle')}
-      </Button>
-      {open ? (
-        <Modal
-          title={t('keyBackupTitle')}
-          className={styles.confirmation}
-          closable
-          onClose={() => setOpen(false)}
-        >
-          <BackupControls key={generation} generation={generation} />
-        </Modal>
-      ) : null}
-    </>
-  )
-}
-function BackupControls({ generation }: { generation: number }) {
+export function KeyBackupControls({ generation }: { generation: number }) {
   const t = useTranslate()
   const configured = useChatProvider((s) => s.keyConfigured)
   const [doc, setDoc] = useState<SyncDocument<KeyEnvelope> | null>(null)

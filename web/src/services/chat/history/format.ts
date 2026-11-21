@@ -68,7 +68,7 @@ export type GeneratedImageEntry = {
 export type ChatMessage = {
   image_action?: ImageActionTrace
   image_prompt?: string
-  image_origin?: 'chat'
+  image_origin?: 'chat' | 'edit'
   generated_images?: GeneratedImageEntry[]
   image_generation?: boolean
   image_model?: string

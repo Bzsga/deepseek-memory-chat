@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type HTMLAttributes, type PointerEvent } from 'react'
 import { createPortal } from 'react-dom'
+import clsx from 'clsx'
 import { useMobileViewport } from '../../app/viewport.js'
 import { useTranslate } from '../../i18n/index.js'
 import { IconCloseOutline16 } from '../base/icons.js'
@@ -27,6 +28,7 @@ export const ImageViewer = ({
   menuOpen,
   press,
   onMenu,
+  onEdit,
   onClose,
 }: {
   url: string
@@ -35,12 +37,14 @@ export const ImageViewer = ({
   menuOpen: boolean
   press: ImagePressHandlers
   onMenu: () => void
+  onEdit?: () => void
   onClose: () => void
 }) => {
   const t = useTranslate()
   const viewportRef = useMobileViewport(true)
   const stageRef = useRef<HTMLDivElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
   const pointers = useRef(new Map<number, Point>())
   const gesture = useRef<Gesture | null>(null)
   const transformRef = useRef(initial)
@@ -83,7 +87,7 @@ export const ImageViewer = ({
     const viewer = viewportRef.current
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const frame = requestAnimationFrame(() => {
-      viewer?.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true })
+      closeButtonRef.current?.focus({ preventScroll: true })
     })
     const keydown = (event: KeyboardEvent) => {
       if (menuRef.current) {
@@ -171,7 +175,18 @@ export const ImageViewer = ({
     >
       <div className={styles.header}>
         <span className={styles.name}>{name}</span>
-        <button type="button" className={styles.control} aria-label={t('close')} onClick={onClose}>
+        {onEdit && !failed ? (
+          <button type="button" className={clsx(styles.control, styles.editControl)} onClick={onEdit}>
+            {t('imageEditThisImage')}
+          </button>
+        ) : null}
+        <button
+          ref={closeButtonRef}
+          type="button"
+          className={styles.control}
+          aria-label={t('close')}
+          onClick={onClose}
+        >
           <IconCloseOutline16 />
         </button>
       </div>

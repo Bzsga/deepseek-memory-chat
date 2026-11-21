@@ -195,8 +195,14 @@ try {
   const store = await load('store.js')
   const drafts = await load('drafts.js')
   const { setReplyPreferences, useSettings } = await import(pathToFileURL(join(out, 'src/services/settings.js')))
+  const { defaultReplyTuning } = await import(pathToFileURL(join(out, 'src/services/replyPreferences.js')))
   const persona = '请先总结，再举一个简短例子。'
-  setReplyPreferences({ persona, temperature: '0.2', reasoningEffort: 'max' })
+  const warmth = '语气亲切体贴'
+  const detail = '展开关键依据、前提、取舍和例外'
+  const approach = '比较可行选项与主要取舍'
+  setReplyPreferences({ ...defaultReplyTuning, replyTone: 'custom', replyWarmth: 'more',
+    replyDetail: 'deep', replyApproach: 'compare', persona,
+    temperature: '0.2', reasoningEffort: 'max' })
   useSettings.setState({ thinking: false })
   let mode = 'success'
   let releaseSummary
@@ -214,6 +220,9 @@ try {
     if (body.system.startsWith('你负责从指定聊天原文')) {
       summaryCalls += 1
       assert.equal(body.system.includes(persona), false)
+      assert.equal(body.system.includes(warmth), false)
+      assert.equal(body.system.includes(detail), false)
+      assert.equal(body.system.includes(approach), false)
       assert.equal(body.temperature, undefined)
       assert.equal(body.output_config, undefined)
       const persisted = db.rows.get(store.useChatStore.getState().activeId)
@@ -229,6 +238,9 @@ try {
     }
     chatCalls += 1
     assert.ok(body.system.includes(persona))
+    assert.ok(body.system.includes(warmth))
+    assert.ok(body.system.includes(detail))
+    assert.ok(body.system.includes(approach))
     assert.equal(body.temperature, 0.2)
     assert.equal(body.output_config, undefined)
     assert.ok(memory.estimateTokens(body) < automaticBudget + 4000)

@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import { API_ORIGIN, request } from '../../services/api/client.js'
 import {
@@ -16,21 +16,24 @@ import {
   normalizeProviderBase,
   personalEndpoint,
 } from '../../services/providerEndpoint.js'
-import { getRuntime, isGuestWorkspace, validWeeklyQuota } from '../../services/runtime.js'
-import { applyRedeemedQuota } from '../../services/weeklyQuota.js'
+import {
+  getRuntime, isGuestWorkspace, parseRuntimeUser, refreshRuntime, subscribeRuntimeUser, validWeeklyQuota,
+} from '../../services/runtime.js'
+import { applyInviteRedemption } from '../../services/weeklyQuota.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
 import { AccountLoginButton } from './AccountLoginButton.js'
 import { SettingsEditRow } from './SettingsEditRow.js'
+import { closeChatProvider, openChatProvider, useSettingsDialog, watchChatProviderHistory } from './settingsDialogState.js'
 import styles from './ChatProviderSetting.module.css'
 
 type CredentialsDraft = { base: string; model: string; apiKey: string }
+type ServiceChoice = ChatProviderMode | 'invite'
 
 export function ChatProviderSetting() {
   const t = useTranslate()
   const { mode, keyConfigured, loading, error, endpoint } = useChatProvider()
-  const [open, setOpen] = useState(false)
   const summary = t(
     loading
       ? 'chatProviderLoading'
@@ -44,21 +47,23 @@ export function ChatProviderSetting() {
   )
 
   return (
-    <>
-      <SettingsEditRow
-        label={t('chatProviderTitle')}
-        summary={summary}
-        onOpen={() => setOpen(true)}
-      />
-      {open ? <ChatProviderForm onClose={() => setOpen(false)} /> : null}
-    </>
+    <SettingsEditRow label={t('chatProviderTitle')} summary={summary} onOpen={openChatProvider} />
   )
+}
+
+export function ChatProviderDialog() {
+  const open = useSettingsDialog((state) => state.chatProviderOpen)
+  useEffect(watchChatProviderHistory, [])
+  return open ? <ChatProviderForm onClose={closeChatProvider} /> : null
 }
 
 function ChatProviderForm({ onClose }: { onClose: () => void }) {
   const t = useTranslate()
+  const issue = useSettingsDialog((state) => state.chatProviderIssue)
   const { mode, managedEligible, loading, keyConfigured, error, endpoint } = useChatProvider()
-  const [selected, setSelected] = useState<ChatProviderMode>(mode)
+  const account = useSyncExternalStore(subscribeRuntimeUser, () => getRuntime().user)
+  const preferredChoice = issue === 'chatProviderManagedSetupFailed' ? 'personal' : mode
+  const [selected, setSelected] = useState<ServiceChoice>(preferredChoice)
   const [credentials, setCredentials] = useState<CredentialsDraft>(() => ({
     base: endpoint.baseUrl === OFFICIAL_BASE ? '' : endpoint.baseUrl,
     model: endpoint.model === DEFAULT_CHAT_MODEL ? '' : endpoint.model,
@@ -72,6 +77,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
   const [models, setModels] = useState<string[]>([])
   const [listing, setListing] = useState(false)
   const listRequest = useRef<AbortController | null>(null)
+  const advancedTrigger = useRef<HTMLButtonElement | null>(null)
   const listId = useId()
   const mainFormId = useId()
   const advancedFormId = useId()
@@ -86,7 +92,12 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
     }))
   }, [endpoint.baseUrl, endpoint.model])
 
-  useEffect(() => setSelected(mode), [mode])
+  useEffect(() => setSelected(preferredChoice), [preferredChoice])
+  useEffect(() => {
+    if (!account.invite_redeemable) {
+      setSelected((choice) => choice === 'invite' ? mode : choice)
+    }
+  }, [account.invite_redeemable, mode])
 
   useEffect(() => {
     setModels([])
@@ -94,11 +105,16 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
     return () => listRequest.current?.abort()
   }, [base, apiKey, advanced])
 
-  const needsInvite = selected === 'managed' && !managedEligible
-  const guestInvite = needsInvite && isGuestWorkspace()
+  const needsInvite = selected === 'invite'
+  const missingManaged = selected === 'managed' && !managedEligible
+  const guestInvite = missingManaged && isGuestWorkspace()
+  const options: ServiceChoice[] = ['personal']
+  if (managedEligible || !account.invite_redeemable) {options.push('managed')}
+  if (account.invite_redeemable) {options.push('invite')}
   const disabled = loading || busy
   const saveDisabled = disabled ||
-    (needsInvite && !invitationCode.trim()) ||
+    missingManaged ||
+    (needsInvite && (!account.invite_redeemable || !invitationCode.trim())) ||
     (selected === 'personal' && !keyConfigured && !apiKey.trim())
 
   const changeCredentials = (changes: Partial<CredentialsDraft>) => {
@@ -158,16 +174,20 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ invitation_code: invitationCode.trim() }),
         })
-        const result = await response.json()
-        if (
-          result.user?.id !== getRuntime().user.id ||
-          result.user?.managed_eligible !== true ||
-          !validWeeklyQuota(result.quota)
-        ) {
+        const result = await response.json() as { user?: unknown; quota?: unknown } | null
+        const redeemed = parseRuntimeUser(result?.user)
+        if (!redeemed || redeemed.id !== account.id || redeemed.role !== account.role || redeemed.invite_redeemable) {
           throw new Error(t('chatProviderRedeemUnconfirmed'))
         }
         setInvitationCode('')
-        applyRedeemedQuota(result.quota)
+        applyInviteRedemption(redeemed, validWeeklyQuota(result?.quota) ? result.quota : undefined)
+        void refreshRuntime()
+        if (redeemed.permissions.chat_api) {
+          await configureChatProvider({ mode: 'managed' })
+        }
+        showToast({ key: 'chatProviderRedeemed' })
+        onClose()
+        return
       }
       await configureChatProvider({
         mode: selected,
@@ -175,13 +195,9 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
         ...(selected === 'personal' && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
       })
       showToast({
-        key: needsInvite
-          ? 'chatProviderRedeemed'
-          : selected === 'managed'
-            ? 'chatProviderManagedActive'
-            : apiKey.trim()
-              ? 'chatProviderKeySaved'
-              : 'chatProviderPersonalActive',
+        key: selected === 'managed'
+          ? 'chatProviderManagedActive'
+          : apiKey.trim() ? 'chatProviderKeySaved' : 'chatProviderPersonalActive',
       })
       onClose()
     } catch (cause) {
@@ -213,20 +229,22 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
     <label className={styles.field}>
       {t('chatProviderKeyLabel')}
       <input
-        type="password"
+        type="text"
         className={styles.keyInput}
         value={apiKey}
         disabled={fieldDisabled}
         placeholder={t(keyConfigured ? 'chatProviderKeepKey' : 'chatProviderEnterKey')}
-        autoComplete="new-password"
+        autoComplete="off"
         autoCapitalize="none"
+        autoCorrect="off"
         spellCheck={false}
         onChange={(event) => changeCredentials({ apiKey: event.target.value })}
       />
     </label>
   )
 
-  const errorMessage = saveError || (selected === mode ? error : '')
+  const issueMessage = issue && (issue === 'chatProviderManagedSetupFailed' || selected === 'personal') ? t(issue) : ''
+  const errorMessage = saveError || (selected === mode ? error : '') || issueMessage
   const submit = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     void save()
@@ -251,7 +269,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
               </Button>
             ) : null}
             {guestInvite ? (
-              <AccountLoginButton label="signInToRedeem" />
+              <AccountLoginButton />
             ) : (
               <Button type="submit" form={mainFormId} size="m" disabled={saveDisabled || advanced}>
                 {t(busy ? 'chatProviderSaving' : needsInvite ? 'chatProviderRedeem' : 'chatProviderSave')}
@@ -262,7 +280,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
       >
         <form id={mainFormId} className={styles.section} onSubmit={submit} aria-hidden={advanced || undefined}>
           <div className={styles.options} role="radiogroup" aria-label={t('chatProviderTitle')}>
-            {(['personal', 'managed'] as const).map((value) => (
+            {options.map((value) => (
               <button
                 key={value}
                 type="button"
@@ -278,7 +296,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
                 {t(
                   value === 'personal'
                     ? 'chatProviderPersonal'
-                    : managedEligible
+                    : value === 'managed'
                       ? 'chatProviderManaged'
                       : 'chatProviderInviteOption'
                 )}
@@ -286,13 +304,19 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
             ))}
           </div>
           <p className={styles.description}>
-            {t(selected === 'personal' ? 'chatProviderPersonalBilling' : 'chatProviderManagedBilling')}
+            {t(selected === 'personal'
+              ? 'chatProviderPersonalBilling'
+              : needsInvite
+                ? 'chatProviderInviteHelp'
+                : missingManaged
+                  ? guestInvite ? 'chatProviderManagedGuest' : 'chatProviderManagedUnavailable'
+                  : 'chatProviderManagedBilling')}
           </p>
           {selected === 'personal' ? (
             <>
               {keyField(disabled || advanced)}
               <p className={styles.description}>
-                {t(managedEligible ? 'chatProviderSyncKey' : 'chatProviderLocalKey')}
+                {t(account.permissions.cloud_sync ? 'chatProviderSyncKey' : 'chatProviderLocalKey')}
               </p>
               <div className={styles.actions}>
                 <a className={styles.guide} href="/deepseek-api/api-key-guide" target="_blank" rel="noopener noreferrer">
@@ -303,7 +327,8 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
                   size="m"
                   disabled={disabled || advanced}
                   aria-haspopup="dialog"
-                  onClick={() => {
+                  onClick={(event) => {
+                    advancedTrigger.current = event.currentTarget
                     setBeforeAdvanced(credentials)
                     setSaveError('')
                   }}
@@ -312,7 +337,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
                 </Button>
               </div>
             </>
-          ) : needsInvite && !guestInvite ? (
+          ) : needsInvite ? (
             <label className={styles.field}>
               {t('chatProviderInviteLabel')}
               <input
@@ -335,6 +360,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
           title={t('chatEndpointAdvanced')}
           className={styles.dialog}
           closable
+          returnFocusTo={advancedTrigger}
           onClose={closeAdvanced}
           footer={
             <div className={styles.footerActions}>

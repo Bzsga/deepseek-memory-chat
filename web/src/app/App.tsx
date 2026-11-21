@@ -18,6 +18,9 @@ import { SessionView } from '../components/session/SessionView.js'
 import { MobileHeader } from '../components/session/MobileHeader.js'
 import { Welcome } from '../components/session/Welcome.js'
 import { SettingsDialog } from '../components/settings/SettingsDialog.js'
+import { ChatProviderDialog } from '../components/settings/ChatProviderSetting.js'
+import { GuestHistoryMigration } from '../components/settings/GuestHistoryMigration.js'
+import { resumeSyncSettingsAfterSignIn } from '../components/settings/settingsDialogState.js'
 import { Toast } from '../components/base/Toast.js'
 import { showToast } from '../components/base/toastState.js'
 import { onUploadNotice } from '../services/attachments.js'
@@ -65,6 +68,7 @@ export const App = () => {
   useEffect(bindWeeklyQuotaRefresh, [])
   useEffect(bindConversationSync, [])
   useEffect(bindNativePreferences, [])
+  useEffect(resumeSyncSettingsAfterSignIn, [])
   useEffect(() => {
     const blocked = () => showToast({ key: 'storageUpgradeBlocked', type: 'error' })
     window.addEventListener('deepseek-storage-upgrade-blocked', blocked)
@@ -142,6 +146,8 @@ export const App = () => {
         <SearchPanel />
       </div>
       <SettingsDialog />
+      <ChatProviderDialog />
+      <GuestHistoryMigration />
       <Toast />
       {ready ? <PendingShareContinuation /> : null}
     </>

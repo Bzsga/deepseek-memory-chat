@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import { useUploads } from '../../services/attachments.js'
 import { loadFile } from '../../services/chat/db.js'
+import { loadMessageFile } from '../../services/chat/store.js'
 import type { FileAttachment } from '../../services/chat/types.js'
 import { IconPhotoErrorFill20, IconRefreshOutline16 } from '../base/icons.js'
 import { Tooltip } from '../base/Tooltip.js'
@@ -11,7 +12,7 @@ import { useImageActions } from './useImageActions.js'
 import styles from './MessageFile.module.css'
 
 /** 原件从 IndexedDB 读出并生成本地地址；undefined 表示加载中，null 表示原件缺失。 */
-const useFileOriginal = (id: string, retry: number) => {
+const useFileOriginal = (id: string, retry: number, sessionId?: string) => {
   const [original, setOriginal] = useState<{
     id: string
     url: string | null
@@ -21,7 +22,8 @@ const useFileOriginal = (id: string, retry: number) => {
     let objectUrl: string | null = null
     let cancelled = false
     setOriginal(null)
-    loadFile(id)
+    const read = sessionId ? loadMessageFile(sessionId, id) : loadFile(id)
+    read
       .catch(() => undefined)
       .then((blob) => {
         if (!cancelled) {
@@ -35,7 +37,7 @@ const useFileOriginal = (id: string, retry: number) => {
         URL.revokeObjectURL(objectUrl)
       }
     }
-  }, [id, retry])
+  }, [id, retry, sessionId])
   return original?.id === id ? original : undefined
 }
 
@@ -57,21 +59,27 @@ const useUploadState = (file: FileAttachment) =>
  */
 export const MessageFile = ({
   file,
+  sessionId,
+  editDisabled,
   onRetry,
 }: {
   file: FileAttachment
+  sessionId?: string
+  editDisabled?: boolean
   /** 本条消息补传失败且可重试时提供 */
   onRetry: (() => void) | null
 }) => {
   const t = useTranslate()
   const [readAttempt, setReadAttempt] = useState(0)
-  const original = useFileOriginal(file.id, readAttempt)
+  const original = useFileOriginal(file.id, readAttempt, sessionId)
   const url = original?.url
   const { handlers, overlay } = useImageActions({
     url,
     blob: original?.blob,
     name: file.name,
+    mimeType: file.mimeType,
     alt: file.name,
+    editSessionId: file.isImage && !editDisabled ? sessionId : undefined,
   })
   const [failedUrl, setFailedUrl] = useState<string | null>(null)
   const upload = useUploadState(file)

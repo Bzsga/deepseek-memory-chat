@@ -9,7 +9,8 @@ from datetime import date, datetime, timedelta
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .schemas import AccountLoginRequest, AdminConfigPatch
+from .accounts import account_invite_redeemable, account_permissions
+from .schemas import AccountLoginRequest, AccountRegistrationPolicy, AdminConfigPatch
 from .store import PROVIDER_REQUEST_USAGE_SQL, SHANGHAI, local_day, local_week, reset_at
 
 
@@ -42,10 +43,24 @@ class AccountStatusPatch(BaseModel):
     enabled: bool
 
 
+class AccountPermissions(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    chat_api: bool
+    image_api: bool
+    cloud_sync: bool
+
+
 class RegistrationInviteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     count: int = Field(default=1, ge=1, le=100)
     valid_days: int = Field(default=7, ge=1, le=365)
+    permissions: AccountPermissions | None = None
+
+    @model_validator(mode="after")
+    def valid_permissions(self):
+        if "permissions" in self.model_fields_set and self.permissions is None:
+            raise ValueError("权限设置不能为 null")
+        return self
 
 
 def _hash(value):
@@ -196,7 +211,8 @@ def _users(store, limit, offset):
         settings = store._settings(db)
         total = int(db.execute("SELECT COUNT(*) FROM registered_accounts").fetchone()[0])
         rows = db.execute(f"""WITH provider_request_usage AS ({PROVIDER_REQUEST_USAGE_SQL}), page AS (
-                SELECT u.id,u.access_mode,a.created_at,u.last_seen,a.username,a.registration_kind,a.weekly_limit_override,a.disabled,a.managed_eligible,a.role
+                SELECT u.id,u.access_mode,a.created_at,u.last_seen,a.username,a.registration_kind,
+                    a.weekly_limit_override,a.disabled,a.managed_eligible,a.chat_api,a.image_api,a.cloud_sync,a.self_service_cloud,a.role
                 FROM registered_accounts AS a JOIN users AS u ON u.id=a.user_id
                 ORDER BY a.created_at DESC,u.id LIMIT ? OFFSET ?
             ), request_totals AS (
@@ -211,7 +227,8 @@ def _users(store, limit, offset):
                     SUM(status='uncertain') AS uncertain,SUM(status='cancelled') AS cancelled
                 FROM jobs WHERE owner_id IN (SELECT id FROM page) GROUP BY owner_id
             ) SELECT page.id,page.access_mode,page.created_at,page.last_seen,
-                page.username,page.registration_kind,page.weekly_limit_override,page.disabled,page.managed_eligible,page.role,
+                page.username,page.registration_kind,page.weekly_limit_override,page.disabled,page.managed_eligible,
+                page.chat_api,page.image_api,page.cloud_sync,page.self_service_cloud,page.role,
                 COALESCE(request_totals.weekly_used,0) AS weekly_used,
                 COALESCE(job_totals.weekly_reserved,0) AS weekly_reserved,
                 COALESCE(request_totals.total_requests,0) AS total_requests,
@@ -229,6 +246,7 @@ def _users(store, limit, offset):
             (limit, offset, week, reset_at(now)[:10])).fetchall()
         for row in rows:
             quota = store.weekly_quota(db, row["id"], settings=settings, timestamp=now)
+            permissions = account_permissions(row)
             counts = {field: int(row[field]) for field in ("weekly_used", "weekly_reserved", "total_requests",
                       "usage_known_requests", "usage_unknown_requests",
                       "completed", "failed", "uncertain", "cancelled", "input_tokens", "output_tokens")}
@@ -238,7 +256,9 @@ def _users(store, limit, offset):
             calls_by_kind["organize"] = counts["total_requests"] - sum(calls_by_kind.values())
             users.append({"id": row["id"],
                           "username": row["username"], "role": row["role"], "registration_kind": row["registration_kind"],
-                          "enabled": not bool(row["disabled"]), "managed_eligible": bool(row["managed_eligible"]),
+                          "enabled": not bool(row["disabled"]), "managed_eligible": permissions["chat_api"],
+                          "permissions": permissions, "effective_permissions": quota["permissions"],
+                          "invite_redeemable": account_invite_redeemable(row),
                           "weekly_limit_override": row["weekly_limit_override"],
                           "access_mode": "public" if settings.public_enabled or row["access_mode"] == "public" else "invitation",
                           "created_at": _iso(row["created_at"]),
@@ -313,6 +333,26 @@ def build_admin_router(store):
     def update_config(body: AdminConfigPatch):
         return store.update_config(body.model_dump(exclude_unset=True))
 
+    @router.get("/account-feature-access", dependencies=[Depends(require_admin)])
+    def get_account_feature_access():
+        return store.get_open_permissions()
+
+    @router.patch("/account-feature-access", dependencies=[Depends(require_admin)])
+    def set_account_feature_access(body: AccountPermissions, request: Request):
+        require_admin_origin(request)
+        return store.set_open_permissions(body.model_dump())
+
+    @router.get("/registration-policy", dependencies=[Depends(require_admin)])
+    def get_registration_policy(response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return store.accounts.registration_policy()
+
+    @router.patch("/registration-policy", dependencies=[Depends(require_admin)])
+    def set_registration_policy(body: AccountRegistrationPolicy, request: Request, response: Response):
+        require_admin_origin(request)
+        response.headers["Cache-Control"] = "no-store"
+        return store.accounts.set_registration_policy(body.self_service)
+
     @router.get("/storage", dependencies=[Depends(require_admin)])
     def storage():
         from .storage_capacity import capacity_report
@@ -334,6 +374,10 @@ def build_admin_router(store):
     def update_user_status(user_id: str, body: AccountStatusPatch):
         return store.accounts.set_enabled(user_id, body.enabled)
 
+    @router.patch("/users/{user_id}/permissions", dependencies=[Depends(require_admin)])
+    def update_user_permissions(user_id: str, body: AccountPermissions):
+        return store.accounts.set_permissions(user_id, body.model_dump())
+
     @router.post("/users/{user_id}/revoke-managed", dependencies=[Depends(require_admin)])
     def revoke_managed(user_id: str):
         return store.accounts.revoke_managed(user_id)
@@ -348,6 +392,7 @@ def build_admin_router(store):
 
     @router.post("/registration-invites", dependencies=[Depends(require_admin)])
     def create_registration_invites(body: RegistrationInviteRequest):
-        return store.accounts.create_invites(body.count, body.valid_days)
+        permissions = body.permissions.model_dump() if body.permissions is not None else None
+        return store.accounts.create_invites(body.count, body.valid_days, permissions=permissions)
 
     return router

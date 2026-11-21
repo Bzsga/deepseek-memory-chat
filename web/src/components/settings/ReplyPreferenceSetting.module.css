@@ -1,0 +1,98 @@
+.details {
+  min-width: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+}
+
+.disclosure {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.disclosure::-webkit-details-marker {
+  display: none;
+}
+
+.disclosure:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: -2px;
+}
+
+.disclosureLabels {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-width: 0;
+  gap: 0 6px;
+}
+
+.disclosureState {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.disclosureAction {
+  flex-shrink: 0;
+  color: var(--dsw-alias-brand-text);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.details[open] > .disclosure .openCue,
+.details:not([open]) > .disclosure .closeCue {
+  display: none;
+}
+
+.disclosureBody {
+  display: grid;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.details:not([open]) > .disclosureBody {
+  display: none;
+}
+
+.group {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 4px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.groupTitle {
+  padding: 0;
+  margin-bottom: 4px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.compactRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(90px, 36%);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.compactRow .compactSelect {
+  min-height: 36px;
+  padding: 6px 8px;
+}

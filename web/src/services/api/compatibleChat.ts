@@ -112,7 +112,7 @@ export async function* streamCompatibleChat(
         ? '兼容服务未返回 SSE 数据流。'
         : `兼容聊天服务请求失败（HTTP ${response.status}）。`,
       response.status,
-      'personal_http'
+      response.status === 401 || response.status === 403 ? 'personal_auth' : 'personal_http'
     )
   }
   let started = false,

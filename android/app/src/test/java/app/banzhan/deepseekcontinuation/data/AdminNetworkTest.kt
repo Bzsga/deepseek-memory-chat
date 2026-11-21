@@ -1,7 +1,9 @@
 package app.banzhan.deepseekcontinuation.data
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
+import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -91,6 +93,82 @@ class AdminNetworkTest {
         assertThrows(Exception::class.java) {
             AdminNetwork.parseAdminUsers(usersPayload().replace("\"limit\":50", "\"limit\":0"))
         }
+    }
+
+    @Test
+    fun administratorPermissionsAreExplicitAndLegacyEligibilityStillParses() {
+        val permissions = ServicePermissions(chatApi = false, imageApi = true, cloudSync = false)
+        val encoded = permissions.toWireJson()
+        assertEquals(mapOf("chat_api" to JsonPrimitive(false), "image_api" to JsonPrimitive(true),
+            "cloud_sync" to JsonPrimitive(false)), encoded.toMap())
+        assertEquals(encoded, json(AdminNetwork.registrationInvitePayload(1, 7, permissions))["permissions"])
+        val payload = usersPayload().replace("\"last_seen_at\":null", "\"last_seen_at\":null,\"permissions\":$encoded")
+        assertEquals(permissions, AdminNetwork.parseAdminUsers(payload).users.single().servicePermissions)
+        assertEquals(ServicePermissions.All, AdminNetwork.parseAdminUsers(usersPayload().replace(
+            "\"last_seen_at\":null", "\"last_seen_at\":null,\"managed_eligible\":true"
+        )).users.single().servicePermissions)
+        val invite = """{"id":"invite-id","expires_at":"2026-11-21T00:00:00+08:00"}"""
+        assertEquals(ServicePermissions.All, AdminNetwork.parseRegistrationInvites("""{"invitations":[$invite]}""").single().permissions)
+        assertEquals(permissions, AdminNetwork.parseRegistrationInvites(
+            """{"invitations":[${invite.dropLast(1)},"permissions":$encoded}]}"""
+        ).single().permissions)
+    }
+
+    @Test
+    fun globalPermissionsUseFlatStrictBooleanFields() {
+        val permissions = ServicePermissions(chatApi = false, imageApi = true, cloudSync = false)
+        val valid = permissions.toWireJson().toString()
+        assertEquals(permissions, AdminNetwork.parseOpenPermissions(valid))
+        val invalid = listOf(
+            """{"chat_api":false,"image_api":"true","cloud_sync":false}""",
+            """{"chat_api":false,"image_api":1,"cloud_sync":false}""",
+            """{"chat_api":false,"image_api":true,"cloud_sync":null}""",
+            """{"chat_api":false,"image_api":true}""",
+            """{"chat_api":false,"image_api":true,"cloud_sync":false,"extra":true}""",
+            """{"permissions":$valid}""",
+        )
+        invalid.forEach { payload ->
+            assertThrows(IllegalArgumentException::class.java) { AdminNetwork.parseOpenPermissions(payload) }
+        }
+    }
+
+    @Test
+    fun globalPermissionsPatchUsesTheHttpsOriginWithoutEndpointPath() {
+        val permissions = ServicePermissions(chatApi = true, imageApi = false, cloudSync = true)
+        val token = "synthetic-admin-token"
+        val prefs = DeveloperPrefs(serviceUrl = "https://admin.example:8443/deepseek-api/v1/", sessionToken = token)
+        val request = AdminNetwork.openPermissionsPatchRequest(prefs, permissions)
+        assertEquals("PATCH", request.method)
+        assertEquals("https://admin.example:8443/deepseek-api/v1/admin/account-feature-access", request.url.toString())
+        assertEquals("https://admin.example:8443", request.header("Origin"))
+        assertEquals("Bearer $token", request.header("Authorization"))
+        val body = Buffer()
+        assertTrue(request.body!!.isOneShot())
+        request.body!!.writeTo(body)
+        assertEquals(permissions.toWireJson(), json(body.readUtf8()))
+
+        val official = AdminNetwork.openPermissionsPatchRequest(
+            prefs.copy(serviceUrl = "https://digimonlegend.com:443/deepseek-api"), permissions,
+        )
+        assertEquals("https://digimonlegend.com", official.header("Origin"))
+        assertEquals("/deepseek-api/v1/admin/account-feature-access", official.url.encodedPath)
+        assertThrows(IllegalArgumentException::class.java) {
+            AdminNetwork.openPermissionsPatchRequest(prefs.copy(serviceUrl = "http://admin.example"), permissions)
+        }
+    }
+
+    @Test
+    fun registrationPolicyPatchKeepsTheAdminOriginAndWritesOnlyItsFlag() {
+        val prefs = DeveloperPrefs(serviceUrl = "https://admin.example:8443/deepseek-api", sessionToken = "synthetic-admin-token")
+        val request = AdminNetwork.registrationPolicyPatchRequest(prefs, false)
+        assertEquals("PATCH", request.method)
+        assertEquals("/deepseek-api/v1/admin/registration-policy", request.url.encodedPath)
+        assertEquals("https://admin.example:8443", request.header("Origin"))
+        assertEquals("Bearer synthetic-admin-token", request.header("Authorization"))
+        val body = Buffer()
+        assertTrue(request.body!!.isOneShot())
+        request.body!!.writeTo(body)
+        assertEquals("""{"self_service":false}""", body.readUtf8())
     }
 
     @Test

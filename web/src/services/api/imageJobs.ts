@@ -137,20 +137,33 @@ const exchange = async <T>(
 export const createImageJob = (
   clientRequestId: string,
   prompt: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  sources?: readonly File[]
 ): Promise<ImageJob> => {
   identifier(clientRequestId)
-  return exchange(
-    base,
-    {
+  let submission: RequestInit
+  if (sources) {
+    if (sources.length === 0) {throw new Error('请至少选择一张参考图。')}
+    const form = new FormData()
+    form.set('client_request_id', clientRequestId)
+    form.set('prompt', prompt)
+    for (const source of sources) {form.append('image', source)}
+    // Fetch keepalive rejects upload bodies above its small shared limit.
+    submission = { method: 'POST', body: form }
+  } else {
+    submission = {
       method: 'POST',
       keepalive: true,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_request_id: clientRequestId, prompt }),
-    },
+    }
+  }
+  return exchange(
+    base,
+    submission,
     signal,
     32768,
-    20000,
+    sources ? 180000 : 20000,
     (value) => metadata(value, clientRequestId)
   )
 }

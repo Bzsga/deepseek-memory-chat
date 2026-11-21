@@ -1,6 +1,6 @@
 # 构建与测试
 
-Android、网页和后端独立构建。Android 通过 HTTPS 加载已部署的聊天网页，不把 `web/dist` 打包进 APK。当前 Android 源码为 2.6.2 / versionCode 40，网页与后端为 2.6.0。官网分发状态以[更新清单](https://digimonlegend.com/continuation-updates/latest.json)为准。
+Android、网页和后端独立构建。Android 通过 HTTPS 加载已部署的聊天网页，不把 `web/dist` 打包进 APK。当前 Android 源码为 2.6.12 / versionCode 50，网页与后端为 2.6.0。官网分发状态以[更新清单](https://digimonlegend.com/continuation-updates/latest.json)为准。
 
 ## 网页
 

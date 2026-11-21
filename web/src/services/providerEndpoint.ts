@@ -53,8 +53,11 @@ export async function fetchProviderModels(
   if (!response.ok) {
     throw new Error(`获取模型列表失败（HTTP ${response.status}）。`)
   }
-  const payload = await response.json()
-  if (!Array.isArray(payload?.data)) {
+  return readProviderModels(await response.json())
+}
+
+export function readProviderModels(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object' || !('data' in payload) || !Array.isArray(payload.data)) {
     throw new Error('服务未返回兼容的模型列表。')
   }
   const ids = new Set<string>()

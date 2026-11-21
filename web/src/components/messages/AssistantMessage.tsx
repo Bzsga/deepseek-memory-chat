@@ -2,8 +2,8 @@ import { useActiveImageProvider } from '../../services/imageProvider.js'
 import { GeneratedImage } from './GeneratedImage.js'
 import { useTranslate } from '../../i18n/index.js'
 import clsx from 'clsx'
-import { memo } from 'react'
-import { IconRefreshOutline16, IconWarningOutline16, IconShareOutline16 } from '../base/icons.js'
+import { memo, useState } from 'react'
+import { IconBranchOutline16, IconRefreshOutline16, IconWarningOutline16, IconShareOutline16 } from '../base/icons.js'
 import { describeReply } from '../../services/chat/describe.js'
 import { canContinueReply, recoverableImagePrompts } from '../../services/chat/reply.js'
 import {
@@ -24,6 +24,8 @@ import { SiteThumbnails } from '../search/SiteLogo.js'
 import { toggleSearchPanel, useSearchPanel } from '../search/searchPanelState.js'
 import { ReadAloudButton } from './ReadAloudButton.js'
 import { CopyButton } from './CopyButton.js'
+import { showConversationShareControls } from '../session/conversationShareVisibility.js'
+import { ensureApiKey } from '../settings/settingsDialogState.js'
 import { ReplyArea } from './ReplyArea.js'
 import { useReplyView } from './useReplyView.js'
 import {
@@ -40,8 +42,9 @@ export const AssistantMessage = memo(function AssistantMessage({
   streaming,
   busy,
   versions,
+  onBranch,
   onShare,
-  shareDisabled,
+  actionsDisabled,
   onSelectVersion,
 }: {
   sessionId: string
@@ -50,11 +53,13 @@ export const AssistantMessage = memo(function AssistantMessage({
   streaming: boolean
   busy: boolean
   versions: MessageVersions
+  onBranch: (messageId: string) => Promise<void>
   onShare: (messageId: string) => void
-  shareDisabled: boolean
+  actionsDisabled: boolean
   onSelectVersion: SelectMessageVersion
 }) {
   const t = useTranslate()
+  const [branching, setBranching] = useState(false)
   const imageProvider = useActiveImageProvider()
   const view = useReplyView(message, streaming)
   const panelEntry = useSearchPanel((state) => state.entry)
@@ -101,7 +106,9 @@ export const AssistantMessage = memo(function AssistantMessage({
       {refused
         ? null
         : message.blocks.map((block) =>
-            block.type === 'image' ? <GeneratedImage key={block.id} image={block} /> : null
+            block.type === 'image' ? (
+              <GeneratedImage key={block.id} image={block} editSessionId={busy ? undefined : sessionId} />
+            ) : null
           )}
       {describedCount > 0 && (
         <Button type="button" variant="outlined" size="s" disabled={busy} onClick={() => drawFromReplyDescriptions(sessionId, message.id)}>
@@ -172,10 +179,25 @@ export const AssistantMessage = memo(function AssistantMessage({
             ) : null}
             {message.status === 'done' ? (
               <IconButton
+                icon={<IconBranchOutline16 />}
+                tooltip={t('branchToNewChat')}
+                tooltipPlacement="bottom"
+                disabled={busy || actionsDisabled || branching}
+                onClick={() => {
+                  setBranching(true)
+                  stopReadAloud()
+                  void onBranch(message.id)
+                    .catch(() => showToast({ key: 'branchChatFailed', type: 'error' }))
+                    .finally(() => setBranching(false))
+                }}
+              />
+            ) : null}
+            {showConversationShareControls && message.status === 'done' ? (
+              <IconButton
                 icon={<IconShareOutline16 />}
                 tooltip={t('conversationShareSystemShare')}
                 tooltipPlacement="bottom"
-                disabled={busy || shareDisabled}
+                disabled={busy || actionsDisabled}
                 onClick={() => onShare(message.id)}
               />
             ) : null}
@@ -186,6 +208,9 @@ export const AssistantMessage = memo(function AssistantMessage({
                 tooltipPlacement="bottom"
                 disabled={busy || refused || (message.imageGeneration === true && !imageProvider)}
                 onClick={() => {
+                  if (!message.imageGeneration && !ensureApiKey()) {
+                    return
+                  }
                   stopReadAloud()
                   regenerateReply(sessionId, message.id)
                 }}
@@ -199,6 +224,9 @@ export const AssistantMessage = memo(function AssistantMessage({
               className={styles.continueButton}
               disabled={busy}
               onClick={() => {
+                if (!ensureApiKey()) {
+                  return
+                }
                 stopReadAloud()
                 continueReply(sessionId, message.id)
               }}

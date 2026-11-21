@@ -1,50 +1,23 @@
-import { updateManagedEligibility } from './chatProvider.js'
 import { create } from 'zustand'
 import {
-  fetchRuntime,
   getRuntime,
-  invalidateSession,
+  initializeRuntime,
   isGuestWorkspace,
-  LoginRequired,
+  refreshRuntime,
+  subscribeRuntimeUser,
+  type RuntimeUser,
   type WeeklyQuota,
 } from './runtime.js'
 
 export const useWeeklyQuota = create<{ quota?: WeeklyQuota }>(() => ({
   quota: getRuntime().weekly_quota,
 }))
-// An older refresh must not undo a completed redemption.
-let revision = 0
-export const applyRedeemedQuota = (quota: WeeklyQuota) => {
-  revision++
-  updateManagedEligibility(true)
-  useWeeklyQuota.setState({ quota })
+subscribeRuntimeUser(() => useWeeklyQuota.setState({ quota: getRuntime().weekly_quota }))
+export const applyInviteRedemption = (user: RuntimeUser, quota?: WeeklyQuota) => {
+  initializeRuntime({ ...getRuntime(), user, weekly_quota: quota })
 }
-let pending: Promise<void> | undefined
-export const refreshWeeklyQuota = (): Promise<void> => {
-  if (isGuestWorkspace()) {return Promise.resolve()}
-  if (pending) {
-    return pending
-  }
-  const started = revision
-  pending = fetchRuntime()
-    .then((fresh) => {
-      if (fresh.user.id !== getRuntime().user.id) {
-        invalidateSession('changed')
-      } else if (started === revision) {
-        updateManagedEligibility(fresh.user.managed_eligible)
-        useWeeklyQuota.setState({ quota: fresh.weekly_quota })
-      }
-    })
-    .catch((error: unknown) => {
-      if (error instanceof LoginRequired) {
-        invalidateSession('login')
-      }
-    })
-    .finally(() => {
-      pending = undefined
-    })
-  return pending
-}
+export const refreshWeeklyQuota = (): Promise<void> =>
+  isGuestWorkspace() ? Promise.resolve() : refreshRuntime()
 export const bindWeeklyQuotaRefresh = () => {
   if (isGuestWorkspace()) {return}
   let timer: ReturnType<typeof setTimeout> | undefined

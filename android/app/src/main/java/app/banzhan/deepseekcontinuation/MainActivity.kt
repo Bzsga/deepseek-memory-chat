@@ -1,11 +1,14 @@
 package app.banzhan.deepseekcontinuation
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import app.banzhan.deepseekcontinuation.data.AppController
@@ -32,23 +35,33 @@ class MainActivity : ComponentActivity() {
                 .distinctUntilChanged().collect { (mode, url, token) -> DiagnosticLog.bindAnonymousIdentity(mode, url, token) }
         }
         enableEdgeToEdge()
-        setContent {
-            ContinuationApp(
-                controller = controller,
-                incomingImport = incomingImports.pending,
-                onIncomingImportConfirmed = { incomingImports.confirm(it, controller) },
-                onIncomingImportConsumed = incomingImports::consume,
-                onShareLinkReceived = { text ->
-                    val previousId = incomingImports.pending?.id
-                    val error = incomingImports.receiveShare(text)
-                    showReceiveError(error)
-                    val pending = incomingImports.pending
-                    if (error == null && previousId == null && pending != null) {
-                        incomingImports.confirm(pending.id, controller)
-                    }
-                },
-            )
+        val webViewMajor = WebView.getCurrentWebViewPackage()?.versionName?.substringBefore('.')?.toIntOrNull() ?: 0
+        // WebView 140 can handle IME overlap through its visual viewport on Android 11+.
+        val webViewHandlesIme = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && webViewMajor >= 140
+        val root = ComposeView(this).apply {
+            // Let insets pass through Compose to the embedded WebView on this path.
+            consumeWindowInsets = !webViewHandlesIme
+            setContent {
+                ContinuationApp(
+                    controller = controller,
+                    incomingImport = incomingImports.pending,
+                    onIncomingImportConfirmed = { incomingImports.confirm(it, controller) },
+                    onIncomingImportConsumed = incomingImports::consume,
+                    onShareLinkReceived = { text ->
+                        val previousId = incomingImports.pending?.id
+                        val error = incomingImports.receiveShare(text)
+                        showReceiveError(error)
+                        val pending = incomingImports.pending
+                        if (error == null && previousId == null && pending != null) {
+                            incomingImports.confirm(pending.id, controller)
+                        }
+                    },
+                    webViewMajor = webViewMajor,
+                    webViewHandlesIme = webViewHandlesIme,
+                )
+            }
         }
+        setContentView(root)
     }
 
     override fun onNewIntent(intent: Intent) {

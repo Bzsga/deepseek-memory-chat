@@ -8,7 +8,8 @@ Android 主工程位于 `android/`，React 聊天界面位于 `web/`，统一 Fa
 
 | 方法与路径 | 输入或结果 |
 | --- | --- |
-| `POST /v1/accounts/register` | 用户名和密码 |
+| `GET /v1/accounts/registration` | 公开查询 `{self_service}` |
+| `POST /v1/accounts/register` | `{username,password,invitation_code?}`，邀请码是否必填取决于注册策略 |
 | `POST /v1/accounts/redeem-invite` | 登录后提交 `{invitation_code}`，返回 `{user,quota}` |
 | `POST /v1/accounts/login` | 用户名和密码 |
 | `GET /v1/accounts/me` | 当前用户及额度 |
@@ -17,7 +18,7 @@ Android 主工程位于 `android/`，React 聊天界面位于 `web/`，统一 Fa
 
 注册与登录返回 `{token, expires_at, user, quota}`。用户名为 3–32 个字母、数字、下划线或短横线，按 NFKC 规范化并忽略大小写比较。密码长度为 8–128，保留输入空白。登录会话有效期为 30 天。
 
-注册无总人数上限。新账号默认使用个人 Key。登录后可在 API 设置中兑换邀请码，每个有效码限用一次。账号及额度中的 `managed_eligible` 表示当前免费资格。
+自助注册获得基础云同步资格，用户自行启用同步。填写邀请码时，校验及消耗邀请码与创建账号在同一个事务内完成。已注册且符合条件的用户可兑换一次性邀请码。账号及额度中的 `permissions` 分别返回配套聊天、生图和云同步的生效授权，`managed_eligible` 是配套聊天权限的兼容字段。
 
 Android 使用 `Authorization: Bearer <token>`。内嵌聊天使用同一账号 token 对应的 `deepseek_session` Cookie，属性为 Secure、HttpOnly、SameSite=Strict，Path 为 `/deepseek-api`。App 通过原生账号页面管理登录，浏览器使用 `/chat/login`、`/chat/register` 和 `/chat/logout`。
 
@@ -69,6 +70,7 @@ Android 使用 `Authorization: Bearer <token>`。内嵌聊天使用同一账号 
 | `POST /login` | 管理员账号和密码登录 |
 | `POST /session` | 通过同源管理员账号 Cookie 建立管理会话 |
 | `GET /config`、`PATCH /config` | 服务开关和默认周额度 |
+| `GET /account-feature-access`、`PATCH /account-feature-access` | 读取或保存对所有登录账号开放的配套聊天、配套生图和云同步权限 |
 | `GET /stats` | 全站与分类调用统计 |
 | `GET /users` | 注册用户、个人周额度和调用情况 |
 | `PATCH /users/{user_id}/quota` | 设置个人周额度或本周剩余 |
