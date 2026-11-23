@@ -119,6 +119,11 @@ const SettingsContent = () => {
     hasSeparateOrganizationSettings
   )
   const [managingShares, setManagingShares] = useState(false)
+  // Older Android WebViews pass only the first accept type to the system picker.
+  // Leave that picker unfiltered and validate the selected archive in the importer.
+  const archiveFileTypes = native === 'web'
+    ? '.zip,.json,application/zip,application/x-zip-compressed,application/json'
+    : undefined
   const historyImport = useHistoryImport()
   const historyDelete = useHistoryDelete()
   const replacingHistory = useChatStore((state) => state.importingHistory)
@@ -211,8 +216,8 @@ const SettingsContent = () => {
                   <GuestHistoryCopyEntry />
                 </>
               )}
-              <ImportHistory mode="append" historyImport={historyImport} disabled={historyBusy} />
-              <ImportHistory mode="restore" historyImport={historyImport} disabled={historyBusy} />
+              <ImportHistory mode="append" accept={archiveFileTypes} historyImport={historyImport} disabled={historyBusy} />
+              <ImportHistory mode="restore" accept={archiveFileTypes} historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
               <TechnicalDiagnosticsSetting />
               {showConversationShareControls ? (
@@ -898,10 +903,12 @@ const useHistoryImport = () => {
 
 const ImportHistory = ({
   mode,
+  accept,
   historyImport,
   disabled,
 }: {
   mode: ImportMode
+  accept: string | undefined
   historyImport: ReturnType<typeof useHistoryImport>
   disabled: boolean
 }) => {
@@ -932,7 +939,7 @@ const ImportHistory = ({
             <input
               ref={inputRef}
               type="file"
-              accept=".zip,.json,application/zip,application/x-zip-compressed,application/json"
+              accept={accept}
               hidden
               onChange={(event) => {
                 const file = event.target.files?.[0]
