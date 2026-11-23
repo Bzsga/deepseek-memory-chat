@@ -101,10 +101,13 @@ export class ServerSentEventDecoder {
 /**
  * 逐个产出字节流中的 SSE 事件；流读完即结束。
  * 中止或调用方提前退出时取消读取以释放连接，不依赖底层网络把中止传到响应体。
+ * onReadFailure 只处理未主动中止的响应体读取失败。
  */
 export async function* readServerSentEvents(
   stream: ReadableStream<Uint8Array>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onReadFailure?: (error: unknown) => never,
+  onBytes?: () => void
 ): AsyncGenerator<ServerSentEvent> {
   const reader = stream.getReader()
   const onAbort = () => {
@@ -117,13 +120,23 @@ export async function* readServerSentEvents(
   let finished = false
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      let read: ReadableStreamReadResult<Uint8Array>
+      try {
+        read = await reader.read()
+      } catch (error) {
+        if (!signal?.aborted && onReadFailure) {
+          onReadFailure(error)
+        }
+        throw error
+      }
+      const { done, value } = read
       if (done) {
         finished = true
         yield* decoder.push(textDecoder.decode())
         yield* decoder.end()
         return
       }
+      if (value.byteLength) {onBytes?.()}
       yield* decoder.push(textDecoder.decode(value, { stream: true }))
     }
   } finally {

@@ -17,6 +17,10 @@ import type { Message } from '../../services/chat/types.js'
 import { useTranslate } from '../../i18n/index.js'
 import { useChatStore } from '../../services/chat/store.js'
 import { registerScrollCapture } from '../../services/scrollCapture.js'
+import { readReadingPosition, readingPositionRevision, saveReadingPosition, type ReadingPosition } from '../../services/chat/readingPosition.js'
+import { useSettings } from '../../services/settings.js'
+import { consumeChatLocation, revealMessageBranch, useChatLocation } from '../../services/chat/chatLocation.js'
+import { showToast } from '../base/toastState.js'
 
 /**
  * 会话共用可重试的附件上传失败入口，覆盖当前提问与历史消息中的附件。
@@ -39,6 +43,22 @@ const STICKY_THRESHOLD = 40
 const EMPTY_VERSIONS: MessageVersions = { ids: [], index: -1 }
 const MESSAGE_PAGE_SIZE = 80
 
+type MessageLocation = { messageId: string; offset?: number; save?: boolean; highlight?: boolean }
+
+const firstReadableMessage = (nodes: NodeListOf<HTMLElement>, top: number): HTMLElement | undefined => {
+  let start = 0
+  let end = nodes.length
+  while (start < end) {
+    const middle = Math.floor((start + end) / 2)
+    if (nodes[middle].getBoundingClientRect().bottom <= top) {
+      start = middle + 1
+    } else {
+      end = middle
+    }
+  }
+  return nodes[start]
+}
+
 export const MessageList = ({
   session,
   streaming,
@@ -49,6 +69,7 @@ export const MessageList = ({
   footer: React.ReactNode
 }) => {
   const t = useTranslate()
+  const chinese = useSettings((state) => state.locale === 'zh-CN')
   const isMobile = useIsMobile()
   const mobileRef = useRef(isMobile)
   mobileRef.current = isMobile
@@ -59,14 +80,21 @@ export const MessageList = ({
   const captureActiveRef = useRef(false)
   const restoreScrollRef = useRef<{ messageId: string; top: number } | null>(null)
   const prependAnchorRef = useRef<{ messageId: string; top: number } | null>(null)
-  const locateRef = useRef<string | null>(null)
+  const locateRef = useRef<MessageLocation | null>(null)
+  const highlightRef = useRef<{ node: HTMLElement; timer: ReturnType<typeof setTimeout> }>()
+  const readingNodesRef = useRef<NodeListOf<HTMLElement>>()
+  const displayedBranchRef = useRef<string>()
+  const pendingReadingRef = useRef<{ branch: string; position: ReadingPosition | null; revision: number } | null>(null)
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout>>()
+  const [showLatest, setShowLatest] = useState(false)
   const [shareReplyId, setShareReplyId] = useState<string | null>(null)
   const onBranch = useCallback((replyId: string) => branchToNewChat(
     session.id, replyId, t('branchChatTitle', { title: session.title || t('untitledChat') })
   ), [session.id, session.title, t])
   const importing = useChatStore(state => state.importingHistory)
   const [visibleCount, setVisibleCount] = useState(MESSAGE_PAGE_SIZE)
-  const messages = getVisibleMessages(session)
+  const messages = useMemo(() => getVisibleMessages(session), [session])
+  const requestedLocation = useChatLocation((state) => state.target?.sessionId === session.id ? state.target : null)
   const startIndex = Math.max(0, messages.length - visibleCount)
   const visibleMessages = messages.slice(startIndex)
   const [previousVersions, setPreviousVersions] = useState(() =>
@@ -79,6 +107,14 @@ export const MessageList = ({
   if (versions !== previousVersions) {
     setPreviousVersions(versions)
   }
+  const branchKey = useMemo(() => {
+    // The first version keeps its key when a sibling is added or the conversation grows.
+    let branch = messages[0]?.id
+    for (const message of messages) {
+      if ((versions.get(message.id)?.index ?? 0) > 0) {branch = message.id}
+    }
+    return JSON.stringify([session.id, branch])
+  }, [messages, session.id, versions])
   const lastMessageId = messages.at(-1)?.id
   const getScroller = useCallback(
     () =>
@@ -92,6 +128,90 @@ export const MessageList = ({
       scrollTopRef.current = el.scrollTop
     }
   }, [getScroller])
+  const getReadingTop = useCallback(() => mobileRef.current
+    ? contentRef.current?.parentElement?.parentElement?.parentElement?.querySelector('header')?.getBoundingClientRect().bottom ?? 0
+    : getScroller()?.getBoundingClientRect().top ?? 0, [getScroller])
+
+  const flushReadingPosition = useCallback(() => {
+    clearTimeout(saveTimerRef.current)
+    const pending = pendingReadingRef.current
+    pendingReadingRef.current = null
+    if (pending?.revision === readingPositionRevision()) {saveReadingPosition(pending.branch, pending.position)}
+  }, [])
+
+  const queueReadingPosition = useCallback((position: ReadingPosition | null) => {
+    if (pendingReadingRef.current && pendingReadingRef.current.branch !== branchKey) {
+      flushReadingPosition()
+    }
+    pendingReadingRef.current = { branch: branchKey, position, revision: readingPositionRevision() }
+    clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(flushReadingPosition, 180)
+  }, [branchKey, flushReadingPosition])
+
+  useLayoutEffect(() => {
+    window.addEventListener('pagehide', flushReadingPosition)
+    return () => {
+      window.removeEventListener('pagehide', flushReadingPosition)
+      flushReadingPosition()
+    }
+  }, [flushReadingPosition])
+
+  const clearHighlight = useCallback(() => {
+    const highlight = highlightRef.current
+    if (!highlight) {return}
+    clearTimeout(highlight.timer)
+    highlight.node.removeAttribute('data-chat-located')
+    highlightRef.current = undefined
+  }, [])
+  useEffect(() => clearHighlight, [clearHighlight])
+
+  const applyLocation = useCallback((location: MessageLocation) => {
+    const scroll = getScroller()
+    const element = contentRef.current?.querySelector<HTMLElement>(`[data-chat-message="${CSS.escape(location.messageId)}"]`)
+    if (!scroll || !element || captureActiveRef.current) {return false}
+    stickyRef.current = false
+    if (location.offset === undefined) {
+      element.scrollIntoView({ block: 'center' })
+    } else {
+      scroll.scrollTop += element.getBoundingClientRect().top - (getReadingTop() + location.offset)
+    }
+    scrollTopRef.current = scroll.scrollTop
+    const nearBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < STICKY_THRESHOLD
+    stickyRef.current = nearBottom
+    setShowLatest(!nearBottom)
+    if (location.highlight) {
+      clearHighlight()
+      element.setAttribute('data-chat-located', '')
+      highlightRef.current = { node: element, timer: setTimeout(clearHighlight, 2600) }
+    }
+    if (location.save) {
+      queueReadingPosition(nearBottom ? null : {
+        messageId: location.messageId,
+        offset: element.getBoundingClientRect().top - getReadingTop(),
+      })
+    }
+    return true
+  }, [clearHighlight, getReadingTop, getScroller, queueReadingPosition])
+
+  const findLocation = useCallback((location: MessageLocation) => {
+    const index = messages.findIndex((message) => message.id === location.messageId)
+    if (index < 0) {return false}
+    locateRef.current = null
+    if (!applyLocation(location)) {
+      stickyRef.current = false
+      locateRef.current = location
+      setVisibleCount((count) => Math.max(count, messages.length - index))
+    }
+    return true
+  }, [applyLocation, messages])
+
+  const goToLatest = () => {
+    locateRef.current = null
+    stickyRef.current = true
+    setShowLatest(false)
+    queueReadingPosition(null)
+    scrollToBottom()
+  }
 
   useLayoutEffect(() => {
     if (!isMobile) {
@@ -106,17 +226,14 @@ export const MessageList = ({
   }, [isMobile, session.id])
 
   useLayoutEffect(() => {
-    if (!isMobile) {
-      return
-    }
     const view = contentRef.current?.parentElement?.parentElement?.parentElement
     const header = view?.querySelector('header')
     const input = contentRef.current?.parentElement?.nextElementSibling
-    if (!view || !header || !input) {
+    if (!view || !input) {
       return
     }
     const measure = () => {
-      const headerHeight = header.getBoundingClientRect().height
+      const headerHeight = header?.getBoundingClientRect().height ?? 0
       const inputHeight = input.getBoundingClientRect().height
       if (headerHeight > 0 && Number.isFinite(headerHeight)) {
         view.style.setProperty('--chat-header-height', `${headerHeight}px`)
@@ -127,7 +244,7 @@ export const MessageList = ({
     }
     const observer = new ResizeObserver(measure)
     // The reserved height includes padding, including changes to the mobile safe area.
-    observer.observe(header, { box: 'border-box' })
+    if (header) {observer.observe(header, { box: 'border-box' })}
     observer.observe(input, { box: 'border-box' })
     measure()
     return () => observer.disconnect()
@@ -158,6 +275,7 @@ export const MessageList = ({
 
   // 加载旧消息后保留第一条原有消息的位置；显式定位可以扩大窗口。
   useLayoutEffect(() => {
+    readingNodesRef.current = contentRef.current?.querySelectorAll<HTMLElement>('[data-chat-message]')
     const scroll = getScroller()
     const anchor = prependAnchorRef.current
     if (scroll && anchor) {
@@ -170,17 +288,10 @@ export const MessageList = ({
       scrollTopRef.current = scroll.scrollTop
       prependAnchorRef.current = null
     }
-    if (locateRef.current && scroll) {
-      const message = scroll.querySelector<HTMLElement>(
-        `[data-chat-message="${CSS.escape(locateRef.current)}"]`
-      )
-      if (message) {
-        message.scrollIntoView({ block: 'center' })
-        scrollTopRef.current = scroll.scrollTop
-        locateRef.current = null
-      }
+    if (locateRef.current && applyLocation(locateRef.current)) {
+      locateRef.current = null
     }
-  }, [getScroller, startIndex, visibleCount, lastMessageId])
+  }, [applyLocation, getScroller, startIndex, visibleCount, lastMessageId])
 
   useEffect(() => {
     const locate = (event: Event) => {
@@ -188,26 +299,11 @@ export const MessageList = ({
       if (!detail || detail.sessionId !== session.id) {
         return
       }
-      const index = messages.findIndex((message) => message.id === detail.messageId)
-      if (index < 0) {
-        return
-      }
-      stickyRef.current = false
-      locateRef.current = detail.messageId
-      setVisibleCount((count) => Math.max(count, messages.length - index))
-      requestAnimationFrame(() => {
-        const target = scrollRef.current?.querySelector<HTMLElement>(
-          `[data-chat-message="${CSS.escape(detail.messageId)}"]`
-        )
-        if (target) {
-          target.scrollIntoView({ block: 'center' })
-          locateRef.current = null
-        }
-      })
+      findLocation({ messageId: detail.messageId, save: true })
     }
     document.addEventListener('deepseek:locate-message', locate)
     return () => document.removeEventListener('deepseek:locate-message', locate)
-  }, [session.id, messages])
+  }, [session.id, findLocation])
 
   // 内容、键盘和输入框高度变化时，继续遵循当前跟随状态。
   useLayoutEffect(() => {
@@ -237,8 +333,20 @@ export const MessageList = ({
     }
   }, [getScroller, isMobile, scrollToBottom])
 
-  // 切换版本后将选择器留在原位置，避免回答长短变化导致操作区跳出视口。
+  // Restore the selected branch's saved message, or preserve the version control's location.
   useLayoutEffect(() => {
+    if (displayedBranchRef.current !== branchKey) {
+      displayedBranchRef.current = branchKey
+      if (requestedLocation?.live()) {
+        restoreScrollRef.current = null
+        return
+      }
+      const position = readReadingPosition(branchKey)
+      if (position && findLocation(position)) {
+        restoreScrollRef.current = null
+        return
+      }
+    }
     const anchor = restoreScrollRef.current
     const scroll = getScroller()
     if (anchor && scroll) {
@@ -247,13 +355,29 @@ export const MessageList = ({
       )
       if (switcher) {
         scroll.scrollTop += switcher.getBoundingClientRect().top - anchor.top
+        scrollTopRef.current = scroll.scrollTop
+        setShowLatest(scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight >= STICKY_THRESHOLD)
       }
       restoreScrollRef.current = null
       return
     }
-    stickyRef.current = true
     scrollToBottom()
-  }, [getScroller, session.id, lastMessageId, scrollToBottom])
+  }, [branchKey, findLocation, getScroller, lastMessageId, requestedLocation, scrollToBottom])
+
+  useEffect(() => {
+    if (!requestedLocation) {return}
+    if (!requestedLocation.live()) {
+      consumeChatLocation(requestedLocation)
+      return
+    }
+    if (findLocation({ messageId: requestedLocation.messageId, save: true, highlight: true })) {
+      consumeChatLocation(requestedLocation)
+      return
+    }
+    if (revealMessageBranch(session, requestedLocation.messageId)) {return}
+    consumeChatLocation(requestedLocation)
+    showToast(chinese ? '暂时无法定位这条消息。' : 'This message could not be opened.')
+  }, [chinese, findLocation, requestedLocation, session])
 
   useEffect(closeSearchPanel, [session.id, lastMessageId])
 
@@ -262,17 +386,17 @@ export const MessageList = ({
       if (streaming) {
         return
       }
+      const before = useChatStore.getState().sessionCache[session.id]
+      selectMessageVersion(session.id, messageId)
+      const nextSession = useChatStore.getState().sessionCache[session.id]
+      if (!nextSession || nextSession === before) {return}
       restoreScrollRef.current = { messageId, top: anchorTop }
       stickyRef.current = false
       closeSearchPanel()
-      selectMessageVersion(session.id, messageId)
-      const nextSession = useChatStore.getState().sessionCache[session.id]
-      if (nextSession) {
-        const next = getVisibleMessages(nextSession)
-        const index = next.findIndex((message) => message.id === messageId)
-        if (index >= 0) {
-          setVisibleCount((count) => Math.max(count, next.length - index))
-        }
+      const next = getVisibleMessages(nextSession)
+      const index = next.findIndex((message) => message.id === messageId)
+      if (index >= 0) {
+        setVisibleCount((count) => Math.max(count, next.length - index))
       }
     },
     [session.id, streaming]
@@ -301,11 +425,17 @@ export const MessageList = ({
         stickyRef.current = false
       }
       scrollTopRef.current = el.scrollTop
+      setShowLatest(!nearBottom)
+      const readingTop = getReadingTop()
+      const nodes = readingNodesRef.current
+      const first = !nearBottom && nodes ? firstReadableMessage(nodes, readingTop) : undefined
+      const messageId = first?.dataset.chatMessage
+      queueReadingPosition(first && messageId ? { messageId, offset: first.getBoundingClientRect().top - readingTop } : null)
     }
     const target = isMobile ? window : el
     target.addEventListener('scroll', onScroll, { passive: true })
     return () => target.removeEventListener('scroll', onScroll)
-  }, [getScroller, isMobile, scrollToBottom])
+  }, [getReadingTop, getScroller, isMobile, queueReadingPosition, scrollToBottom])
 
   const lastIndex = messages.length - 1
   const uploadRetryId = getUploadRetryId(messages, streaming)
@@ -374,6 +504,11 @@ export const MessageList = ({
           </div>
         </div>
         {footer}
+        {showLatest ? (
+          <button className={styles.returnLatest} type="button" onClick={goToLatest}>
+            {chinese ? '回到最新' : 'Back to latest'}
+          </button>
+        ) : null}
       </div>
       {showConversationShareControls && shareReplyId !== null ? (
         <ConversationShareDialog

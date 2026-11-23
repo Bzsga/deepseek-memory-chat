@@ -43,7 +43,6 @@ class BranchedImportRecoveryTest {
         try {
             controller.clearLocalData()
             controller.saveSettings(ServiceSettings(mode = "byok"))
-            DiagnosticLog.bindAnonymousIdentity("byok", "", "")
             val zip = ByteArrayOutputStream().also { bytes ->
                 ZipOutputStream(bytes).use { output ->
                     output.putNextEntry(ZipEntry("conversations.json"))

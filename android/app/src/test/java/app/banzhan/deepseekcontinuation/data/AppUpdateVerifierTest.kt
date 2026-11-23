@@ -1,5 +1,6 @@
 package app.banzhan.deepseekcontinuation.data
 
+import android.content.pm.PackageManager
 import app.banzhan.deepseekcontinuation.core.AppUpdateManifest
 import java.io.File
 import java.security.MessageDigest
@@ -18,6 +19,18 @@ class AppUpdateVerifierTest {
     private val candidate = installed.copy(versionCode = 7L, versionName = "preview.7")
     private val bytes = "synthetic APK bytes".toByteArray()
 
+    @Suppress("DEPRECATION")
+    @Test
+    fun olderArchiveParsersCollectCertificatesAndExposeTheCurrentSigner() {
+        val legacy = PackageManager.GET_SIGNATURES
+        val current = PackageManager.GET_SIGNING_CERTIFICATES
+        assertEquals(legacy, appUpdateSigningFlags(27, archive = true))
+        for (sdk in listOf(28, 29, 35)) {
+            assertEquals(legacy or current, appUpdateSigningFlags(sdk, archive = true))
+            assertEquals(current, appUpdateSigningFlags(sdk))
+        }
+    }
+
     @Test
     fun exactIdentityAndCurrentSignerSetAcceptANewerVersion() {
         validateAppUpdateIdentity(manifest(), candidate, installed, 26)
@@ -27,13 +40,17 @@ class AppUpdateVerifierTest {
 
     @Test
     fun aDifferentOrHistoricalSigningCertificateCannotReplaceTheCurrentSigner() {
-        listOf(emptySet(), setOf(signatureB), setOf(signatureA, signatureB)).forEach { signers ->
-            assertThrows(AppUpdateVerificationException::class.java) {
+        listOf(setOf(signatureB), setOf(signatureA, signatureB)).forEach { signers ->
+            val error = assertThrows(AppUpdateVerificationException::class.java) {
                 validateAppUpdateIdentity(manifest(), candidate.copy(signerSha256 = signers), installed, 35)
             }
+            assertEquals(AppUpdateVerificationFailure.SIGNER_MISMATCH, error.failure)
         }
-        assertThrows(AppUpdateVerificationException::class.java) {
-            validateAppUpdateIdentity(manifest(), candidate, installed.copy(signerSha256 = emptySet()), 35)
+        listOf(candidate.copy(signerSha256 = emptySet()) to installed, candidate to installed.copy(signerSha256 = emptySet())).forEach { (update, current) ->
+            val error = assertThrows(AppUpdateVerificationException::class.java) {
+                validateAppUpdateIdentity(manifest(), update, current, 35)
+            }
+            assertEquals(AppUpdateVerificationFailure.SIGNER_UNAVAILABLE, error.failure)
         }
     }
 
@@ -66,7 +83,8 @@ class AppUpdateVerifierTest {
         val file = updateFile(cache)
         assertEquals(file.canonicalFile, verifyAppUpdateFile(file, cache, manifest()))
         file.writeBytes(ByteArray(bytes.size) { 1 })
-        assertThrows(AppUpdateVerificationException::class.java) { verifyAppUpdateFile(file, cache, manifest()) }
+        val error = assertThrows(AppUpdateVerificationException::class.java) { verifyAppUpdateFile(file, cache, manifest()) }
+        assertEquals(AppUpdateVerificationFailure.CHECKSUM, error.failure)
     }
 
     @Test

@@ -1,5 +1,8 @@
 declare const styles: {
   readonly "area": string;
+  readonly "usage": string;
+  readonly "usageGroup": string;
+  readonly "usageValues": string;
   readonly "title": string;
   readonly "titleIcon": string;
   readonly "stoppedIcon": string;

@@ -2,6 +2,7 @@
 
 package app.banzhan.deepseekcontinuation.ui
 
+import android.text.format.Formatter
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -13,15 +14,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import app.banzhan.deepseekcontinuation.data.*
 
@@ -36,43 +41,52 @@ internal fun DeveloperScreen(
     var page by rememberSaveable { mutableStateOf("overview") }
     var days by rememberSaveable { mutableIntStateOf(7) }
     val signedIn = prefs.sessionToken.isNotBlank()
-    val hideManagementHeader =
-        WindowInsets.isImeVisible && page in setOf("users", "server", "feedback")
+    val userPageState = rememberSaveableStateHolder()
+    val keyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val hideManagementHeader = keyboardOpen && page in setOf("users", "server", "feedback", "diagnostics")
     LaunchedEffect(signedIn, prefs.serviceUrl, prefs.sessionToken, page, days) {
         if (page == "local") page = "overview"
         if (signedIn) {
             when (page) {
                 "overview" -> run { controller.refreshAdminStats(days) }
-                "users" -> {
-                    run { controller.refreshAdminOpenPermissions() }
-                    run { controller.refreshAdminRegistrationPolicy() }
-                    run {
-                        controller.refreshAdminConfig()
-                        controller.refreshAdminUsers(limit = 25, offset = 0)
-                    }
+                "server" -> {
+                    run { controller.refreshAdminConfig() }
+                    run { controller.refreshAdminStorage() }
                 }
-                "server" -> run { controller.refreshAdminConfig() }
             }
         }
     }
     Column(Modifier.fillMaxSize()) {
-        if (!hideManagementHeader)
-            Column(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                ActionRow {
+        if (!hideManagementHeader) {
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Row(
+                    Modifier.widthIn(max = 540.dp).fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
                     listOf(
-                            "overview" to "统计概览",
-                            "users" to "用户与邀请码",
-                            "feedback" to "意见审批",
-                            "server" to "服务器",
+                        "overview" to "统计概览",
+                        "diagnostics" to "故障诊断",
+                        "users" to "用户管理",
+                        "feedback" to "意见审批",
+                        "server" to "服务器",
+                    ).forEach { (id, title) ->
+                        FilterChip(
+                            selected = page == id,
+                            onClick = { page = id },
+                            modifier = Modifier.weight(1f).testTag("developer-tab:$id"),
+                            label = {
+                                Text(
+                                    title,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    textAlign = TextAlign.Center,
+                                )
+                            },
                         )
-                        .forEach { (id, title) ->
-                            FilterChip(page == id, { page = id }, label = { Text(title) })
-                        }
+                    }
                 }
             }
+        }
         Box(Modifier.weight(1f)) {
             when (page) {
                 "overview" ->
@@ -82,15 +96,12 @@ internal fun DeveloperScreen(
                         { days = it },
                         { run { controller.refreshAdminStats(days) } },
                     )
-                "users" ->
-                    AdminUsers(
-                        state,
-                        controller,
-                        run,
-                        onPage = { offset ->
-                            run { controller.refreshAdminUsers(limit = 25, offset = offset) }
-                        },
-                    )
+                "users" -> userPageState.SaveableStateProvider("admin-users") {
+                    AdminUsersScreen(state, controller, run)
+                }
+                "diagnostics" -> userPageState.SaveableStateProvider("admin-diagnostics") {
+                    AdminDiagnosticsScreen(state, controller, run)
+                }
                 "server" -> AdminServerSettings(state, controller, run)
                 "feedback" -> AdminFeedbackScreen(state, controller, run)
             }
@@ -193,154 +204,6 @@ private fun AdminOverview(
 }
 
 @Composable
-private fun AdminUsers(
-    state: AppState,
-    controller: AppController,
-    run: (suspend () -> Unit) -> Unit,
-    onPage: (Int) -> Unit,
-) {
-    val page = state.adminUsers
-    var resetTarget by remember { mutableStateOf<UserUsage?>(null) }
-    var resetResult by remember { mutableStateOf<AdminPasswordReset?>(null) }
-    val clipboard = LocalClipboardManager.current
-    resetTarget?.let { user ->
-        AlertDialog(
-            onDismissRequest = { resetTarget = null },
-            title = { Text("重置密码？") },
-            text = { Text("为 ${user.username ?: user.id} 生成新密码，并退出该账号已有的登录会话。") },
-            confirmButton = { TextButton(onClick = {
-                resetTarget = null
-                run { resetResult = controller.resetAdminUserPassword(user.id) }
-            }, enabled = !state.adminUsersLoading) { Text("重置密码") } },
-            dismissButton = { TextButton(onClick = { resetTarget = null }) { Text("取消") } },
-        )
-    }
-    resetResult?.let { result ->
-        AlertDialog(
-            onDismissRequest = { resetResult = null },
-            title = { Text("新密码已生成") },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(result.username)
-                SelectionContainer { Text(result.password, style = MaterialTheme.typography.titleMedium) }
-                Text("请把新密码发给对应用户。关闭后这里不再显示。", style = MaterialTheme.typography.bodySmall)
-            } },
-            confirmButton = { TextButton(onClick = {
-                clipboard.setText(AnnotatedString(result.password))
-                resetResult = null
-            }) { Text("复制并关闭") } },
-            dismissButton = { TextButton(onClick = { resetResult = null }) { Text("关闭") } },
-        )
-    }
-    var invitationsExpanded by rememberSaveable { mutableStateOf(false) }
-    var invitationCount by rememberSaveable { mutableIntStateOf(10) }
-    LaunchedEffect(invitationsExpanded) {
-        if (invitationsExpanded) run { controller.refreshAdminRegistrationInvites() }
-    }
-    LazyColumn(
-        Modifier.fillMaxSize().imePadding(),
-        contentPadding = PaddingValues(20.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        item {
-            AdminRegistrationPolicyControls(
-                current = state.adminSelfServiceRegistration,
-                loading = state.adminSelfServiceRegistrationLoading,
-                error = state.adminSelfServiceRegistrationError,
-                onRefresh = { run { controller.refreshAdminRegistrationPolicy() } },
-                onSave = { enabled -> run { controller.updateAdminRegistrationPolicy(enabled) } },
-            )
-        }
-        item {
-            AdminOpenPermissionsControls(
-                current = state.adminOpenPermissions,
-                loading = state.adminOpenPermissionsLoading,
-                error = state.adminOpenPermissionsError,
-                onRefresh = { run { controller.refreshAdminOpenPermissions() } },
-                onSave = { permissions -> run { controller.updateAdminOpenPermissions(permissions) } },
-            )
-        }
-        state.adminError?.let { item { NoticeCard(it) } }
-        item {
-            RegistrationInvitationControls(
-                expanded = invitationsExpanded,
-                loading = state.adminRegistrationLoading,
-                onToggle = { invitationsExpanded = !invitationsExpanded; invitationCount = 10 },
-                onRefresh = { run { controller.refreshAdminRegistrationInvites() } },
-                onCreate = { count, days, permissions -> run { controller.createAdminRegistrationInvites(count, days, permissions) } },
-            )
-        }
-        if (invitationsExpanded) {
-            state.adminRegistrationError?.let { item { NoticeCard(it) } }
-            val invitations = state.adminRegistrationInvites?.filter { it.usedAt == null }.orEmpty()
-            if (state.adminRegistrationInvites != null && invitations.isEmpty())
-                item { Text("还没有未使用的邀请码。", style = MaterialTheme.typography.bodySmall) }
-            items(invitations.take(invitationCount), key = { "invite:${it.id}" }) { invitation ->
-                RegistrationInvitationCard(invitation)
-            }
-            if (invitations.size > invitationCount) item {
-                TextButton(onClick = { invitationCount += 10 }) { Text("显示更多邀请码") }
-            }
-        }
-        item {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("注册用户", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
-                TextButton(
-                    onClick = { run {
-                        controller.refreshAdminConfig()
-                        controller.refreshAdminUsers(limit = page?.limit ?: 25, offset = page?.offset ?: 0)
-                    } },
-                    enabled = !state.adminUsersLoading,
-                ) {
-                    Text("刷新")
-                }
-            }
-        }
-        if (state.adminUsersLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-        state.adminUsersError?.let {
-            item { NoticeCard("未能获取用户列表。$it" + if (page != null) "\n下面显示上次成功读取的列表。" else "") }
-        }
-        if (page == null) {
-            if (!state.adminUsersLoading && state.adminUsersError == null)
-                item { NoticeCard("尚未加载用户列表。") }
-        } else {
-            if (page.users.isEmpty()) item { NoticeCard("这一页没有用户记录。") }
-            items(page.users.filter { !it.username.isNullOrBlank() }, key = { it.id }) { user ->
-                RegisteredUserQuotaCard(
-                    user, state.adminConfig?.userWeeklyLimit, state.adminUsersLoading,
-                    onSetEnabled = { enabled -> run { controller.setAdminUserEnabled(user.id, enabled) } },
-                    onResetPassword = { resetTarget = user },
-                    onSavePermissions = { permissions -> run { controller.updateAdminUserPermissions(user.id, permissions) } },
-                ) { limit, remaining ->
-                    run { controller.updateAdminUserQuota(user.id, limit, remaining, page.week.takeIf { remaining != null }) }
-                }
-            }
-            item {
-                val first = if (page.users.isEmpty()) 0 else page.offset + 1
-                Text(
-                    "显示 $first–${page.offset + page.users.size} / ${page.total}",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                ActionRow {
-                    OutlinedButton(
-                        onClick = { onPage((page.offset - page.limit).coerceAtLeast(0)) },
-                        enabled = !state.adminUsersLoading && page.offset > 0,
-                    ) {
-                        Text("上一页")
-                    }
-                    OutlinedButton(
-                        onClick = { onPage(page.offset + page.limit) },
-                        enabled =
-                            !state.adminUsersLoading && page.offset + page.users.size < page.total,
-                    ) {
-                        Text("下一页")
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 internal fun AdminOpenPermissionsControls(
     current: ServicePermissions?,
     loading: Boolean,
@@ -384,7 +247,7 @@ internal fun AdminOpenPermissionsControls(
 }
 
 @Composable
-private fun AdminRegistrationPolicyControls(
+internal fun AdminRegistrationPolicyControls(
     current: Boolean?,
     loading: Boolean,
     error: String?,
@@ -420,95 +283,6 @@ private fun AdminRegistrationPolicyControls(
 }
 
 @Composable
-internal fun RegisteredUserQuotaCard(
-    user: UserUsage,
-    defaultLimit: Int?,
-    loading: Boolean,
-    onSetEnabled: ((Boolean) -> Unit)? = null,
-    onResetPassword: (() -> Unit)? = null,
-    onSavePermissions: ((ServicePermissions) -> Unit)? = null,
-    onSave: (Int?, Int?) -> Unit,
-) {
-    val currentPermissions = user.servicePermissions
-    val canLockCurrentPermissions = currentPermissions == ServicePermissions.None && user.inviteRedeemable == true
-    var permissions by rememberSaveable(user.id, currentPermissions, stateSaver = permissionSelectionSaver) {
-        mutableStateOf(currentPermissions)
-    }
-    var expanded by rememberSaveable(user.id) { mutableStateOf(false) }
-    var followDefault by remember(user) { mutableStateOf(user.weeklyLimitOverride == null) }
-    var limit by remember(user) { mutableStateOf((user.weeklyLimitOverride ?: user.weeklyLimit).toString()) }
-    var weekRemaining by remember(user) { mutableStateOf("") }
-    var problem by remember { mutableStateOf<String?>(null) }
-    AdminSection(user.username ?: user.id.take(12)) {
-        if (!user.enabled) Text("账号已停用", color = MaterialTheme.colorScheme.error,
-            style = MaterialTheme.typography.labelMedium)
-        MetricRow("服务权限", currentPermissions.summary())
-        if (currentPermissions.hasManagedApi) MetricRow("本周剩余 / 每周上限", "${user.weeklyRemaining} / ${user.weeklyLimit}")
-        val registration = if (user.registrationKind == "invitation") "邀请码注册" else "公开注册"
-        val quotaPolicy = if (user.weeklyLimitOverride == null) "跟随默认次数" else "个人单独设置"
-        Text(
-            if (currentPermissions.hasManagedApi) "$registration · $quotaPolicy" else registration,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        TextButton(onClick = { expanded = !expanded }, modifier = Modifier.testTag("admin-user-toggle:${user.id}")) {
-            Text(if (expanded) "收起调整" else "管理账号")
-        }
-        if (expanded) {
-            if (onSetEnabled != null || onResetPassword != null) ActionRow {
-                onSetEnabled?.let { action ->
-                    OutlinedButton(onClick = { action(!user.enabled) }, enabled = !loading,
-                        modifier = Modifier.testTag("admin-user-status:${user.id}")) {
-                        Text(if (user.enabled) "停用账号" else "启用账号")
-                    }
-                }
-                onResetPassword?.let { action ->
-                    TextButton(onClick = action, enabled = !loading,
-                        modifier = Modifier.testTag("admin-user-reset:${user.id}")) { Text("重置密码") }
-                }
-            }
-            onSavePermissions?.let { save ->
-                PermissionChecks(permissions, !loading, "admin-user-permissions:${user.id}") { permissions = it }
-                if (canLockCurrentPermissions) {
-                    Text("保存后，此账号的权限由管理员调整。", style = MaterialTheme.typography.bodySmall)
-                }
-                OutlinedButton(
-                    onClick = { save(permissions) },
-                    enabled = !loading && (permissions != currentPermissions || canLockCurrentPermissions),
-                    modifier = Modifier.testTag("admin-user-save-permissions:${user.id}"),
-                ) { Text("保存权限") }
-            }
-            if (currentPermissions.hasManagedApi) Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(followDefault, { followDefault = it }, enabled = !loading,
-                        modifier = Modifier.testTag("admin-user-follow-default:${user.id}"))
-                    Text("跟随默认每周次数" + (defaultLimit?.let { "（$it 次）" } ?: ""),
-                        Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                }
-                if (!followDefault) NumberField("个人每周免费次数", limit, !loading) { limit = it }
-                NumberField("仅本周的剩余次数（选填）", weekRemaining, !loading) { weekRemaining = it }
-                Text("留空保留本周已用情况。已开始的请求与预留次数不会被取消。", style = MaterialTheme.typography.bodySmall)
-                problem?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                Button(
-                    onClick = {
-                        try {
-                            val personal = if (followDefault) null else requireNotNull(limit.toIntOrNull()?.takeIf { it in 0..1_000_000 }) { "个人次数应为0到1000000之间的整数。" }
-                            val remaining = if (weekRemaining.isBlank()) null else requireNotNull(weekRemaining.toIntOrNull()?.takeIf { it in 0..1_000_000 }) { "本周剩余应为0到1000000之间的整数。" }
-                            problem = null
-                            onSave(personal, remaining)
-                        } catch (error: IllegalArgumentException) { problem = error.message }
-                    },
-                    enabled = !loading,
-                    modifier = Modifier.testTag("admin-user-save:${user.id}"),
-                ) { Text("保存个人次数") }
-                Text("本周已用 ${user.weeklyUsed} 次 · 排队预留 ${user.weeklyReserved} 次", style = MaterialTheme.typography.bodySmall)
-            }
-            SelectionContainer { Text("用户 ID · ${user.id}", style = MaterialTheme.typography.bodySmall) }
-        }
-    }
-}
-
-@Composable
 internal fun RegistrationInvitationControls(
     expanded: Boolean,
     loading: Boolean,
@@ -522,7 +296,7 @@ internal fun RegistrationInvitationControls(
     var problem by remember { mutableStateOf<String?>(null) }
     AdminSection("注册邀请码") {
         TextButton(onClick = onToggle, modifier = Modifier.testTag("admin-invitations-toggle")) {
-            Text(if (expanded) "收起邀请码" else "生成与查看未使用邀请码")
+            Text(if (expanded) "收起生成选项" else "生成邀请码")
         }
         if (expanded) {
             Text("每个邀请码仅限使用一次，勾选的权限会授予使用该邀请码的账号。", style = MaterialTheme.typography.bodySmall)
@@ -547,19 +321,19 @@ internal fun RegistrationInvitationControls(
     }
 }
 
-private val permissionSelectionSaver = listSaver<ServicePermissions, Boolean>(
+internal val permissionSelectionSaver = listSaver<ServicePermissions, Boolean>(
     save = { listOf(it.chatApi, it.imageApi, it.cloudSync) },
     restore = { ServicePermissions(it[0], it[1], it[2]) },
 )
 
-private fun ServicePermissions.summary() = buildList {
+internal fun ServicePermissions.summary() = buildList {
     if (chatApi) add("聊天 API")
     if (imageApi) add("生图 API")
     if (cloudSync) add("云同步")
 }.joinToString("、").ifEmpty { "未开通" }
 
 @Composable
-private fun PermissionChecks(
+internal fun PermissionChecks(
     permissions: ServicePermissions,
     enabled: Boolean,
     tag: String,
@@ -618,6 +392,14 @@ private fun AdminServerSettings(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item {
+            AdminStorageSection(
+                storage = state.adminStorage,
+                loading = state.adminStorageLoading,
+                error = state.adminStorageError,
+                onRefresh = { run { controller.refreshAdminStorage() } },
+            )
+        }
+        item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("服务器配置", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
                 TextButton(
@@ -643,6 +425,36 @@ private fun AdminServerSettings(
                     },
                 )
             }
+    }
+}
+
+@Composable
+private fun AdminStorageSection(
+    storage: AdminStorage?,
+    loading: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+) {
+    val context = LocalContext.current
+    fun size(bytes: Long) = Formatter.formatShortFileSize(context, bytes)
+    AdminSection("服务器存储") {
+        if (storage != null) {
+            MetricRow("多端同步", "${size(storage.syncBytes)} / ${size(storage.syncLimitBytes)}")
+            MetricRow("公开分享", "${size(storage.shareBytes)} / ${size(storage.shareLimitBytes)}")
+            MetricRow("磁盘可用 / 预留", "${size(storage.diskFreeBytes)} / ${size(storage.diskReserveBytes)}")
+            if (storage.warning) {
+                Text(
+                    "部分存储用量或磁盘余量已达到预警阈值。",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        TextButton(onClick = onRefresh, enabled = !loading, modifier = Modifier.testTag("admin-storage-refresh")) {
+            Text("刷新存储用量")
+        }
     }
 }
 
@@ -787,7 +599,7 @@ private fun RemoteConfigEditor(
 }
 
 @Composable
-private fun NumberField(
+internal fun NumberField(
     label: String,
     value: String,
     enabled: Boolean = true,

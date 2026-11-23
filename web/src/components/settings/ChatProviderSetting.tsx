@@ -20,6 +20,7 @@ import {
   getRuntime, isGuestWorkspace, parseRuntimeUser, refreshRuntime, subscribeRuntimeUser, validWeeklyQuota,
 } from '../../services/runtime.js'
 import { applyInviteRedemption } from '../../services/weeklyQuota.js'
+import { PersonalMcpSetting } from './PersonalMcpSetting.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
@@ -419,6 +420,7 @@ function ChatProviderForm({ onClose }: { onClose: () => void }) {
             </div>
             <p className={styles.description}>{t('chatEndpointHelp')}</p>
             {errorMessage ? <p className={styles.error} role="alert">{errorMessage}</p> : null}
+            <PersonalMcpSetting disabled={disabled} />
           </form>
         </Modal>
       ) : null}

@@ -11,3 +11,6 @@ export class BackupError extends Error {
 export const fail = (key: TranslationKey): never => {
   throw new BackupError(key)
 }
+
+/** Bound selected originals held until the live append transaction. */
+export class HistorySelectionTooLargeError extends Error {}

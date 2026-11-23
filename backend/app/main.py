@@ -1,4 +1,6 @@
 import asyncio
+import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,12 +13,19 @@ from .api_key_guide import build_api_key_guide_router
 from .chat import build_chat_router
 from .share_import import build_share_import_router
 from .conversation_shares import ConversationShares, build_conversation_share_router
-from .conversation_sync import ConversationSync, build_conversation_sync_router
+from .conversation_sync import SYNC_PATH, ConversationSync, build_conversation_sync_router
 from .admin_web import build_admin_web_router
 from .admin_access import _client_ip, build_admin_router, initialize_admin
+from .password_recovery import (
+    MAX_PASSWORD_RESET_BODY_BYTES, PASSWORD_RESET_PATH, build_password_recovery_router,
+)
 from .feedback import FeedbackStore, MAX_FEEDBACK_BODY_BYTES, build_feedback_router
 from .diagnostics import DiagnosticsStore, MAX_DIAGNOSTIC_BODY_BYTES, build_diagnostics_router
+from .server_diagnostics import ServerDiagnostics, ServerDiagnosticsMiddleware
+from .technical_diagnostics import (MAX_TECHNICAL_DIAGNOSTIC_BODY_BYTES, TechnicalDiagnostics,
+                                    build_technical_diagnostics_router)
 from .runner import Runner, ServiceLease
+from .chat_jobs import ChatJobs
 from .image_jobs import ImageJobs
 from .releases import build_release_router
 from .schemas import (AccountInviteRequest, AccountLoginRequest, AccountRegisterRequest, JobRequest, RedeemRequest, MAX_SOURCE_CHARACTERS, MAX_SOURCE_MESSAGES,
@@ -33,7 +42,13 @@ class BoundedBodyMiddleware:
         if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH"}:
             return await self.app(scope, receive, send)
         # The image job route authenticates before applying its own bounded upload read.
-        if scope["method"] == "POST" and scope.get("path") == "/chat/api/image-jobs":
+        if scope["method"] == "POST" and (scope.get("path") == "/chat/api/image-jobs" or
+                                         scope.get("path", "").startswith("/chat/api/chat-jobs/")):
+            return await self.app(scope, receive, send)
+        # Sync uploads also authenticate before reading, with route-specific size and idle limits.
+        if scope["method"] == "PUT" and scope.get("path", "").rpartition("/")[0] in (
+            f"{SYNC_PATH}/sessions", f"{SYNC_PATH}/blobs",
+        ):
             return await self.app(scope, receive, send)
         content = bytearray()
         max_bytes = (MAX_FEEDBACK_BODY_BYTES if scope["method"] == "POST" and scope.get("path") == "/v1/feedback"
@@ -42,6 +57,10 @@ class BoundedBodyMiddleware:
             max_bytes = 70 * 1024 * 1024
         if scope["method"] == "POST" and scope.get("path") == "/v1/diagnostics":
             max_bytes = min(max_bytes, MAX_DIAGNOSTIC_BODY_BYTES)
+        if scope["method"] == "POST" and scope.get("path") == "/v1/technical-diagnostics/events":
+            max_bytes = min(max_bytes, MAX_TECHNICAL_DIAGNOSTIC_BODY_BYTES)
+        if scope["method"] == "POST" and scope.get("path") == PASSWORD_RESET_PATH:
+            max_bytes = min(max_bytes, MAX_PASSWORD_RESET_BODY_BYTES)
         while True:
             try:
                 event = await asyncio.wait_for(receive(), timeout=15)
@@ -73,7 +92,12 @@ def create_app(settings=None):
     store = Store(settings)
     feedback = FeedbackStore(store)
     diagnostics = DiagnosticsStore(store)
+    technical_diagnostics = TechnicalDiagnostics(store)
+    release_directory = Path(__file__).resolve().parents[2].name
+    release = release_directory if re.fullmatch(r"\d{8}T\d{6}Z-[a-f0-9]{6}", release_directory) else "2.6.0"
+    server_diagnostics = ServerDiagnostics(technical_diagnostics, release)
     runner = Runner(settings, store)
+    chat_jobs = ChatJobs(store)
     image_jobs = ImageJobs(store, Path(settings.db_path).resolve().parent / "image-results")
     conversation_shares = ConversationShares(store, Path(settings.db_path).resolve().parent / "conversation-shares")
     conversation_sync = ConversationSync(store)
@@ -82,7 +106,7 @@ def create_app(settings=None):
     @asynccontextmanager
     async def lifespan(app):
         lease.acquire()
-        diagnostics_cleanup = None
+        diagnostics_tasks = []
         try:
             store.initialize()
             conversation_shares.initialize()
@@ -90,16 +114,21 @@ def create_app(settings=None):
             initialize_admin(store)
             feedback.initialize()
             diagnostics.initialize()
+            technical_diagnostics.initialize()
             store.recover_running()
             store.purge_expired()
+            await chat_jobs.start()
             await image_jobs.start()
             runner.start()
-            diagnostics_cleanup = asyncio.create_task(diagnostics.cleanup())
+            diagnostics_tasks.extend(asyncio.create_task(operation) for operation in (
+                diagnostics.cleanup(), technical_diagnostics.cleanup(), server_diagnostics.run(),
+            ))
             yield
         finally:
-            if diagnostics_cleanup is not None:
-                diagnostics_cleanup.cancel()
-                await asyncio.gather(diagnostics_cleanup, return_exceptions=True)
+            for task in diagnostics_tasks:
+                task.cancel()
+            await asyncio.gather(*diagnostics_tasks, return_exceptions=True)
+            await chat_jobs.stop()
             await image_jobs.stop()
             await runner.stop()
             lease.release()
@@ -107,21 +136,29 @@ def create_app(settings=None):
     app = FastAPI(title="DeepSeek 记忆聊天", version="2.6.0", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(BoundedBodyMiddleware, max_bytes=settings.max_body_bytes)
+    app.add_middleware(ServerDiagnosticsMiddleware, diagnostics=server_diagnostics)
     app.state.store = store
     app.state.runner = runner
     app.state.feedback = feedback
     app.state.diagnostics = diagnostics
+    app.state.technical_diagnostics = technical_diagnostics
+    app.state.chat_jobs = chat_jobs
     app.state.image_jobs = image_jobs
     app.state.conversation_shares = conversation_shares
     app.state.conversation_sync = conversation_sync
+    public_origin = os.environ.get("PUBLIC_ORIGIN", "https://digimonlegend.com").rstrip("/")
     app.include_router(build_admin_router(store))
+    app.include_router(build_password_recovery_router(store, public_origin=public_origin))
     app.include_router(build_share_import_router(store))
     app.include_router(build_conversation_share_router(store, conversation_shares))
     app.include_router(build_conversation_sync_router(store, conversation_sync))
-    app.include_router(build_chat_router(store, image_jobs=image_jobs))
+    app.include_router(build_chat_router(store, image_jobs=image_jobs, chat_jobs=chat_jobs))
     app.include_router(build_api_key_guide_router())
-    app.include_router(build_admin_web_router(store))
+    app.include_router(build_admin_web_router())
     app.include_router(build_release_router())
+    app.include_router(build_technical_diagnostics_router(
+        store, technical_diagnostics, public_origin,
+    ))
 
     @app.exception_handler(ServiceError)
     async def service_error(request, error):
@@ -136,7 +173,7 @@ def create_app(settings=None):
             return JSONResponse({"detail": detail}, status_code=422)
         if request.url.path.startswith("/v1/accounts/"):
             return JSONResponse({"detail": "账号信息格式不正确，请检查用户名、密码和邀请码"}, status_code=422)
-        if request.url.path == "/v1/diagnostics":
+        if request.url.path in {"/v1/diagnostics", "/v1/technical-diagnostics/events"}:
             return JSONResponse({"detail": "诊断日志格式不正确；仅接受受支持的技术信息"}, status_code=422)
         if request.url.path.startswith(("/v1/feedback", "/v1/admin/feedback")):
             return JSONResponse({"detail": "反馈格式不正确；请填写正文及 QQ 或微信，最多附 3 张 JPEG/PNG 图片，每张不超过 1 MiB"}, status_code=422)

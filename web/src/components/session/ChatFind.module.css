@@ -1,0 +1,75 @@
+.dialog {
+  width: min(540px, calc(100vw - 24px));
+}
+
+.searchRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.searchRow input {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  box-sizing: border-box;
+  padding: 6px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+}
+
+.close,
+.results button {
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.close {
+  min-height: 44px;
+  padding: 0 10px;
+}
+
+.results {
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.results button {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.results button:hover,
+.close:hover {
+  background: var(--dsw-specific-sidebar-nav-item-hover);
+}
+
+.meta,
+.empty {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+}
+
+.body {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+}
+
+.body mark {
+  background: var(--dsw-specific-sidebar-nav-item-active-accent);
+  color: var(--dsw-alias-label-primary);
+}

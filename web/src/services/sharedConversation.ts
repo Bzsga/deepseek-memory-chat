@@ -15,6 +15,7 @@ const EXTRA_FRAGMENTS = new Set([
   'TIP',
   'CONTENT_RISK',
   'PARTIAL_FILE_READ',
+  'SEARCH',
   'TOOL_SEARCH',
   'TOOL_OPEN',
   'TOOL_FIND',

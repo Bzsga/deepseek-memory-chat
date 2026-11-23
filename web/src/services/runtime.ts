@@ -1,3 +1,5 @@
+import { recordDiagnostic, safeRequestId } from './technicalDiagnostics.js'
+
 /** Loaded before any account-scoped stores or UI modules are imported. */
 export const API_ORIGIN = __API_ORIGIN__
 
@@ -23,7 +25,7 @@ export type WeeklyQuota = {
 export type RuntimeConfig = {
   provider: string
   model: string
-  features: { search: boolean; files: boolean; speech: boolean; image_generation?: boolean }
+  features: { search: boolean; files: boolean; speech: boolean; image_generation?: boolean; background_chat?: boolean }
   image_model?: string | null
   user: RuntimeUser
   weekly_quota?: WeeklyQuota
@@ -89,6 +91,9 @@ export const fetchRuntime = async (): Promise<RuntimeConfig> => {
       cache: 'no-store',
       signal: controller.signal,
     })
+  } catch (error) {
+    recordDiagnostic('runtime', controller.signal.aborted ? 'timeout' : 'network_error', { stage: 'request' })
+    throw error
   } finally {
     clearTimeout(timeout)
   }
@@ -96,11 +101,20 @@ export const fetchRuntime = async (): Promise<RuntimeConfig> => {
     throw new LoginRequired()
   }
   if (!response.ok) {
+    if (response.status >= 500 || response.status === 408) {
+      recordDiagnostic('runtime', 'http_error', {
+        stage: 'response', http_status: response.status, request_id: safeRequestId(response),
+      })
+    }
     throw new Error('Unable to verify the current account')
   }
-  const value: unknown = await response.json()
+  const invalidRuntime = () => {
+    recordDiagnostic('runtime', 'invalid_response', { stage: 'parse', request_id: safeRequestId(response) })
+    return new Error('Invalid runtime configuration')
+  }
+  const value: unknown = await response.json().catch(() => { throw invalidRuntime() })
   if (typeof value !== 'object' || value === null) {
-    throw new Error('Invalid runtime configuration')
+    throw invalidRuntime()
   }
   const data = value as Partial<RuntimeConfig>
   const user = parseRuntimeUser(data.user)
@@ -109,7 +123,7 @@ export const fetchRuntime = async (): Promise<RuntimeConfig> => {
     !data.model ||
     !user || user.role === 'guest'
   ) {
-    throw new Error('Invalid account configuration')
+    throw invalidRuntime()
   }
   return {
     provider: typeof data.provider === 'string' ? data.provider : 'DeepSeek',
@@ -120,6 +134,7 @@ export const fetchRuntime = async (): Promise<RuntimeConfig> => {
       files: data.features?.files === true,
       speech: data.features?.speech === true,
       image_generation: data.features?.image_generation === true,
+      background_chat: data.features?.background_chat === true,
     },
     user,
     ...(validWeeklyQuota(data.weekly_quota) ? { weekly_quota: data.weekly_quota } : {}),

@@ -123,6 +123,7 @@ class AppUpdateViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
+                if (generation == checkGeneration) TechnicalDiagnostics.failure("update", "request", error)
                 if (generation == checkGeneration) mutableState.update {
                     it.copy(checking = false, error = if (manual) safeMessage(error, "暂时无法检查更新，请稍后重试。") else it.error)
                 }
@@ -150,6 +151,7 @@ class AppUpdateViewModel(application: Application) : AndroidViewModel(applicatio
             var part: File? = null
             var promoted: File? = null
             var verified = false
+            var diagnosticStage = "download"
             try {
                 // A new explicit retry waits for prior cancellation cleanup before enqueuing.
                 previous?.join()
@@ -186,13 +188,16 @@ class AppUpdateViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 ensureActive()
                 if (generation != downloadGeneration) return@launch
+                diagnosticStage = "verify"
                 mutableState.update { it.copy(status = AppUpdateStatus.VERIFYING) }
                 withContext(Dispatchers.IO) {
-                    part = cache.newPart()
-                    downloads.copyTo(download, requireNotNull(part))
-                    val file = cache.promote(requireNotNull(part), manifest)
-                    promoted = file
-                    verifier.verify(file, manifest)
+                    downloads.verifyCompleted(download) {
+                        part = cache.newPart()
+                        downloads.copyTo(download, requireNotNull(part))
+                        val file = cache.promote(requireNotNull(part), manifest)
+                        promoted = file
+                        verifier.verify(file, manifest)
+                    }
                 }
                 ensureActive()
                 if (generation != downloadGeneration) return@launch
@@ -207,6 +212,10 @@ class AppUpdateViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
+                if (generation == downloadGeneration && !verified) {
+                    if (error is AppUpdateVerificationException) error.recordDiagnostic()
+                    else TechnicalDiagnostics.failure("update", diagnosticStage, error)
+                }
                 if (generation == downloadGeneration) mutableState.update {
                     it.copy(status = AppUpdateStatus.FAILED, error = safeMessage(error, "更新包下载失败，请重试。"))
                 }
@@ -266,6 +275,8 @@ class AppUpdateViewModel(application: Application) : AndroidViewModel(applicatio
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
+            if (error is AppUpdateVerificationException) error.recordDiagnostic()
+            else TechnicalDiagnostics.failure("update", "verify", error)
             val message = safeMessage(error, "更新包验证失败，请重新下载。")
             mutableState.update { it.copy(status = AppUpdateStatus.FAILED, error = message) }
             throw AppUpdateVerificationException(message)
@@ -292,4 +303,8 @@ class AppUpdateViewModel(application: Application) : AndroidViewModel(applicatio
         is AppUpdateDownloadException, is AppUpdateVerificationException -> error.message ?: fallback
         else -> fallback
     }
+}
+
+private fun AppUpdateVerificationException.recordDiagnostic() {
+    failure?.let { TechnicalDiagnostics.record("update", it.code, it.stage) }
 }

@@ -1,6 +1,7 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 import { accountStorageKey } from '../runtime.js'
+import { recordDiagnostic } from '../technicalDiagnostics.js'
 import { createId } from '../../utils/id.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
@@ -171,7 +172,9 @@ export const storedSessionVersion = (session: Session): number => loadedVersions
 export const saveSession = async (
   session: Session,
   files: StoredFile[] = [],
-  expectedVersion?: number
+  expectedVersion?: number,
+  expectedChat?: { replyId: string; jobId: string; cancelling?: boolean; requestCancel?: boolean;
+    eventsSeen?: number; canWrite?: () => boolean }
 ): Promise<number> => {
   const summary = storedSummary(session)
   let writtenVersion = 0
@@ -184,13 +187,21 @@ export const saveSession = async (
       try {
         const sync = tx.objectStore('syncState')
         const previous = await sync.get(session.id)
-        if (
+        const sessions = tx.objectStore('sessions')
+        if (expectedChat) {
+          const current = await sessions.get(session.id)
+          const reply = current?.messages.find((message) => message.id === expectedChat.replyId)
+          if (reply?.role !== 'assistant' || reply.chatJob?.id !== expectedChat.jobId ||
+              (!expectedChat.requestCancel && Boolean(reply.chatJob.cancelRequested) !== Boolean(expectedChat.cancelling)) ||
+              (expectedChat.eventsSeen !== undefined && (reply.chatJob.eventsSeen ?? 0) > expectedChat.eventsSeen) ||
+              (expectedChat.canWrite && !expectedChat.canWrite())) {return}
+        } else if (
           expectedVersion !== undefined &&
           previous &&
           previous.version !== expectedVersion &&
           previous.writerId !== localWriterId
         ) {
-          const current = await tx.objectStore('sessions').get(session.id)
+          const current = await sessions.get(session.id)
           if (current) {
             const copy = createSyncConflictCopy(current)
             await tx.objectStore('sessions').add(copy)
@@ -201,7 +212,7 @@ export const saveSession = async (
         for (const file of files) {
           await tx.objectStore('files').put(file)
         }
-        await tx.objectStore('sessions').put(session)
+        await sessions.put(session)
         await tx.objectStore('sessionSummaries').put(summary)
         const changed = changedSyncState(session.id, previous)
         writtenVersion = changed.version
@@ -213,7 +224,7 @@ export const saveSession = async (
     })(),
     tx.done,
   ])
-  notifyLocalChange()
+  if (writtenVersion) {notifyLocalChange()}
   return writtenVersion
 }
 
@@ -228,6 +239,7 @@ export const createSyncConflictCopy = (session: Session): Session => ({
       ? message
       : {
           ...message,
+          chatJob: undefined,
           imageJob: undefined,
           prefix: false,
           status:
@@ -369,6 +381,79 @@ export const saveFiles = (files: StoredFile[]): Promise<void> => putFiles('files
 
 export const loadFile = async (id: string): Promise<Blob | undefined> =>
   (await (await getDB()).get('files', id))?.blob
+
+export type AppendedHistory = { summaries: SessionSummary[]; skipped: number }
+
+const checkAppendState = (canWrite: () => boolean) => {
+  if (!canWrite()) {
+    throw new DOMException('The local workspace changed during history import.', 'AbortError')
+  }
+}
+
+/** Insert all selected conversations in the current schema after their archive is fully validated. */
+export const appendHistory = async (
+  sessions: readonly Session[], files: readonly StoredFile[],
+  canWrite: () => boolean, skipSession: (id: string) => boolean
+): Promise<AppendedHistory> => {
+  checkAppendState(canWrite)
+  const connection = await getDB()
+  checkAppendState(canWrite)
+  const tx = connection.transaction(['sessions', 'sessionSummaries', 'files', 'syncState'], 'readwrite')
+  const live = tx.objectStore('sessions')
+  const summaryStore = tx.objectStore('sessionSummaries')
+  const fileStore = tx.objectStore('files')
+  const sync = tx.objectStore('syncState')
+  const stagedFiles = new Map(files.map((file) => [file.id, file]))
+  const fileIds = new Map<string, { id: string; type: string }>()
+  const summaries: SessionSummary[] = []
+  let skipped = 0
+  try {
+    for (const session of sessions) {
+      checkAppendState(canWrite)
+      if (skipSession(session.id) || (await live.getKey(session.id)) !== undefined) {
+        skipped++
+        continue
+      }
+      for (const message of session.messages) {
+        const references = message.role === 'user'
+          ? message.files
+          : message.blocks.filter((block) => block.type === 'image')
+        for (const file of references) {
+          let local = fileIds.get(file.id)
+          if (!local) {
+            const staged = stagedFiles.get(file.id)
+            local = { id: createId(), type: staged?.blob.type ?? '' }
+            if (staged) {await fileStore.add({ id: local.id, blob: staged.blob })}
+            fileIds.set(file.id, local)
+          }
+          file.id = local.id
+          if (message.role === 'user') {
+            file.mimeType = local.type
+          }
+        }
+      }
+      checkAppendState(canWrite)
+      if (skipSession(session.id)) {
+        // An in-memory session appeared while staging this row. Revalidate the selection
+        // rather than leave unreferenced files or touch the newly created session.
+        throw new DOMException('An existing session changed during history import.', 'AbortError')
+      }
+      const summary = storedSummary(session)
+      await live.add(session)
+      await summaryStore.add(summary)
+      await sync.put(changedSyncState(session.id, await sync.get(session.id)))
+      summaries.push(toSessionSummary(summary))
+    }
+    checkAppendState(canWrite)
+    await tx.done
+  } catch (error) {
+    abortTransaction(tx)
+    await tx.done.catch(() => {})
+    throw error
+  }
+  if (summaries.length) {notifyLocalChange()}
+  return { summaries, skipped }
+}
 
 /** 清空导入暂存：开始导入前清除上次中断（如关闭页面）遗留的数据，导入失败后清除本次写入。 */
 export const clearStaging = async (): Promise<void> => {
@@ -632,8 +717,11 @@ export const applySyncedSession = async (options: {
   }
 }
 
-/** 本地存储失败不打断对话，只在控制台留痕 */
-export const reportStorageError = (action: string) => (error: unknown) => {
+/** 本地存储失败不打断对话。诊断只保留操作阶段。 */
+export const reportStorageError = (action: string, stage: 'read' | 'save') => (error: unknown) => {
+  if (!(error instanceof DOMException && error.name === 'AbortError')) {
+    recordDiagnostic('chat', 'storage_error', { stage })
+  }
   // eslint-disable-next-line no-console
   console.error(`[storage] ${action} failed`, error)
 }

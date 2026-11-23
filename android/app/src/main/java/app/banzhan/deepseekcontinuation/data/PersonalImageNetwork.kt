@@ -1,6 +1,7 @@
 package app.banzhan.deepseekcontinuation.data
 
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.URI
 import java.net.URISyntaxException
 import java.util.concurrent.TimeUnit
@@ -34,7 +35,12 @@ import okio.BufferedSink
 import okio.BufferedSource
 
 internal data class PersonalImageFile(val name: String, val mime: String, val bytes: ByteArray)
-internal class PersonalImageException(message: String) : IOException(message)
+internal class PersonalImageException(
+    message: String,
+    val diagnosticCode: String? = null,
+    val diagnosticStage: String = "response",
+    val httpStatus: Int? = null,
+) : IOException(message)
 
 /** Independent of the app account, WebView cookies and managed model service. */
 internal object PersonalImageNetwork {
@@ -114,13 +120,13 @@ internal object PersonalImageNetwork {
         }.toString().toRequestBody(jsonContentType)
         val result = read(request.post(OneShotBody(body)).build(), 240, 29 * MIB, action, ::parseImage)
         val image = if (!result.base64.isNullOrEmpty()) {
-            if (result.mime != null && result.mime !in imageMimeTypes) throw PersonalImageException(INVALID_RESULT)
+            if (result.mime != null && result.mime !in imageMimeTypes) throw PersonalImageException(INVALID_RESULT, "invalid_response")
             ProviderImage(base64 = compactBase64(result.base64), mime = result.mime)
         } else {
-            val resultUrl = result.url?.let(::httpsUrl) ?: throw PersonalImageException(INVALID_RESULT)
+            val resultUrl = result.url?.let(::httpsUrl) ?: throw PersonalImageException(INVALID_RESULT, "invalid_response")
             // Signed result links may use a query. No provider Key, Cookie or Referer is attached.
             read(Request.Builder().url(resultUrl).get().build(), 45, MAX_IMAGE_BYTES, null) {
-                if (it.exhausted()) throw PersonalImageException(INVALID_RESULT)
+                if (it.exhausted()) throw PersonalImageException(INVALID_RESULT, "invalid_response", "download")
                 ProviderImage(base64 = it.readByteString().base64())
             }
         }
@@ -152,17 +158,17 @@ internal object PersonalImageNetwork {
     @OptIn(ExperimentalSerializationApi::class)
     private fun parseImage(source: BufferedSource): ProviderImage =
         providerJson.decodeFromStream<ImageResponse>(source.inputStream()).data.singleOrNull()
-            ?: throw PersonalImageException("个人生图服务没有返回单张图片。")
+            ?: throw PersonalImageException("个人生图服务没有返回单张图片。", "invalid_response")
 
     private fun compactBase64(value: String): String {
         if (value.length > MAX_BASE64 + 65536 || value.any {
                 it !in 'A'..'Z' && it !in 'a'..'z' && it !in '0'..'9' &&
                     it != '+' && it != '/' && it != '=' && !base64Space(it)
             }) {
-            throw PersonalImageException(INVALID_RESULT)
+            throw PersonalImageException(INVALID_RESULT, "invalid_response")
         }
         val compact = if (value.any(::base64Space)) value.filterNot(::base64Space) else value
-        if (compact.length !in 1..MAX_BASE64) throw PersonalImageException(INVALID_RESULT)
+        if (compact.length !in 1..MAX_BASE64) throw PersonalImageException(INVALID_RESULT, "invalid_response")
         return compact
     }
 
@@ -178,7 +184,7 @@ internal object PersonalImageNetwork {
             override fun onFailure(call: Call, e: IOException) {
                 if (continuation.isActive) continuation.resumeWithException(
                     (e as? UpstreamStatus)?.let { httpError(action, it.code) }
-                        ?: PersonalImageException(connectionFailure(action)),
+                        ?: ioFailure(action, e),
                 )
             }
 
@@ -187,10 +193,12 @@ internal object PersonalImageNetwork {
                     val value = response.use {
                         if (!continuation.isActive) throw CancellationException()
                         if (!it.isSuccessful) throw httpError(action, it.code)
-                        val body = it.body ?: throw PersonalImageException(emptyResponse(action))
+                        val body = it.body ?: throw PersonalImageException(emptyResponse(action),
+                            "invalid_response", if (action == null) "download" else "response")
                         val source = body.source()
                         if (body.contentLength() > limit || source.request(limit.toLong() + 1)) {
-                            throw PersonalImageException("个人生图服务的响应超过大小限制。")
+                            throw PersonalImageException("个人生图服务的响应超过大小限制。",
+                                "invalid_response", if (action == null) "download" else "response")
                         }
                         if (!continuation.isActive) throw CancellationException()
                         parse(source)
@@ -200,14 +208,19 @@ internal object PersonalImageNetwork {
                     if (continuation.isActive) {
                         continuation.resumeWithException(when (e) {
                             is PersonalImageException, is CancellationException -> e
-                            is IOException -> PersonalImageException(connectionFailure(action))
-                            else -> PersonalImageException(emptyResponse(action))
+                            is IOException -> ioFailure(action, e)
+                            else -> PersonalImageException(emptyResponse(action),
+                                "invalid_response", if (action == null) "download" else "response")
                         })
                     }
                 }
             }
         })
     }
+
+    private fun ioFailure(action: Operation?, error: IOException) = PersonalImageException(
+        connectionFailure(action), if (error is InterruptedIOException) "timeout" else "network_error",
+        if (action == null) "download" else "request")
 
     private fun emptyResponse(action: Operation?): String = when (action) {
         Operation.MODELS -> "服务未返回兼容的模型列表。"
@@ -227,7 +240,8 @@ internal object PersonalImageNetwork {
             "个人生图服务的图片编辑接口不可用（HTTP $code）。请检查服务地址及模型是否支持图片编辑。"
         else "个人生图服务未能编辑图片（HTTP $code）。请检查服务配置、模型和参考图。"
         Operation.GENERATE -> "个人生图服务返回 HTTP $code。"
-    })
+    }, if (code in 500..599 || code == 408) "http_error" else null,
+        if (action == null) "download" else "response", code)
 
     private class UpstreamStatus(val code: Int) : IOException()
 

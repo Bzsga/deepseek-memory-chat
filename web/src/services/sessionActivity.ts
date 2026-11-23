@@ -1,5 +1,5 @@
 import { cancelUpload, useUploads } from './attachments.js'
-import { clearAllDrafts } from './chat/drafts.js'
+import { releaseDraftMemory } from './chat/drafts.js'
 import { suspendReply, useChatStore } from './chat/store.js'
 import { stopReadAloud } from './speech/readAloud.js'
 
@@ -11,7 +11,7 @@ export const stopSessionActivity = (clearDrafts = false) => {
   stopReadAloud()
   window.dispatchEvent(new Event('deepseek-session-ending'))
   if (clearDrafts) {
-    clearAllDrafts()
+    releaseDraftMemory()
     for (const id of Object.keys(useUploads.getState().tasks)) {
       cancelUpload(id)
     }

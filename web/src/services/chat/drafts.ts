@@ -10,6 +10,11 @@ import {
   type UploadTask,
 } from '../attachments.js'
 import type { FileAttachment } from './types.js'
+import {
+  clearSavedDraftText,
+  loadDraftText,
+  saveDraftText,
+} from './draftTextStorage.js'
 
 export type DraftAttachment = {
   /** 本地标识，也是 IndexedDB 原件与上传任务的 key */
@@ -23,9 +28,9 @@ type Draft = { text: string; attachments: DraftAttachment[] }
 
 export const EMPTY_DRAFT: Draft = { text: '', attachments: [] }
 
-/** 草稿只保存在本次页面的内存中，独立于会话详情缓存；null 是新对话的草稿。 */
+/** 按当前工作区恢复文字。附件和上传任务仍随页面释放。null 是新对话。 */
 export const useDrafts = create<{ drafts: Map<string | null, Draft> }>(() => ({
-  drafts: new Map(),
+  drafts: new Map(Array.from(loadDraftText(), ([id, text]) => [id, { text, attachments: [] }])),
 }))
 
 export const getDraft = (sessionId: string | null): Draft =>
@@ -43,8 +48,10 @@ const updateDraft = (sessionId: string | null, update: (draft: Draft) => Draft) 
     return { drafts }
   })
 
-export const setDraftText = (sessionId: string | null, text: string) =>
+export const setDraftText = (sessionId: string | null, text: string) => {
+  saveDraftText(sessionId, text)
   updateDraft(sessionId, (draft) => ({ ...draft, text }))
+}
 
 const upload = (attachment: DraftAttachment, apiKey: string) => {
   // 上传任务负责记录错误，输入框的附件卡片展示失败及重试入口。
@@ -144,18 +151,25 @@ export const removeDraftAttachment = (sessionId: string | null, attachmentId: st
 /** 发送成功后原件与 serverId 已交给会话，释放预览但保留上传完成态。 */
 export const clearSentDraft = (sessionId: string | null) => {
   getDraft(sessionId).attachments.forEach((attachment) => releaseAttachment(attachment, false))
+  saveDraftText(sessionId, '')
   updateDraft(sessionId, () => EMPTY_DRAFT)
 }
 
 /** 删除会话或替换历史成功后，释放尚未发送的草稿及上传任务。 */
 export const clearDraft = (sessionId: string | null) => {
   getDraft(sessionId).attachments.forEach((attachment) => releaseAttachment(attachment, true))
+  saveDraftText(sessionId, '')
   updateDraft(sessionId, () => EMPTY_DRAFT)
 }
 
-export const clearAllDrafts = () => {
+export const releaseDraftMemory = () => {
   for (const draft of useDrafts.getState().drafts.values()) {
     draft.attachments.forEach((attachment) => releaseAttachment(attachment, true))
   }
   useDrafts.setState({ drafts: new Map() })
+}
+
+export const clearAllDrafts = () => {
+  clearSavedDraftText()
+  releaseDraftMemory()
 }

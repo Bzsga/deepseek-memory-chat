@@ -82,14 +82,104 @@ class AdminAccountNetworkTest {
         assertEquals("false", disabled["enabled"]!!.jsonPrimitive.content)
     }
 
-    @Test fun resetPasswordChecksTheRequestedIdentityAndRedactsItsStringForm() {
-        val payload = """{"id":"registered-user","username":"test_user","password":"new-one-time-secret"}"""
-        val result = AdminNetwork.parsePasswordReset(payload, "registered-user")
-        assertEquals("new-one-time-secret", result.password)
-        assertFalse(result.toString().contains(result.password))
-        assertThrows(Exception::class.java) { AdminNetwork.parsePasswordReset(payload, "another-user") }
+    @Test fun roleAndEffectivePermissionsAreOptionalButStrictWhenPresent() {
+        val old = AdminNetwork.parseAdminUsers(users()).users.single()
+        assertNull(old.role)
+        assertNull(old.effectivePermissions)
+
+        val effective = """"effective_permissions":{"chat_api":true,"image_api":false,"cloud_sync":true}"""
+        val fields = """"role":"admin","permissions":{"chat_api":false,"image_api":false,"cloud_sync":false},$effective"""
+        val parsed = AdminNetwork.parseAdminUsers(users(user.dropLast(1) + ",$fields}")).users.single()
+        assertEquals("admin", parsed.role)
+        assertEquals(ServicePermissions(false, false, false), parsed.servicePermissions)
+        assertEquals(ServicePermissions(true, false, true), parsed.effectivePermissions)
+
+        listOf(
+            """"role":"owner"""",
+            """"role":null""",
+            """"effective_permissions":null""",
+            """"effective_permissions":{"chat_api":"true","image_api":false,"cloud_sync":true}""",
+            """"effective_permissions":{"chat_api":true,"image_api":false}""",
+        ).forEach { field ->
+            assertThrows(Exception::class.java) { AdminNetwork.parseAdminUsers(users(user.dropLast(1) + ",$field}")) }
+        }
+    }
+
+    @Test fun searchMatchesNameOrIdAcrossServerPagesAndKeepsTheRequestedFilter() = runBlocking {
+        val fixture = AdminNetwork.parseAdminUsers(users())
+        val sample = fixture.users.single()
+        val requests = mutableListOf<Pair<Int, Int>>()
+        val page = AdminNetwork.getUsersPage(1, 10, " MATCH ", AdminUserStatusFilter.DISABLED) { limit, offset ->
+            requests += limit to offset
+            val entries = when (offset) {
+                0 -> List(199) { sample.copy(id = "account-$it") } + sample.copy(id = "duplicate", username = "match")
+                200 -> listOf(
+                    sample.copy(id = "duplicate", username = "match", enabled = false),
+                    sample.copy(id = "user-match", enabled = false),
+                    sample.copy(id = "found-by-name", username = "match name", enabled = false),
+                )
+                else -> error("Unexpected user page")
+            }
+            fixture.copy(limit = limit, offset = offset, total = 203L, users = entries)
+        }
+        assertEquals(listOf(200 to 0, 200 to 200), requests)
+        assertEquals(2L, page.total)
+        assertEquals(1, page.offset)
+        assertEquals("found-by-name", page.users.single().id)
+        assertEquals(fixture.week, page.week)
+        assertEquals(fixture.resetAt, page.resetAt)
+        assertEquals("MATCH", page.query)
+        assertEquals(AdminUserStatusFilter.DISABLED, page.statusFilter)
+    }
+
+    @Test fun plainBrowsingFetchesOnePageExceptWhenItsOffsetNeedsCorrection() = runBlocking {
+        val fixture = AdminNetwork.parseAdminUsers(users())
+        val requests = mutableListOf<Pair<Int, Int>>()
+        suspend fun get(offset: Int) = AdminNetwork.getUsersPage(50, offset, " ", AdminUserStatusFilter.ALL) { limit, start ->
+            requests += limit to start
+            fixture.copy(limit = limit, offset = start, users = if (start == 0) fixture.users else emptyList())
+        }
+        assertEquals(fixture, get(0))
+        assertEquals(listOf(50 to 0), requests)
+        requests.clear()
+        assertEquals(fixture, get(50))
+        assertEquals(listOf(50 to 50, 50 to 0), requests)
+    }
+
+    @Test fun filteredPagingRejectsWeekRollover() = runBlocking {
+        val fixture = AdminNetwork.parseAdminUsers(users())
+        val problem = runCatching {
+            AdminNetwork.getUsersPage(25, 0, "", AdminUserStatusFilter.ENABLED) { limit, offset ->
+                fixture.copy(limit = limit, offset = offset, total = 201L,
+                    week = if (offset == 0) fixture.week else "2026-11-16")
+            }
+        }.exceptionOrNull()
+        assertTrue(problem is SummaryFailure)
+    }
+
+    @Test fun resetLinkMatchesTheRequestedIdentityAndTrustedAccountPage() {
+        val service = "https://example.com/deepseek-api"
+        val page = "$service/v1/accounts/reset-password"
+        val token = "a".repeat(43)
+        val link = "$page#token=$token"
+        val payload = """{"id":"registered-user","username":"test_user","url":"$link","expires_at":"2026-11-21T12:00:00+08:00"}"""
+        val result = AdminNetwork.parsePasswordResetLink(payload, "registered-user", service)
+        assertEquals(link, result.url)
+        assertEquals("2026-11-21T12:00:00+08:00", result.expiresAt)
+        assertFalse(result.toString().contains(token))
         assertThrows(Exception::class.java) {
-            AdminNetwork.parsePasswordReset(payload.replace("new-one-time-secret", "short"), "registered-user")
+            AdminNetwork.parsePasswordResetLink(payload, "another-user", service)
+        }
+        listOf(
+            link.replace("https", "http"),
+            link.replace("example.com", "example.net"),
+            link.replace("accounts", "admin"),
+            "$page?token=$token",
+            "$page#token=invalid",
+        ).forEach { invalid ->
+            assertThrows(Exception::class.java) {
+                AdminNetwork.parsePasswordResetLink(payload.replace(link, invalid), "registered-user", service)
+            }
         }
     }
 

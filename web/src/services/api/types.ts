@@ -127,6 +127,9 @@ export type ToolUseBlock = { type: 'tool_use'; id: string; name: string; input: 
 
 export type TextBlockParam = { type: 'text'; text: string }
 
+export type ToolUseBlockParam = { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+export type ToolResultBlockParam = { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+
 /**
  * 文件块：引用经 Files API 上传的文件，图片用 image、其余用 document；
  * 图片请求需带 anthropic-beta: files-api-2025-04-14；扩展模式不支持 document，返回 400。
@@ -151,6 +154,7 @@ export type WebFetchToolResultBlockParam = WebFetchToolResultBlock
 export type AssistantBlockParam =
   | TextBlockParam
   | ThinkingBlock
+  | ToolUseBlockParam
   | ServerToolUseBlockParam
   | WebSearchToolResultBlockParam
   | WebFetchToolResultBlockParam
@@ -159,7 +163,7 @@ export type AssistantBlockParam =
 export type MessageParam =
   /** Chat Engine 扩展角色，位于对应 user 前；需服务端支持 latest_reminder。 */
   | { role: 'latest_reminder'; content: string }
-  | { role: 'user'; content: string | (FileBlockParam | TextBlockParam)[] }
+  | { role: 'user'; content: string | (FileBlockParam | TextBlockParam | ToolResultBlockParam)[] }
   | { role: 'assistant'; content: AssistantBlockParam[] }
 
 /** 开启联网搜索与边想边搜 */
@@ -174,14 +178,24 @@ export type DeepseekReadUrlTool = {
   name: 'deepseek_read_url'
 }
 
+/** DeepSeek Messages selects server tools by type. Client tools omit that field. */
+export type ClientMessageTool = {
+  type?: never
+  name: string
+  description?: string
+  input_schema: Record<string, unknown>
+}
+
 export type CreateMessageRequest = {
   model: ChatModel
   output_config?: { effort: Exclude<ReasoningEffort, ''> }
   temperature?: number
+  max_tokens?: number
   system: string
   messages: MessageParam[]
   thinking: { type: 'enabled' | 'disabled' }
-  tools: (DeepseekWebSearchTool | DeepseekReadUrlTool)[]
+  tools: (DeepseekWebSearchTool | DeepseekReadUrlTool | ClientMessageTool)[]
+  tool_choice?: { type: 'auto' | 'none' }
   safety_check: { level: 'high' }
   title?: { enabled: boolean }
 }
@@ -193,12 +207,16 @@ export type StopReason = 'end_turn' | 'max_tokens' | 'tool_use' | 'refusal'
 export type StopDetails = { type: 'refusal'; category: null; explanation: null }
 
 export type MessageUsage = {
-  /** 未命中缓存的输入 Token */
+  /** 未命中缓存的输入 Token；兼容接口未提供缓存拆分时为输入总量。 */
   input_tokens: number
   cache_creation_input_tokens: number
   cache_read_input_tokens: number
-  /** message_start 中为 0，message_delta 中为全轮累计值 */
+  /** 服务未给出完整的缓存拆分；缺失字段的占位 0 不是实测用量。 */
+  cache_usage_reported?: false
+  /** message_start 中为 0，message_delta 中为全轮累计值。 */
   output_tokens: number
+  /** 思考和安全检查已计入 output_tokens。 */
+  output_tokens_details?: { thinking_tokens?: number; safety_tokens?: number }
   /** 仅当 message_delta 中有对外输出的搜索结果块时出现 */
   server_tool_use?: { web_search_requests: number; tool_search: number }
 }

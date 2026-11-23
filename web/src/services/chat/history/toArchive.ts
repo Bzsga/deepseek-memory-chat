@@ -2,6 +2,7 @@ import type { ServerToolUseBlock } from '../../api/types.js'
 import { getVisibleMessages, normalizeSession } from '../branches.js'
 import { describeReply } from '../describe.js'
 import { remapMemorySources } from '../contextMemory.js'
+import { normalizeMcpSources } from '../mcpSources.js'
 import { remapSharedSource } from '../sharedSource.js'
 import { toLocalSession } from './toLocal.js'
 import type { AssistantMessage, Message, ReplyBlock, Session, UserMessage } from '../types.js'
@@ -246,8 +247,10 @@ export const toSessionFile = (original: Session, exportImage: ExportImage): Sess
       parent_id: message.parentId ? (ids.get(message.parentId) ?? null) : null,
     }
     const reply = message.role === 'assistant' ? message : firstReply.get(message.id)
+    const mcpSources = message.role === 'user' ? normalizeMcpSources(message.mcpSources) : []
     return {
       ...tree,
+      ...(mcpSources.length > 0 ? { mcp_sources: mcpSources } : {}),
       ...(message.role === 'assistant' && message.imageAction ? { image_action: message.imageAction } : {}),
       ...(message.role === 'assistant' && message.imagePrompt !== undefined ? { image_prompt: message.imagePrompt } : {}),
       ...(message.role === 'assistant' && message.imageOrigin ? { image_origin: message.imageOrigin } : {}),

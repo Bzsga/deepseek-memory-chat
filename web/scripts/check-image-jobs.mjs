@@ -16,10 +16,18 @@ try {
   writeFileSync(join(output, 'src/services/chat/db.js'), `
     import {toSessionSummary} from './types.js';
     export const rows = new Map(); export const files = new Map(); export const summaries = new Map();
-    export const saveSession = async (value, originals=[]) => {
+    let version = 0;
+    export const saveSession = async (value, originals=[], expectedVersion, guard) => {
+      if (guard) {
+        const job = rows.get(value.id)?.messages.find(message => message.id === guard.replyId)?.chatJob;
+        if (!job || job.id !== guard.jobId || (!guard.requestCancel && Boolean(job.cancelRequested) !== Boolean(guard.cancelling)) ||
+            (guard.eventsSeen !== undefined && (job.eventsSeen ?? 0) > guard.eventsSeen) || (guard.canWrite && !guard.canWrite())) return 0;
+      }
       rows.set(value.id,structuredClone(value)); summaries.set(value.id,toSessionSummary(value));
       for(const file of originals)files.set(file.id,file.blob);
+      return ++version;
     };
+    export const storedSessionVersion = () => version;
     export const loadSession = async id => structuredClone(rows.get(id));
     export const loadSessionSummaries = async () => [...summaries.values()];
     export const loadFile = async id => files.get(id);
@@ -30,8 +38,9 @@ try {
   `)
   globalThis.__API_ORIGIN__ = '/deepseek-api/chat'
   globalThis.window = new EventTarget()
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
   globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
-  globalThis.cancelAnimationFrame = () => {}
+  globalThis.cancelAnimationFrame = clearTimeout
   globalThis.requestAnimationFrame = callback => realTimeout(callback, 0)
   const load = path => import(pathToFileURL(join(output, 'src', path)))
   const runtime = await load('services/runtime.js')
@@ -59,6 +68,12 @@ try {
   let disconnectCreation = false
   let offline = false
   let holdGet
+  let chatMode = 'partial'
+  const chatPosts = []
+  const chatWatches = []
+  const chatCancels = []
+  const chatNonces = new Map()
+  const waitingImageWatchers = []
   const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2i8AAAAASUVORK5CYII='
   const originalBytes = Buffer.from(image, 'base64')
   const { createImageJob } = await load('services/api/imageJobs.js')
@@ -105,11 +120,58 @@ try {
   const metadata = job => ({ id: job.id, client_request_id: job.id, status: job.status, model: 'synthetic-image',
     created_at: new Date().toISOString(), updated_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString(), has_result: job.status === 'completed',
     ...(job.status === 'unknown' ? { error: { code: 'image_job_interrupted', message: '合成重启未知结果' } } : {}) })
+  const chatEvents = (mode, signal, jobId) => {
+    const nonce = chatNonces.get(jobId)
+    const events = [
+      ...(mode === 'held-image' ? [{ type: 'message_start', message: { id: 'synthetic-chat-image', model: 'deepseek-flash' } }] : []),
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '部分' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: mode === 'held-image'
+        ? `答案\n[[APP_IMAGE_ACTION:${nonce}]]\n{"prompt":"合成海边日出"}\n[[/APP_IMAGE_ACTION:${nonce}]]`
+        : '答案' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+      { type: 'message_stop' },
+    ]
+    const bytes = new TextEncoder().encode((mode === 'partial' ? events.slice(0, 1) : events)
+      .map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''))
+    return new Response(new ReadableStream({ start(controller) {
+      const write = () => {
+        if (signal.aborted) return
+        controller.enqueue(bytes)
+        if (mode !== 'partial') controller.close()
+      }
+      if (mode === 'held-image') waitingImageWatchers.push(write)
+      else write()
+      signal.addEventListener('abort', () => {
+        if (mode === 'partial') controller.error(new DOMException('aborted', 'AbortError'))
+      }, { once: true })
+    } }), { headers: { 'Content-Type': 'text/event-stream' } })
+  }
   globalThis.fetch = async (url, init) => {
     const path = new URL(url, 'http://synthetic.invalid').pathname
     calls.push({ path, method: init.method })
     assert.equal(init.headers.get('X-Chat-User-Id'), 'synthetic-job-owner')
     if (offline) throw new TypeError('synthetic network disconnected')
+    const chat = /\/api\/chat-jobs\/([^/]+)(?:\/(events|cancel))?$/.exec(path)
+    if (chat) {
+      const [, id, endpoint] = chat
+      if (init.method === 'POST' && !endpoint) {
+        const local = [...db.rows.values()].find(session => session.messages.some(message => message.chatJob?.id === id))
+        assert.ok(local, 'Chat request ID must be durable before POST')
+        assert.equal(db.summaries.get(local.id).pendingChatJob, true)
+        chatNonces.set(id, /APP_IMAGE_REQUEST nonce=([a-f\d]{32})/.exec(init.body)?.[1])
+        chatPosts.push(id)
+        return response({}, 202)
+      }
+      if (endpoint === 'cancel') {
+        assert.ok([...db.rows.values()].some(session => session.messages.some(message =>
+          message.chatJob?.id === id && message.chatJob.cancelRequested)), 'Stop intent must be durable before cancel')
+        chatCancels.push(id)
+        return response({})
+      }
+      chatWatches.push(id)
+      return chatEvents(chatMode, init.signal, id)
+    }
     const match = /^\/deepseek-api\/chat\/api\/image-jobs(?:\/([^/]+)(?:\/(result|cancel))?)?$/.exec(path)
     assert.ok(match, `Unexpected external request ${path}`)
     let id = match[1]
@@ -336,7 +398,7 @@ try {
   }
   await imageProvider.configureImageProvider('personal', 'https://images.invalid', 'synthetic-image-key', 'draw-test')
   assert.deepEqual(await imageProvider.imageModels('https://images.invalid', ''), ['draw-test'])
-  assert.throws(() => imageProvider.imageModels('https://another.invalid', ''))
+  await assert.rejects(() => imageProvider.imageModels('https://another.invalid', ''))
   fresh('personal'); send('personal'); await idle('personal')
   assert.equal(reply('personal').imageModel, 'draw-test')
   assert.equal(reply('personal').blocks[0].mimeType, 'image/png')
@@ -398,6 +460,80 @@ try {
   await until(() => holdGet.resolve !== undefined)
   await store.replaceHistory(async () => {})
   assert.equal(db.rows.size, 0)
+
+  // The same reply ID receives a complete replay after page teardown, with no second generation POST.
+  runtime.initializeRuntime({ ...runtime.getRuntime(), features: { ...runtime.getRuntime().features, background_chat: true } })
+  const chatProvider = await load('services/chatProvider.js')
+  await chatProvider.initializeChatProvider()
+  const { encodeSyncSnapshot } = await load('services/chat/syncCodec.js')
+  fresh('chat-resume')
+  drafts.setDraftText('chat-resume', '合成聊天任务')
+  assert.equal(store.sendMessage('chat-resume'), true)
+  await until(() => reply('chat-resume')?.blocks[0]?.text === '部分')
+  const originalReply = reply('chat-resume')
+  const originalChatId = originalReply.chatJob.id
+  assert.deepEqual(chatPosts, [originalChatId])
+  assert.ok(!JSON.stringify(toSessionFile(db.rows.get('chat-resume'), () => null)).includes(originalChatId))
+  assert.throws(() => encodeSyncSnapshot(db.rows.get('chat-resume')), /仍在生成/)
+  store.suspendReply('chat-resume')
+  await idle('chat-resume')
+  assert.equal(chatCancels.length, 0)
+  assert.equal(db.rows.get('chat-resume').messages.at(-1).blocks[0].text, '部分')
+  chatMode = 'complete'
+  store.useChatStore.setState({ ready: false, sessions: [], sessionCache: {}, activeId: null, streaming: {} })
+  await store.initChat()
+  await until(() => reply('chat-resume')?.status === 'done')
+  await idle('chat-resume')
+  assert.deepEqual(chatPosts, [originalChatId])
+  assert.deepEqual(chatWatches, [originalChatId, originalChatId])
+  assert.equal(reply('chat-resume').id, originalReply.id)
+  assert.equal(reply('chat-resume').blocks[0].text, '部分答案')
+  assert.equal(reply('chat-resume').chatJob, undefined)
+  assert.equal(db.summaries.get('chat-resume').pendingChatJob, undefined)
+  assert.ok(!JSON.stringify(encodeSyncSnapshot(db.rows.get('chat-resume'))).includes(originalChatId))
+
+  fresh('chat-stop')
+  chatMode = 'partial'
+  drafts.setDraftText('chat-stop', '合成停止任务')
+  assert.equal(store.sendMessage('chat-stop'), true)
+  await until(() => reply('chat-stop')?.blocks[0]?.text === '部分')
+  const stoppedChatId = reply('chat-stop').chatJob.id
+  offline = true
+  store.stopReply('chat-stop')
+  await idle('chat-stop')
+  await until(() => reply('chat-stop')?.chatJob?.cancelRequested)
+  await new Promise(done => realTimeout(done, 25))
+  assert.equal(db.rows.get('chat-stop').messages.at(-1).chatJob.cancelRequested, true)
+  drafts.setDraftText('chat-stop', '停止确认前不能覆盖本次任务')
+  assert.equal(store.sendMessage('chat-stop'), false)
+  offline = false
+  store.reconnectChatJob('chat-stop')
+  await until(() => reply('chat-stop')?.status === 'stopped')
+  assert.deepEqual(chatCancels, [stoppedChatId])
+  assert.deepEqual(chatPosts, [originalChatId, stoppedChatId])
+  assert.equal(db.summaries.get('chat-stop').pendingChatJob, undefined)
+
+  // Two local pages watching the same job can both receive the action, but only one can pay for it.
+  fresh('chat-image')
+  state = 'completed'
+  holdGet = undefined
+  chatMode = 'held-image'
+  drafts.setDraftText('chat-image', '帮我生成一张合成图片')
+  assert.equal(store.sendMessage('chat-image'), true)
+  await until(() => waitingImageWatchers.length === 1)
+  const resultId = reply('chat-image').chatJob.id
+  const pageTwo = await import(pathToFileURL(join(output, 'src/services/chat/store.js')).href + '?second-page')
+  await pageTwo.initChat()
+  await until(() => waitingImageWatchers.length === 2)
+  const paidImages = dispatches
+  for (const finish of waitingImageWatchers) finish()
+  await until(() => db.rows.get('chat-image')?.messages.at(-1)?.blocks.some(block => block.type === 'image'))
+  await idle('chat-image')
+  await until(() => !pageTwo.useChatStore.getState().streaming['chat-image'])
+  assert.equal(dispatches, paidImages + 1)
+  assert.equal(chatPosts.filter(id => id === resultId).length, 1)
+  assert.ok(!JSON.stringify(encodeSyncSnapshot(db.rows.get('chat-image'))).includes(resultId))
+
   holdGet = {}
   fresh('account-ended')
   store.useChatStore.setState({ sessionCache: { 'account-ended': { ...deleting, id: 'account-ended' } } })
@@ -409,7 +545,7 @@ try {
   await idle('account-ended')
   assert.equal(calls.filter(call => call.path.endsWith('/cancel')).length, cancelCalls)
   assert.equal(reply('account-ended').blocks.length, 0)
-  console.log('Image job checks passed: durable IDs before dispatch, lost create response and one generation, hidden/destroyed view recovery, pending-summary startup restore, deterministic files, portable backup isolation, explicit same-ID submission, ordered reference validation and persistence, managed edit recovery and branching, missing reference blocks all dispatch, personal single/multiple edit upload and no text-generation fallback, persisted cancellation/tombstone, network pause without new job, deletion/import/account isolation. Synthetic HTTP and storage boundaries only.')
+  console.log('Background job checks passed: image job lifecycle and chat GET-only reload replay, same reply ID, no duplicate POST, portable/sync isolation, and persisted explicit Stop across a disconnect. Synthetic HTTP and storage boundaries only.')
 } finally {
   globalThis.setTimeout = realTimeout
   if (!output.startsWith(root + sep)) throw Error('Unexpected temporary output')

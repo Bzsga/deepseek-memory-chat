@@ -1,4 +1,72 @@
-import { ApiError } from './client.js'
+import { ApiError, type ApiErrorKind } from './ApiError.js'
+
+export const CHAT_INPUT_LIMIT_CODE = 'chat_input_too_long'
+export const MAX_ERROR_BODY_BYTES = 8192
+const inputLimitPattern = /^\s*user input too long,\s*([0-9]{1,12})\s+tokens exceeds max\s+([0-9]{1,12})\s+tokens\b/i
+const maxReportedTokenCount = 999_999_999_999
+
+export class ChatInputLimitError extends ApiError {
+  constructor(
+    kind: ApiErrorKind,
+    readonly reportedTokens?: { inputTokens: number; maxInputTokens: number }
+  ) {
+    super(kind, { key: 'replyContextInputTooLong' }, 400, CHAT_INPUT_LIMIT_CODE)
+  }
+}
+
+export const chatInputLimitError = (
+  kind: ApiErrorKind,
+  error: unknown
+): ChatInputLimitError | undefined => {
+  const { code, message, input_tokens, max_input_tokens } = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; message?: unknown; input_tokens?: unknown; max_input_tokens?: unknown }
+    : { message: error, code: undefined, input_tokens: undefined, max_input_tokens: undefined }
+  const coded = code === CHAT_INPUT_LIMIT_CODE || code === 'context_length_exceeded'
+  if (coded && typeof input_tokens === 'number' && typeof max_input_tokens === 'number' &&
+      Number.isSafeInteger(input_tokens) && Number.isSafeInteger(max_input_tokens) &&
+      max_input_tokens > 0 && input_tokens > max_input_tokens && input_tokens <= maxReportedTokenCount) {
+    return new ChatInputLimitError(kind, { inputTokens: input_tokens, maxInputTokens: max_input_tokens })
+  }
+  const match = typeof message === 'string' ? inputLimitPattern.exec(message.slice(0, 512)) : null
+  if (match) {
+    const inputTokens = Number(match[1])
+    const maxInputTokens = Number(match[2])
+    if (maxInputTokens > 0 && inputTokens > maxInputTokens) {
+      return new ChatInputLimitError(kind, { inputTokens, maxInputTokens })
+    }
+  }
+  if (coded) {
+    return new ChatInputLimitError(kind)
+  }
+  return undefined
+}
+
+export const apiErrorField = (value: unknown): unknown =>
+  value && typeof value === 'object' && 'error' in value ? value.error : undefined
+
+/** Error bodies can echo input. Read only a bounded JSON body, never display it here. */
+export const readSmallErrorJson = async (response: Response): Promise<unknown> => {
+  const reader = response.body?.getReader()
+  if (!reader) {return undefined}
+  const decoder = new TextDecoder()
+  let size = 0
+  let text = ''
+  try {
+    while (true) {
+      const part = await reader.read()
+      if (part.done) {
+        return JSON.parse(text + decoder.decode()) as unknown
+      }
+      size += part.value.byteLength
+      if (size > MAX_ERROR_BODY_BYTES) {return undefined}
+      text += decoder.decode(part.value, { stream: true })
+    }
+  } catch {
+    return undefined
+  } finally {
+    await reader.cancel().catch(() => {})
+  }
+}
 
 /**
  * 接口失败的统一分类。各调用方按自己的场景给同一种情况配不同文案，

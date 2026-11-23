@@ -32,8 +32,18 @@ class SummaryFailure(
     message: String,
     val ambiguous: Boolean = true,
     val expired: Boolean = false,
-    val statusCode: Int? = null
+    val statusCode: Int? = null,
+    internal val failureDetail: String? = null,
+    internal val timedOut: Boolean = false,
+    internal val requestId: String? = null,
 ) : IOException(message)
+
+internal enum class PersonalSummaryResponseFailure(val detail: String) {
+    ENVELOPE("model_envelope_invalid"),
+    INCOMPLETE("model_finish_incomplete"),
+    BLANK("model_content_blank"),
+    ENTRIES("model_entries_invalid"),
+}
 
 data class RemoteJob(
     val id: String,
@@ -110,18 +120,34 @@ object SummaryNetwork {
         val body = SummaryProtocol.requestBody(settings, messages, promptVersion, contextMessages)
         val request = authenticated(chatEndpoint(settings.baseUrl), settings.apiKey)
             .post(body.toRequestBody(contentType)).build()
-        val response = exchange(request, mutation = true, secrets = listOf(settings.apiKey))
-        return parseResult(ambiguous = true) {
+        val response = exchange(request, mutation = true, secrets = listOf(settings.apiKey), personalOrganization = true)
+        return parsePersonalSummaryResponse(response, messages, contextMessages)
+    }
+
+    internal suspend fun parsePersonalSummaryResponse(response: String, messages: List<ChatMessage>,
+        contextMessages: List<ChatMessage> = emptyList()): List<ArchiveEntry> {
+        val choice = parseResult(ambiguous = true, failureDetail = PersonalSummaryResponseFailure.ENVELOPE.detail) {
             val root = objectResponse(response)
-            val choice = (root["choices"] as? JsonArray)?.firstOrNull() as? JsonObject
+            (root["choices"] as? JsonArray)?.firstOrNull() as? JsonObject
                 ?: error("API 未返回可读取的整理内容")
-            val reason = (choice["finish_reason"] as? JsonPrimitive)?.contentOrNull
-            require(reason == null || reason == "stop") { "API 整理输出未完整结束（$reason），请检查输出预算" }
+        }
+        val reason = (choice["finish_reason"] as? JsonPrimitive)?.contentOrNull
+        if (reason != null && reason != "stop") {
+            throw SummaryFailure("API 整理输出未完整结束，请检查输出预算。任务已暂停，原文与已完成分段已保留",
+                failureDetail = PersonalSummaryResponseFailure.INCOMPLETE.detail)
+        }
+        val content = parseResult(ambiguous = true, failureDetail = PersonalSummaryResponseFailure.ENVELOPE.detail) {
             val message = choice["message"] as? JsonObject ?: error("API 缺少 message 内容")
-            val content = message["content"] as? JsonPrimitive ?: error("API 未返回文本内容")
-            require(content.isString && content.content.isNotBlank()) { "API 返回了空文本内容" }
-            // reasoning_content is intentionally never read or stored.
-            SummaryProtocol.validateEntries(content.content, messages, contextMessages)
+            (message["content"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+                ?: error("API 未返回文本内容")
+        }
+        if (content.isBlank()) {
+            throw SummaryFailure("API 返回了空文本内容。任务已暂停，原文与已完成分段已保留",
+                failureDetail = PersonalSummaryResponseFailure.BLANK.detail)
+        }
+        // reasoning_content is intentionally never read or stored.
+        return parseResult(ambiguous = true, failureDetail = PersonalSummaryResponseFailure.ENTRIES.detail) {
+            SummaryProtocol.validateEntries(content, messages, contextMessages)
         }
     }
 
@@ -377,18 +403,20 @@ object SummaryNetwork {
         return RemoteJob(id, status, entries, message, usageKnown)
     }
 
-    private suspend fun <T> parseResult(ambiguous: Boolean, block: suspend () -> T): T = try {
+    private suspend fun <T> parseResult(ambiguous: Boolean, failureDetail: String = "invalid_model_response",
+        block: suspend () -> T): T = try {
         block()
     } catch (error: kotlinx.coroutines.CancellationException) {
         throw error
     } catch (error: SummaryFailure) {
         throw error
     } catch (error: Exception) {
-        throw SummaryFailure("${error.message ?: "服务响应格式无法识别"}。任务已暂停，原文与已完成分段已保留", ambiguous)
+        throw SummaryFailure("${error.message ?: "服务响应格式无法识别"}。任务已暂停，原文与已完成分段已保留",
+            ambiguous, failureDetail = failureDetail)
     }
 
     internal fun httpFailure(statusCode: Int, detail: String, mutation: Boolean,
-        jobResult: Boolean = false, requestUrl: HttpUrl? = null): SummaryFailure {
+        jobResult: Boolean = false, requestUrl: HttpUrl? = null, requestId: String? = null): SummaryFailure {
         if (statusCode == 410 && jobResult && requestUrl?.let(::isRetiredOfficialEndpoint) != true) return SummaryFailure(
             "远端整理结果已过期，继续会重新发起整理请求，请确认后再试。",
             ambiguous = false,
@@ -402,7 +430,7 @@ object SummaryNetwork {
         )
         val reason = if (detail.isBlank()) "请检查服务地址、凭据和额度" else detail
         return SummaryFailure("服务返回 HTTP $statusCode，$reason", mutation && (statusCode >= 500 || statusCode == 408),
-            statusCode = statusCode)
+            statusCode = statusCode, requestId = requestId)
     }
 
     internal fun redactSecrets(value: String, secrets: List<String>): String =
@@ -410,22 +438,32 @@ object SummaryNetwork {
             .fold(value) { text, secret -> text.replace(secret, "[已隐藏]") }
 
     internal suspend fun exchange(request: Request, mutation: Boolean, secrets: List<String> = emptyList(),
-        maxResponseBytes: Long = SummaryProtocol.MAX_RESPONSE_BYTES, jobResult: Boolean = false): String =
+        maxResponseBytes: Long = SummaryProtocol.MAX_RESPONSE_BYTES, jobResult: Boolean = false,
+        personalOrganization: Boolean = false, callFactory: Call.Factory = client): String =
         suspendCancellableCoroutine { continuation ->
-            val call = client.newCall(request)
+            val call = callFactory.newCall(request)
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, error: IOException) {
                     if (continuation.isActive) continuation.resumeWithException(SummaryFailure(
                         if (mutation) "连接中断或网络不可用，尚无法确认服务是否已处理请求。任务已暂停" else "暂时无法连接服务，请检查网络后继续",
-                        ambiguous = mutation
+                        ambiguous = mutation, failureDetail = "network_before_headers",
+                        timedOut = error is java.io.InterruptedIOException,
                     ))
                 }
 
                 override fun onResponse(call: Call, response: Response) {
+                    val managed = CHAT_API.toHttpUrlOrNull()
+                    val requestId = response.header("X-Request-ID")?.takeIf {
+                        jobResult && managed != null && response.request.url.host == managed.host &&
+                            response.request.url.port == managed.port &&
+                            response.request.url.encodedPath.startsWith(managed.encodedPath.trimEnd('/') + "/")
+                    }
                     try {
                         response.use {
-                            if (response.code == 410) throw httpFailure(410, "", mutation, jobResult, request.url)
+                            // A 401 is definitive even when its error body is empty, large, or interrupted.
+                            if (response.code == 410 || (personalOrganization && response.code == 401))
+                                throw httpFailure(response.code, "", mutation, jobResult, request.url, requestId)
                             val body = response.body ?: throw SummaryFailure("服务返回空响应", mutation)
                             if (body.contentLength() > maxResponseBytes) throw SummaryFailure("服务响应过大，已暂停处理", mutation)
                             val source = body.source()
@@ -439,13 +477,15 @@ object SummaryNetwork {
                                         ?: (errorObject["error"] as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull
                                 }.getOrNull().orEmpty()
                                 val safeDetail = redactSecrets(detail, secrets).take(500)
-                                throw httpFailure(response.code, safeDetail, mutation, jobResult, request.url)
+                                throw httpFailure(response.code, safeDetail, mutation, jobResult, request.url, requestId)
                             }
                             if (continuation.isActive) continuation.resume(payload)
                         }
                     } catch (error: Exception) {
                         if (continuation.isActive) continuation.resumeWithException(
-                            error as? SummaryFailure ?: SummaryFailure("读取服务响应中断，任务已暂停", mutation)
+                            error as? SummaryFailure ?: SummaryFailure("读取服务响应中断，任务已暂停", mutation,
+                                failureDetail = "network_reading_body", timedOut = error is java.io.InterruptedIOException,
+                                requestId = requestId)
                         )
                     }
                 }

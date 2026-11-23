@@ -303,6 +303,17 @@ private fun UpdateActions(
                 Button(onClick = onDownload, enabled = !state.checking) {
                     Text(if (state.status == AppUpdateStatus.FAILED) "重试下载" else "下载更新")
                 }
+            if (state.status == AppUpdateStatus.FAILED) {
+                val context = LocalContext.current
+                val uriHandler = LocalUriHandler.current
+                TextButton(onClick = {
+                    try {
+                        uriHandler.openUri("https://digimonlegend.com/deepseek/download")
+                    } catch (_: IllegalArgumentException) {
+                        Toast.makeText(context, "无法打开官网下载页面，请检查默认浏览器。", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("前往官网下载") }
+            }
         }
         AppUpdateStatus.DOWNLOADING,
         AppUpdateStatus.VERIFYING -> OutlinedButton(onClick = onCancelDownload) { Text("取消更新") }

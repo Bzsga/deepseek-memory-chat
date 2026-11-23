@@ -25,6 +25,7 @@
 
 .filesWithDocuments {
   --message-file-image-size: 64px;
+  --message-file-image-reason-display: none;
 }
 
 .bubble {
@@ -40,8 +41,50 @@
   word-break: break-word;
 }
 
+.sources {
+  max-width: min(560px, calc(100% - 88px));
+  margin-top: 4px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+
+  & summary {
+    width: fit-content;
+    margin-left: auto;
+    padding: 10px 12px;
+    cursor: pointer;
+  }
+
+  & ul {
+    margin: 0;
+    padding: 4px 14px;
+    border-radius: 14px;
+    list-style: none;
+    background-color: var(--dsw-specific-bubble);
+  }
+
+  & li {
+    margin-block: 8px;
+  }
+
+  & a {
+    color: var(--dsw-alias-brand-primary);
+    font-weight: 500;
+  }
+
+  & small {
+    display: block;
+  }
+
+  & p {
+    margin: 2px 0 0;
+    white-space: pre-wrap;
+  }
+}
+
 @media not all and (min-width: 440px) {
-  .bubble {
+  .bubble, .sources {
     max-width: calc(100% - 68px);
   }
 }

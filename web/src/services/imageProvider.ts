@@ -6,7 +6,9 @@ import { normalizeProviderBase, providerApiUrl, fetchProviderModels, readProvide
 import { nativePersonalImageChannel } from './nativeBridge.js'
 import { requestNativePersonalImage } from './nativePersonalImage.js'
 import { readJson } from './api/imageJobs.js'
+import { reportHttpFailure } from './api/serviceDiagnostics.js'
 import { decodePersonalImage, decodePersonalImageResponse } from './chat/imageGeneration.js'
+import { recordDiagnostic } from './technicalDiagnostics.js'
 
 type Mode = 'personal' | 'managed' | 'off'
 type Config = { mode: Mode; base: string; model: string; key: string }
@@ -47,11 +49,14 @@ const credentials = (input: string, key: string) => {
   if (!secret || secret.length > 8192 || !/^[\x21-\x7e]+$/.test(secret)) {throw new Error('请为此地址填写有效的生图 API Key。')}
   return { base, key: secret }
 }
-const browserImageRequest = async <T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
+const browserImageRequest = async <T>(
+  run: () => Promise<T>, signal?: AbortSignal, stage?: 'request' | 'download'
+): Promise<T> => {
   try {
     return await run()
   } catch (error) {
     if (error instanceof TypeError && !signal?.aborted) {
+      if (stage) {recordDiagnostic('image', 'network_error', { stage })}
       throw new Error('无法连接个人生图服务。请检查地址和网络，网页和旧版 App 还需要服务商允许跨域访问。')
     }
     throw error
@@ -93,6 +98,15 @@ function personalImageItem(value: unknown) {
   return result.data[0]
 }
 
+const parsePersonalImage = async <T>(read: () => T | Promise<T>, signal: AbortSignal): Promise<T> => {
+  try {
+    return await read()
+  } catch (error) {
+    if (!signal.aborted) {recordDiagnostic('image', 'invalid_response', { stage: 'parse' })}
+    throw error
+  }
+}
+
 export const requestPersonalImage = async (prompt: string, signal: AbortSignal, sources?: readonly File[]) => {
   if (activeImageProvider() !== 'personal') {throw new Error('个人生图服务已关闭或配置不完整。')}
   const { base, key, model } = saved
@@ -104,7 +118,7 @@ export const requestPersonalImage = async (prompt: string, signal: AbortSignal, 
     const result = await requestNativePersonalImage(channel, {
       operation: sources ? 'edit' : 'generate', url, key, model, prompt, files: sources,
     }, () => config === configurationId && isSessionActive(), signal)
-    return { model, images: [decodePersonalImage(personalImageItem(result))] }
+    return { model, images: [await parsePersonalImage(() => decodePersonalImage(personalImageItem(result)), signal)] }
   }
   const headers = new Headers({ Authorization: `Bearer ${key}` })
   let body: BodyInit
@@ -124,24 +138,33 @@ export const requestPersonalImage = async (prompt: string, signal: AbortSignal, 
     method: 'POST', credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal,
     headers,
     body,
-  }), signal)
+  }), signal, 'request')
   if (!response.ok) {
     await response.body?.cancel().catch(() => {})
     if (sources && [404, 405, 501].includes(response.status)) {
       throw new Error(`个人生图服务的图片编辑接口不可用（HTTP ${response.status}）。请检查服务地址及模型是否支持图片编辑。`)
     }
+    if (!signal.aborted) {reportHttpFailure('image', response.status)}
     throw new Error(sources
       ? `个人生图服务未能编辑图片（HTTP ${response.status}）。请检查服务配置、模型和参考图。`
       : `个人生图服务返回 HTTP ${response.status}。`)
   }
-  const item = personalImageItem(await readJson(response, 29 * 1024 * 1024))
-  if (item.b64_json) {return { model, images: [decodePersonalImage(item)] }}
-  if (!item.url) {throw new Error('个人生图服务没有返回图像数据。')}
-  const resultUrl = new URL(item.url)
-  if (resultUrl.protocol !== 'https:' || resultUrl.username || resultUrl.password) {throw new Error('个人生图结果地址无效。')}
+  const item = await parsePersonalImage(async () => personalImageItem(await readJson(response, 29 * 1024 * 1024)), signal)
+  if (item.b64_json) {
+    return { model, images: [await parsePersonalImage(() => decodePersonalImage(item), signal)] }
+  }
+  const resultUrl = await parsePersonalImage(() => {
+    if (!item.url) {throw new Error('个人生图服务没有返回图像数据。')}
+    const value = new URL(item.url)
+    if (value.protocol !== 'https:' || value.username || value.password) {throw new Error('个人生图结果地址无效。')}
+    return value
+  }, signal)
   const image = await browserImageRequest(() => fetch(resultUrl.href, {
     credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal,
-  }), signal)
-  if (!image.ok) {throw new Error('个人生图结果下载失败。')}
-  return { model, images: [await decodePersonalImageResponse(image)] }
+  }), signal, 'download')
+  if (!image.ok) {
+    if (!signal.aborted) {reportHttpFailure('image', image.status, undefined, 'download')}
+    throw new Error('个人生图结果下载失败。')
+  }
+  return { model, images: [await parsePersonalImage(() => decodePersonalImageResponse(image), signal)] }
 }

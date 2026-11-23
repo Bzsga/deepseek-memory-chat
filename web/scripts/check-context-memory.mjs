@@ -54,10 +54,42 @@ try {
   const shortPlan = memory.planContext(small, small.messages, question('next'), 'BASE')
   assert.equal(shortPlan.history.length, small.messages.length)
   assert.equal(shortPlan.limited, false)
+  const suffix = '本轮由应用追加的限制。'
+  const shortPlanWithSuffix = memory.planContext(small, small.messages, question('next'), 'BASE', undefined, suffix)
+  assert.ok(shortPlanWithSuffix.estimatedTokens > shortPlan.estimatedTokens)
+  assert.deepEqual(shortPlanWithSuffix.history, shortPlan.history)
+  assert.equal(shortPlanWithSuffix.system, shortPlan.system)
   small.longMemory = { ...memory.newConversationMemory(), entries: [{ id: 'manual', kind: 'fact', text: '以后讨论海边旅行时保留弹性。', sourceIds: [], sourceSignature: '', pinned: true, edited: true, createdAt: 3 }] }
   assert.equal(memory.planContext(small, small.messages, question('next'), 'BASE').history.length, small.messages.length)
   assert.ok(memory.planContext(small, small.messages, question('next'), 'BASE').system.includes('保留弹性'))
   assert.equal(JSON.stringify({ ...small, longMemory: undefined }), originalSmall)
+  const [firstQuestion, , nextQuestion] = small.messages
+  const automatic = { id: 'automatic', kind: 'decision', text: '海边旅行以天气为准。', sourceIds: [firstQuestion.id],
+    sourceSignature: memory.sourceSignature([firstQuestion]), pinned: false, edited: false, createdAt: 3 }
+  const duplicateEntries = [
+    automatic,
+    { ...automatic, id: 'duplicate', createdAt: 4 },
+    { ...automatic, id: 'other-source', sourceIds: [nextQuestion.id], sourceSignature: memory.sourceSignature([nextQuestion]) },
+    { ...automatic, id: 'other-kind', kind: 'todo' },
+    { ...automatic, id: 'different-text', text: '海边旅行以当前天气为准。' },
+    { ...automatic, id: 'edited', edited: true },
+    { ...automatic, id: 'pinned', pinned: true },
+    ...small.longMemory.entries,
+  ]
+  const duplicateSession = { ...small, longMemory: { ...small.longMemory, entries: duplicateEntries } }
+  const beforeDeduplication = JSON.stringify(duplicateSession)
+  const duplicatePlan = memory.planContext(duplicateSession, duplicateSession.messages, question('next'), 'BASE')
+  const { memories } = JSON.parse(duplicatePlan.system.slice(duplicatePlan.system.lastIndexOf('\n') + 1))
+  const directCopies = memories.filter(({ kind, text, sourceIds }) =>
+    kind === automatic.kind && text === automatic.text && sourceIds[0] === firstQuestion.id)
+  assert.equal(directCopies.length, 3)
+  assert.equal(directCopies.filter(({ pinned }) => pinned).length, 1)
+  assert.equal(memories.length, duplicateEntries.length - 1)
+  assert.ok(memories.some(({ sourceIds }) => sourceIds[0] === nextQuestion.id))
+  assert.ok(memories.some(({ kind }) => kind === 'todo'))
+  assert.ok(memories.some(({ text }) => text === '海边旅行以当前天气为准。'))
+  assert.ok(memories.some(({ sourceIds }) => sourceIds.length === 0))
+  assert.equal(JSON.stringify(duplicateSession), beforeDeduplication)
 
   const large = fixture('large')
   const original = JSON.stringify(large)
@@ -208,11 +240,15 @@ try {
   let releaseSummary
   let summaryCalls = 0
   let chatCalls = 0
-  const eventResponse = (text) => new Response([
-    { type: 'message_start', message: { id: 'synthetic-response', model: 'synthetic' } },
+  let latestChatBody
+  const summaryUsage = { input_tokens: 12, cache_creation_input_tokens: 0, cache_read_input_tokens: 20, output_tokens: 4 }
+  const chatUsage = { input_tokens: 400, cache_creation_input_tokens: 0, cache_read_input_tokens: 800, output_tokens: 90,
+    output_tokens_details: { thinking_tokens: 30 } }
+  const eventResponse = (text, usage) => new Response([
+    { type: 'message_start', message: { id: 'synthetic-response', model: 'synthetic', usage: { ...usage, output_tokens: 0 } } },
     { type: 'content_block_start', index: 0, content_block: { type: 'text', text } },
     { type: 'content_block_stop', index: 0 },
-    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage },
     { type: 'message_stop' },
   ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'Content-Type': 'text/event-stream' } })
   globalThis.fetch = async (_url, init) => {
@@ -234,9 +270,10 @@ try {
       })
       const content = body.messages[0].content
       const source = JSON.parse(content.slice(content.lastIndexOf('\n\n') + 2))
-      return eventResponse(JSON.stringify({ entries: [{ kind: 'decision', text: '记得保留旅行时间的弹性。', sourceIds: [source[0].id] }] }))
+      return eventResponse(JSON.stringify({ entries: [{ kind: 'decision', text: '记得保留旅行时间的弹性。', sourceIds: [source[0].id] }] }), summaryUsage)
     }
     chatCalls += 1
+    latestChatBody = body
     assert.ok(body.system.includes(persona))
     assert.ok(body.system.includes(warmth))
     assert.ok(body.system.includes(detail))
@@ -244,7 +281,7 @@ try {
     assert.equal(body.temperature, 0.2)
     assert.equal(body.output_config, undefined)
     assert.ok(memory.estimateTokens(body) < automaticBudget + 4000)
-    return eventResponse('合成回复，继续在原会话交流。')
+    return eventResponse('合成回复，继续在原会话交流。', chatUsage)
   }
   const until = async predicate => {
     for (let attempt = 0; attempt < 500; attempt += 1) {
@@ -311,14 +348,37 @@ try {
   assert.equal(chatCalls, 1)
   assert.equal(store.useChatStore.getState().sessionCache.successful.longMemory.segments[0].status, 'complete')
   assert.equal(store.useChatStore.getState().sessionCache.successful.longMemory.entries.length, 1)
+  const completedReply = store.useChatStore.getState().sessionCache.successful.messages.at(-1)
+  assert.deepEqual(completedReply.usage, chatUsage)
+  assert.deepEqual(completedReply.compactionUsage, { usage: summaryUsage })
+  await until(() => db.rows.get('successful')?.messages.at(-1)?.usage?.output_tokens === chatUsage.output_tokens)
+  assert.deepEqual(db.rows.get('successful').messages.at(-1).compactionUsage, { usage: summaryUsage })
+  const compactFixture = seed('compact-attachment')
+  const fixtureSession = { ...compactFixture, messages: small.messages.slice(0, 2).map((item) =>
+    item.role === 'user' ? { ...item, files: [{ id: 'synthetic-large-file', serverId: 'file-api-historical-txt',
+      name: 'historical.txt', size: 2700000, mimeType: 'text/plain', isImage: false }] } : item) }
+  store.useChatStore.setState({ sessionCache: { [fixtureSession.id]: fixtureSession } })
+  assert.equal(store.setConversationContextMode(fixtureSession.id, 'compact'), true)
+  send(fixtureSession.id)
+  await idle(fixtureSession.id)
+  assert.equal(JSON.stringify(latestChatBody.messages).includes('file-api-historical-txt'), false)
+  assert.ok(JSON.stringify(latestChatBody.messages).includes(small.messages[0].content))
+  assert.equal(store.useChatStore.getState().sessionCache[fixtureSession.id].messages[0].files[0].serverId, 'file-api-historical-txt')
+  assert.equal(store.setConversationContextMode(fixtureSession.id, 'full'), true)
+  send(fixtureSession.id)
+  await idle(fixtureSession.id)
+  assert.ok(JSON.stringify(latestChatBody.messages).includes('file-api-historical-txt'))
+  assert.equal(summaryCalls, 1)
   mode = 'fail'
   seed('failed')
   send('failed')
   await idle('failed')
   const failedCount = summaryCalls
+  assert.deepEqual(store.useChatStore.getState().sessionCache.failed.messages.at(-1).compactionUsage, {})
   send('failed')
   await idle('failed')
   assert.equal(summaryCalls, failedCount)
+  assert.equal(store.useChatStore.getState().sessionCache.failed.messages.at(-1).compactionUsage, undefined)
   mode = 'success'
   assert.equal(store.retryMemoryPreparation('failed'), true)
   send('failed')

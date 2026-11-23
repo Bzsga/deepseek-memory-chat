@@ -4,14 +4,18 @@ const MAX_BYTES = 2 * 1024 * 1024
 const listeners = new Set<() => void>()
 const pending = new Map<
   string,
-  { resolve: () => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
+  { resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout>; mcpInvocation: boolean }
 >()
 let port: MessagePort | undefined
 let supportsSettingsSections = false
 let organizationUsesChatProvider = false
 let supportsImageOverlayHistory = false
-let privateCapabilities = { provider: false, theme: false }
+let privateCapabilities = { provider: false, theme: false, memoryRefresh: false }
 let supportsPersonalImage = false
+let supportsPersonalMcp = false
+let supportsPersonalMcpActions = false
+let supportsPersonalBackgroundChat = false
+let supportsTechnicalDiagnostics = false
 const imageFrameListeners = new Set<(frame: Record<string, unknown>) => void>()
 export const nativePreferenceChannel = (kind: 'provider' | 'theme') =>
   privateCapabilities[kind] ? port : undefined
@@ -24,7 +28,22 @@ let bound = false
 let receiveContinuation: ((payload: unknown, id: string) => Promise<void>) | undefined
 let sequence = 0
 
+type ChatBridgeAction = 'start' | 'read' | 'cancel'
+const chatRequests = new Map<string, {
+  resolve: (value: Record<string, unknown>) => void
+  reject: (error: Error) => void
+}>()
+export class NativeChatBridgeError extends Error {
+  constructor(message: string, readonly code: string) { super(message) }
+}
+export class NativeMcpInvocationInterrupted extends Error {}
+export const nativeBackgroundChatAvailable = () => supportsPersonalBackgroundChat && !!port
+
 export const isNativeConnected = () => port !== undefined
+export const nativeDiagnosticsAvailable = () => supportsTechnicalDiagnostics && !!port
+export const nativePersonalMcpChannel = () => supportsPersonalMcp ? port : undefined
+export const nativePersonalMcpAvailable = () => Boolean(nativePersonalMcpChannel())
+export const nativePersonalMcpActionsAvailable = () => supportsPersonalMcpActions && nativePersonalMcpAvailable()
 export const nativeSettingsAccess = () =>
   !port ? 'web' : supportsSettingsSections ? 'sections' : 'legacy'
 export const hasSeparateOrganizationSettings = () =>
@@ -58,12 +77,19 @@ const close = () => {
   organizationUsesChatProvider = false
   supportsImageOverlayHistory = false
   supportsPersonalImage = false
-  privateCapabilities = { provider: false, theme: false }
+  supportsPersonalMcp = false
+  supportsPersonalMcpActions = false
+  supportsPersonalBackgroundChat = false
+  supportsTechnicalDiagnostics = false
+  privateCapabilities = { provider: false, theme: false, memoryRefresh: false }
   for (const item of pending.values()) {
     clearTimeout(item.timer)
-    item.reject(new Error('连接已刷新，请重试。'))
+    item.reject(item.mcpInvocation ? new NativeMcpInvocationInterrupted() : new Error('连接已刷新，请重试。'))
   }
   pending.clear()
+  for (const task of chatRequests.values()) {
+    task.reject(new NativeChatBridgeError('App 聊天连接已刷新。', 'personal_chat_bridge'))
+  }
   notify()
 }
 
@@ -99,8 +125,10 @@ export const bindNativeBridge = (
       organizationUsesChatProvider?: unknown
       chatProvider?: unknown
       themePreference?: unknown
+      memoryRefresh?: unknown
       imageOverlayHistory?: unknown
       personalImage?: unknown
+      diagnostics?: unknown
     }
     try {
       hello = JSON.parse(event.data) as typeof hello
@@ -118,11 +146,13 @@ export const bindNativeBridge = (
     privateCapabilities = {
       provider: host && hello.chatProvider === true,
       theme: host && hello.themePreference === true,
+      memoryRefresh: host && hello.memoryRefresh === true,
     }
     supportsSettingsSections = hello.settingsSections === true
     organizationUsesChatProvider = host && hello.organizationUsesChatProvider === true
     supportsImageOverlayHistory = host && hello.imageOverlayHistory === true
     supportsPersonalImage = host && hello.personalImage === true
+    supportsTechnicalDiagnostics = host && hello.diagnostics === true
     port = channel
     channel.onmessage = async (message: MessageEvent<unknown>) => {
       if (
@@ -146,8 +176,32 @@ export const bindNativeBridge = (
         return
       }
       const id = value.id
+      if (host && value.type === 'personal.chat.capability' && value.personalBackgroundChat === true) {
+        supportsPersonalBackgroundChat = true
+        notify()
+        return
+      }
+      if (host && value.type === 'personal.mcp.capability' && value.personalMcp === true) {
+        supportsPersonalMcp = true
+        supportsPersonalMcpActions = value.personalMcpActions === true
+        notify()
+        return
+      }
       if (supportsPersonalImage && typeof value.type === 'string' && value.type.startsWith('image.')) {
         imageFrameListeners.forEach((listener) => listener(value))
+        return
+      }
+      if (supportsPersonalBackgroundChat && value.type === 'personal.chat.response') {
+        const task = chatRequests.get(id)
+        if (!task) {return}
+        if (value.ok === true && value.payload && typeof value.payload === 'object' && !Array.isArray(value.payload)) {
+          task.resolve(value.payload as Record<string, unknown>)
+        } else {
+          const code = typeof value.code === 'string' && /^personal_chat_[a-z_]{1,40}$/.test(value.code)
+            ? value.code : 'personal_chat_bridge'
+          task.reject(new NativeChatBridgeError(
+            typeof value.error === 'string' ? value.error.slice(0, 200) : 'App 后台聊天暂时不可用。', code))
+        }
         return
       }
       if (value.type === 'ack') {
@@ -156,7 +210,7 @@ export const bindNativeBridge = (
           clearTimeout(task.timer)
           pending.delete(id)
           if (value.ok === true) {
-            task.resolve()
+            task.resolve(value.payload)
           } else {
             task.reject(
               new Error(
@@ -205,8 +259,38 @@ export const bindNativeBridge = (
   window.addEventListener('pagehide', close)
 }
 
-export const sendNative = (
-  type:
+export const requestNativeBackgroundChat = (
+  action: ChatBridgeAction, payload: object, signal?: AbortSignal
+): Promise<Record<string, unknown>> => {
+  const channel = port
+  if (!channel || !supportsPersonalBackgroundChat || chatRequests.size >= 4) {
+    return Promise.reject(new NativeChatBridgeError('App 后台聊天尚未连接。', 'personal_chat_bridge'))
+  }
+  signal?.throwIfAborted()
+  const id = `web-chat-${Date.now()}-${++sequence}`
+  let message: string
+  try {
+    message = encode({ version: 1, id, type: `personal.chat.${action}`, payload })
+  } catch {
+    return Promise.reject(new NativeChatBridgeError('本次对话内容过长，请缩短后重试。', 'personal_chat_payload'))
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer)
+      chatRequests.delete(id)
+      signal?.removeEventListener('abort', abort)
+    }
+    const fail = (error: Error) => { cleanup(); reject(error) }
+    const abort = () => fail(signal?.reason)
+    const timer = setTimeout(() => fail(new NativeChatBridgeError('App 后台聊天暂未响应。', 'personal_chat_bridge')), 8000)
+    chatRequests.set(id, { resolve: (value) => { cleanup(); resolve(value) }, reject: fail })
+    signal?.addEventListener('abort', abort, { once: true })
+    try { channel.postMessage(message) }
+    catch { fail(new NativeChatBridgeError('App 后台聊天连接已关闭。', 'personal_chat_bridge')) }
+  })
+}
+
+type NativeCommand =
     | 'archive.ready'
     | 'organize'
     | 'memory.open'
@@ -214,14 +298,56 @@ export const sendNative = (
     | 'settings.open'
     | 'share.link'
     | 'chat.provider'
-    | 'chat.theme',
-  payload?: unknown
-): Promise<void> => {
+    | 'chat.theme'
+    | 'diagnostics.record'
+    | 'diagnostics.ready'
+    | 'diagnostics.open'
+
+export const nativeArchiveRefreshAvailable = (): boolean =>
+  Boolean(port && privateCapabilities.memoryRefresh)
+
+const requestNativeArchive = (type: 'memory.open' | 'memory.refresh', archiveId: string): Promise<unknown> => {
+  if (!nativeArchiveRefreshAvailable()) {
+    return Promise.reject(new Error('此版本暂不支持打开来源档案或更新背景。'))
+  }
+  if (!archiveId.trim() || archiveId.length > 200) {
+    return Promise.reject(new Error('来源记忆标识无效。'))
+  }
+  return requestNative(type, { archiveId })
+}
+
+export const openNativeSourceArchive = async (archiveId: string): Promise<void> => {
+  await requestNativeArchive('memory.open', archiveId)
+}
+
+export const readNativeArchiveBackground = (archiveId: string): Promise<unknown> =>
+  requestNativeArchive('memory.refresh', archiveId)
+
+export const sendNative = async (type: NativeCommand, payload?: unknown): Promise<void> => {
+  await requestNative(type, payload)
+}
+
+type NativeMcpAction = 'settings' | 'discover' | 'save' | 'clear' | 'lookup' | 'tools' | 'invoke'
+type NativeMcpCommand = `mcp.${NativeMcpAction}`
+
+export const requestNativeMcp = (action: NativeMcpAction, payload: object): Promise<unknown> => {
+  if (!nativePersonalMcpAvailable()) {
+    return Promise.reject(new Error('App 的资料库连接暂时不可用。'))
+  }
+  if ((action === 'tools' || action === 'invoke') && !nativePersonalMcpActionsAvailable()) {
+    return Promise.reject(new Error('当前 App 版本暂不支持直接运行 MCP 工具。'))
+  }
+  return requestNative(`mcp.${action}`, payload)
+}
+
+const requestNative = (type: NativeCommand | NativeMcpCommand | 'memory.refresh', payload?: unknown): Promise<unknown> => {
   const channel = port
   if (
     !channel ||
+    (type.startsWith('diagnostics.') && !supportsTechnicalDiagnostics) ||
     (type === 'chat.provider' && !privateCapabilities.provider) ||
-    (type === 'chat.theme' && !privateCapabilities.theme)
+    (type === 'chat.theme' && !privateCapabilities.theme) ||
+    (type === 'memory.refresh' && !privateCapabilities.memoryRefresh)
   ) {
     return Promise.reject(new Error('请在 App 中打开记忆功能。'))
   }
@@ -235,12 +361,13 @@ export const sendNative = (
   } catch (error) {
     return Promise.reject(error)
   }
+  const mcpInvocation = type === 'mcp.invoke'
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(id)
-      reject(new Error('暂时未收到回应，请重试。'))
+      reject(mcpInvocation ? new NativeMcpInvocationInterrupted() : new Error('暂时未收到回应，请重试。'))
     }, 30000)
-    pending.set(id, { resolve, reject, timer })
+    pending.set(id, { resolve, reject, timer, mcpInvocation })
     try {
       channel.postMessage(body)
     } catch (error) {

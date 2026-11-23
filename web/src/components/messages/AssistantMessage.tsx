@@ -4,15 +4,21 @@ import { useTranslate } from '../../i18n/index.js'
 import clsx from 'clsx'
 import { memo, useState } from 'react'
 import { IconBranchOutline16, IconRefreshOutline16, IconWarningOutline16, IconShareOutline16 } from '../base/icons.js'
+import { useChatProvider } from '../../services/chatProvider.js'
 import { describeReply } from '../../services/chat/describe.js'
 import { canContinueReply, recoverableImagePrompts } from '../../services/chat/reply.js'
 import {
   cancelImageJob,
   drawFromReplyDescriptions,
   continueReply,
+  hasLargeTxtRecovery,
+  reconnectChatJob,
   regenerateReply,
+  requestLargeTxtReply,
   resumeImageJob,
   retryImageJobSubmission,
+  stopReply,
+  useChatStore,
 } from '../../services/chat/store.js'
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import type { AssistantMessage as AssistantMessageType } from '../../services/chat/types.js'
@@ -26,7 +32,8 @@ import { ReadAloudButton } from './ReadAloudButton.js'
 import { CopyButton } from './CopyButton.js'
 import { showConversationShareControls } from '../session/conversationShareVisibility.js'
 import { ensureApiKey } from '../settings/settingsDialogState.js'
-import { ReplyArea } from './ReplyArea.js'
+import { ReplyArea, ReplyUsage } from './ReplyArea.js'
+import { ChatMcpCards } from './ChatMcpCards.js'
 import { useReplyView } from './useReplyView.js'
 import {
   BranchSwitcher,
@@ -64,6 +71,22 @@ export const AssistantMessage = memo(function AssistantMessage({
   const view = useReplyView(message, streaming)
   const panelEntry = useSearchPanel((state) => state.entry)
   const imageJob = message.imageJob
+  const chatJob = message.chatJob
+  const personalChat = useChatProvider((state) => state.mode === 'personal')
+  const providerReady = useChatProvider((state) => !state.loading && !state.error)
+  const largeTxtActivity = useChatStore((state) => {
+    const activity = state.largeTxtActivity[sessionId]
+    return activity?.messageId === message.id ? activity : undefined
+  })
+  const offerLargeTxt = useChatStore((state) => providerReady && !streaming && !chatJob &&
+    message.error?.localMessage?.key === 'replyContextInputTooLong' &&
+    hasLargeTxtRecovery(state.sessionCache[sessionId], message.id))
+  const retryWholeTxt = !personalChat || message.thinking || message.search
+  const largeTxtStatus = largeTxtActivity?.stage === 'prepare' ? t('largeTxtPreparing')
+    : largeTxtActivity?.stage === 'whole' ? t('largeTxtWhole')
+    : largeTxtActivity?.stage === 'read' ? t('largeTxtReading', {
+      completed: largeTxtActivity.completed, total: largeTxtActivity.total,
+    }) : largeTxtActivity ? t('largeTxtCombining') : null
   const describedCount = imageProvider && !streaming ? recoverableImagePrompts(message).length : 0
   const showImageJob =
     !!imageJob &&
@@ -73,7 +96,12 @@ export const AssistantMessage = memo(function AssistantMessage({
     showImageJob &&
     !!imageJob &&
     !['unknown', 'expired', 'cancelled', 'failed'].includes(imageJob.state)
-  const notice = streaming || showImageJob ? null : describeReply(message)
+  const replyNotice = streaming || showImageJob || chatJob ? null : describeReply(message)
+  const notice = replyNotice && offerLargeTxt
+    ? { ...replyNotice, text: t(retryWholeTxt
+      ? personalChat ? 'largeTxtPersonalReadAgainHint' : 'largeTxtManagedReadAgainHint'
+      : 'largeTxtInputTooLong') }
+    : replyNotice
   // 安全拒绝：已下发的思考与正文按协议丢弃，只显示模板答复。
   const refused = message.stopReason === 'refusal'
   const answer = refused ? null : view.answer
@@ -81,11 +109,11 @@ export const AssistantMessage = memo(function AssistantMessage({
     .filter(Boolean)
     .join('\n\n')
   const copyText = responseText || notice?.text
-  const waiting = streaming && view.steps.length === 0 && !view.answer && !message.thinking
+  const waiting = streaming && !largeTxtActivity && view.steps.length === 0 && !view.answer && !message.thinking
   const summaryEntry = `${message.id}-summary`
   return (
     <div className={styles.message} data-chat-message={message.id}>
-      {refused ? null : (
+      {refused || largeTxtActivity ? null : (
         <ReplyArea
           message={message}
           view={view}
@@ -93,6 +121,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           hasResponse={!!responseText}
         />
       )}
+      <ChatMcpCards sessionId={sessionId} messageId={message.id} />
       {answer ? (
         <Markdown
           className="ds-assistant-message-main-content"
@@ -125,6 +154,27 @@ export const AssistantMessage = memo(function AssistantMessage({
           busy={busy}
         />
       ) : null}
+      {chatJob && !streaming ? (
+        <div className={styles.imageJob} role="status">
+          <div className={styles.imageJobStatus}>
+            <IconWarningOutline16 />
+            <p>{t(chatJob.cancelRequested ? 'chatJobStopUnconfirmed' : 'chatJobDisconnected')}</p>
+          </div>
+          <div className={styles.imageJobActions}>
+            <Button variant="outlined" size="s" disabled={busy || actionsDisabled} onClick={() => reconnectChatJob(sessionId)}>
+              {t(chatJob.cancelRequested ? 'chatJobRetryStop' : 'chatJobReconnect')}
+            </Button>
+            {!chatJob.cancelRequested ? (
+              <Button variant="outlined" size="s" disabled={busy || actionsDisabled} onClick={() => stopReply(sessionId)}>
+                {t('chatInputStopButtonTooltip')}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {largeTxtStatus ? (
+        <div className={styles.imageJob} role="status">{largeTxtStatus}</div>
+      ) : null}
       {waiting && message.imageGeneration && !showImageJob ? (
         <div className={styles.notice} role="status">
           {t('imageGenerating')}
@@ -151,6 +201,19 @@ export const AssistantMessage = memo(function AssistantMessage({
           <span>{notice.text}</span>
         </div>
       ) : null}
+      {offerLargeTxt ? (
+        <div className={styles.imageJobActions}>
+          <Button variant="outlined" size="s" disabled={busy || actionsDisabled} onClick={() => {
+            if (!requestLargeTxtReply(sessionId, message.id)) {
+              showToast({ key: 'largeTxtUnavailable', type: 'error' })
+              return
+            }
+            stopReadAloud()
+          }}>
+            {t(retryWholeTxt ? 'largeTxtReadAgain' : 'largeTxtAction')}
+          </Button>
+        </div>
+      ) : null}
       {!streaming && !refused && view.searchResults.length > 0 ? (
         <div
           className={clsx(styles.summary, panelEntry === summaryEntry && styles.summaryActive)}
@@ -165,7 +228,8 @@ export const AssistantMessage = memo(function AssistantMessage({
           </span>
         </div>
       ) : null}
-      {streaming && !showImageJob ? null : (
+      <ReplyUsage message={message} streaming={streaming} />
+      {(streaming && !showImageJob) || chatJob ? null : (
         <div className={styles.bottom}>
           <BranchSwitcher
             versions={versions}

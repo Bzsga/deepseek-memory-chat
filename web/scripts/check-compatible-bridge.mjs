@@ -155,6 +155,13 @@ try {
   const choice = (delta, finish_reason = null) => ({
     choices: [{ delta, finish_reason, index: 0 }],
   })
+  let dropStream
+  const resetAfterPartialReply = (values) => new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(emit(values)))
+      dropStream = () => controller.error(new TypeError('connection closed'))
+    },
+  })
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })
     return new Response(frames, { headers: { 'content-type': 'text/event-stream' } })
@@ -234,6 +241,15 @@ try {
     (e) => e.name === 'AbortError'
   )
   assert.equal(streamCancelled, true)
+  frames = resetAfterPartialReply([choice({ content: 'first' })])
+  const brokenCompatible = api.streamMessage(key, expectedInput, new AbortController().signal)
+  assert.equal((await brokenCompatible.next()).value.type, 'message_start')
+  assert.equal((await brokenCompatible.next()).value.type, 'content_block_start')
+  assert.equal((await brokenCompatible.next()).value.delta.text, 'first')
+  const callsBeforeCompatibleDrop = requests.length
+  dropStream()
+  await assert.rejects(brokenCompatible.next(), (e) => e.kind === 'interrupted' && e.code === 'personal_interrupted')
+  assert.equal(requests.length, callsBeforeCompatibleDrop)
   await provider.configureChatProvider({
     mode: 'personal',
     apiKey: key,
@@ -277,6 +293,35 @@ try {
   await pause()
   assert.equal(sent.at(-1).payload.mode, 'managed')
   assert.equal(sent.at(-1).payload.apiKey, undefined)
+  const diagnosticRequestId = 'e13cfa4c-f3f4-42ee-affa-a97ec030ecbc'
+  const currentDocument = globalThis.document
+  globalThis.document = { querySelector: () => null, scripts: [] }
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    const response = new Response(resetAfterPartialReply([
+      { type: 'message_start', message: { id: 'synthetic', model: 'test' } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'first' } },
+    ]), { headers: { 'content-type': 'text/event-stream', 'X-Request-ID': diagnosticRequestId } })
+    Object.defineProperty(response, 'url', { value: location.origin + url })
+    return response
+  }
+  const brokenManaged = api.streamMessage(settings.useSettings.getState().apiKey, expectedInput, new AbortController().signal)
+  assert.equal((await brokenManaged.next()).value.type, 'message_start')
+  assert.equal((await brokenManaged.next()).value.content_block.text, 'first')
+  const callsBeforeManagedDrop = requests.length
+  dropStream()
+  await assert.rejects(brokenManaged.next(), (e) => e.kind === 'interrupted')
+  assert.equal(requests.length, callsBeforeManagedDrop)
+  const streamDiagnostic = [...storage.entries()]
+    .filter(([name]) => name.includes(':event:'))
+    .map(([, value]) => JSON.parse(value))
+    .find((item) => item.area === 'chat')
+  assert.ok(streamDiagnostic)
+  assert.equal(streamDiagnostic.area, 'chat')
+  assert.equal(streamDiagnostic.code, 'network_error')
+  assert.equal(streamDiagnostic.stage, 'response')
+  assert.equal(streamDiagnostic.request_id, diagnosticRequestId)
+  globalThis.document = currentDocument
   const {importArchiveFrame} = await load('chat/nativeArchive')
   const {saved} = await load('chat/store')
   const deliver = async (source, title) => {

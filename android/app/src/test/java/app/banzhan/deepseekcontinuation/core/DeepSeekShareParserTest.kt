@@ -37,7 +37,12 @@ class DeepSeekShareParserTest {
     @Test fun keepsKnownMetadataOutOfConversationProseWithAnExplicitWarning() {
         val result = parse("""{"data":{"biz_data":{"messages":[
           {"id":1,"role":"USER","fragments":[{"type":"REQUEST","content":"提问"},{"type":"FILE","files":[{"id":"f1","file_name":"示例.pdf"}]}]},
-          {"id":2,"role":"ASSISTANT","fragments":[{"type":"THINK","content":"不混入正文"},{"type":"TOOL_SEARCH","queries":["测试"],"results":[]},{"type":"RESPONSE","content":"原始回答"}]}]}}}""")
+          {"id":2,"role":"ASSISTANT","fragments":[
+            {"type":"THINK","content":"不混入正文"},
+            {"type":"SEARCH","content":"搜索过程不入正文","queries":["合成搜索"],"results":[]},
+            {"type":"TOOL_SEARCH","queries":["合成工具搜索"],"results":[]},
+            {"type":"RESPONSE","content":"原始回答"}
+          ]}]}}}""")
         val messages = result.conversations.single().branches.single().messages
         assertEquals("原始回答", messages.last().content)
         assertTrue(messages.first().attachments.any { it.contains("示例.pdf") })

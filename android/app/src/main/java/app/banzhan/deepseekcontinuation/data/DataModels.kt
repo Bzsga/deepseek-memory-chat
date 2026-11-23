@@ -37,6 +37,15 @@ data class AppState(
     val adminStats: AdminStats? = null,
     val adminStatsLoading: Boolean = false,
     val adminStatsError: String? = null,
+    val adminStorage: AdminStorage? = null,
+    val adminStorageLoading: Boolean = false,
+    val adminStorageError: String? = null,
+    val adminDiagnostics: AdminDiagnosticsPage? = null,
+    val adminDiagnosticsLoading: Boolean = false,
+    val adminDiagnosticsError: String? = null,
+    val adminDiagnosticDetail: AdminDiagnosticDetail? = null,
+    val adminDiagnosticDetailLoading: Boolean = false,
+    val adminDiagnosticDetailError: String? = null,
     val adminUsers: AdminUsersPage? = null,
     val adminUsersLoading: Boolean = false,
     val adminUsersError: String? = null,
@@ -112,6 +121,7 @@ data class OrganizationTask(
     val provider: String = "",
     val uncertain: Boolean = false,
     val serviceMode: String = "byok",
+    val personalKeyRejected: Boolean = false,
 )
 
 @Serializable
@@ -152,11 +162,17 @@ internal data class TaskRecord(
     val initialContextScope: ArchiveSourceScope? = null,
     // Opaque ownership metadata permits same-account recovery without changing frozen settings/cache keys.
     val ownerUserId: String? = null,
+    val personalKeyRejected: Boolean = false,
 ) {
+    // 2.6.19 and older only persisted the HTTP failure in the task message.
+    val needsPersonalKey: Boolean
+        get() = settings.mode == "byok" &&
+            (personalKeyRejected || message.startsWith("服务返回 HTTP 401，"))
+
     fun display() = OrganizationTask(
         id, archiveId, label, status, chunks.count { it.completed }, chunks.size, message,
         if (settings.mode == "byok") "${settings.model} · ${settings.baseUrl}"
-        else "免费服务 · ${settings.companionUrl}", uncertain, settings.mode,
+        else "免费服务 · ${settings.companionUrl}", uncertain, settings.mode, needsPersonalKey,
     )
 
     fun currentRemoteId(): String = chunks.firstOrNull { !it.completed }?.remoteJobId.orEmpty()

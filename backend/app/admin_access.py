@@ -5,11 +5,12 @@ import os
 import secrets
 import time
 from datetime import date, datetime, timedelta
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .accounts import account_invite_redeemable, account_permissions
+from .accounts import PASSWORD_RESET_PATH, account_invite_redeemable, account_permissions
 from .schemas import AccountLoginRequest, AccountRegistrationPolicy, AdminConfigPatch
 from .store import PROVIDER_REQUEST_USAGE_SQL, SHANGHAI, local_day, local_week, reset_at
 
@@ -385,6 +386,21 @@ def build_admin_router(store):
     @router.post("/users/{user_id}/reset-password", dependencies=[Depends(require_admin)])
     def reset_user_password(user_id: str):
         return store.accounts.reset_password(user_id)
+
+    @router.post("/users/{user_id}/password-reset-link", dependencies=[Depends(require_admin)])
+    def issue_user_password_reset_link(user_id: str):
+        origin = os.environ.get("PUBLIC_ORIGIN", "https://digimonlegend.com").rstrip("/")
+        try:
+            parts = urlsplit(origin)
+            valid_origin = (parts.scheme == "https" and parts.hostname and parts.username is None
+                            and not parts.path and not parts.query and not parts.fragment)
+        except ValueError:
+            valid_origin = False
+        if not valid_origin:
+            raise HTTPException(503, "重置链接地址尚未配置，请联系管理员。")
+        issued = store.accounts.issue_password_reset_link(user_id)
+        token = issued.pop("token")
+        return issued | {"url": f"{origin}/deepseek-api{PASSWORD_RESET_PATH}#token={token}"}
 
     @router.get("/registration-invites", dependencies=[Depends(require_admin)])
     def registration_invites(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0)):

@@ -14,6 +14,7 @@ import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
+from starlette.requests import ClientDisconnect
 
 from .accounts import account_permissions
 from .chat import ChatError, _body, _error, _origin_ok, _token
@@ -22,6 +23,9 @@ from .store import digest
 from .storage_capacity import check_growth, sync_usage
 
 
+SYNC_PATH = "/chat/api/conversation-sync"
+# Large, authenticated uploads can wait for the same idle interval as Nginx.
+UPLOAD_IDLE_TIMEOUT_SECONDS = 60
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
 MAX_BLOB_BYTES = 64 * 1024 * 1024
 MAX_ACCOUNT_BYTES = 512 * 1024 * 1024
@@ -573,7 +577,7 @@ class ConversationSync:
 
 
 def build_conversation_sync_router(store, sync, public_origin=None):
-    router = APIRouter(prefix="/chat/api/conversation-sync")
+    router = APIRouter(prefix=SYNC_PATH)
     origin = (public_origin or os.environ.get("PUBLIC_ORIGIN", "https://digimonlegend.com")).rstrip("/")
 
     async def owner(request):
@@ -587,12 +591,13 @@ def build_conversation_sync_router(store, sync, public_origin=None):
             raise ChatError(409, "账号已切换，请刷新页面后继续。", {"X-Session-Changed": "1"})
         return account, digest(token)
 
-    async def execute(request, action, *, body=False, body_limit=MAX_REQUEST_BYTES):
+    async def execute(request, action, *, body=False, body_limit=MAX_REQUEST_BYTES, body_idle_timeout=15):
         try:
             account, token_hash = await owner(request)
             payload = None
             if body:
-                raw = await _body(request, body_limit, "同步请求超过大小上限，请拆分会话后重试。")
+                raw = await _body(request, body_limit, "同步请求超过大小上限，请拆分会话后重试。",
+                                  idle_timeout=body_idle_timeout)
                 payload = _parse(raw)
             result = await action(account, token_hash, payload)
             return result if isinstance(result, Response) else JSONResponse(result, headers=HEADERS)
@@ -601,6 +606,8 @@ def build_conversation_sync_router(store, sync, public_origin=None):
                 return JSONResponse({"error": {"message": error.message, "code": error.code},
                                      "current_revision": error.current_revision}, status_code=409, headers=HEADERS)
             return _error(error.status, error.message, {**HEADERS, **error.headers}, error.code)
+        except ClientDisconnect:
+            return Response(status_code=499, headers=HEADERS)
         except (OSError, sqlite3.Error):
             logger.error("Conversation sync storage operation failed")
             return _error(503, "云端同步暂时不可用，请稍后重试。", HEADERS)
@@ -670,7 +677,7 @@ def build_conversation_sync_router(store, sync, public_origin=None):
     async def write(request: Request, session_id: str):
         async def action(account, token_hash, payload):
             return await asyncio.to_thread(sync.mutate, account, session_id, payload, token_hash=token_hash)
-        return await execute(request, action, body=True)
+        return await execute(request, action, body=True, body_idle_timeout=UPLOAD_IDLE_TIMEOUT_SECONDS)
 
     @router.delete("/sessions/{session_id}")
     async def delete(request: Request, session_id: str):
@@ -684,7 +691,8 @@ def build_conversation_sync_router(store, sync, public_origin=None):
             generation = query_integer(request, "generation")
             # Refuse closed or superseded consent before accepting the bytes.
             await asyncio.to_thread(sync.check_attachments, account, generation, token_hash)
-            raw = await _body(request, MAX_BLOB_BYTES, "单个同步附件超过 64 MiB。")
+            raw = await _body(request, MAX_BLOB_BYTES, "单个同步附件超过 64 MiB。",
+                              idle_timeout=UPLOAD_IDLE_TIMEOUT_SECONDS)
             return await asyncio.to_thread(sync.upload, account, checksum, generation, raw, token_hash)
         return await execute(request, action)
 

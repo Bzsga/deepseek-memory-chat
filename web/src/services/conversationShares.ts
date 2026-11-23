@@ -1,4 +1,5 @@
 import { createId } from '../utils/id.js'
+import { cloneSnapshot } from '../utils/cloneSnapshot.js'
 import { API_ORIGIN, getRuntime, isSessionActive } from './runtime.js'
 import { validateSharedJsonStructure } from './sharedConversation.js'
 import { getVisibleMessages } from './chat/branches.js'
@@ -274,7 +275,7 @@ export const createConversationShare = (
       fail('请打开会话并等待当前回复结束，再创建分享。')
     }
     const originalMessages = selectedMessages(original, selectedIds)
-    const chosen = structuredClone(originalMessages)
+    const chosen = await cloneSnapshot(originalMessages)
     const current = () => {
       account(owner)
       signal?.throwIfAborted()

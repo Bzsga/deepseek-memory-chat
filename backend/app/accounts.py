@@ -1,4 +1,4 @@
-"""Registered identities, revocable sessions, and one-use registration invitations.
+"""Registered identities, revocable sessions, invitations, and password recovery.
 
 Local archives never enter this module. Legacy owners and task identities remain
 untouched; a registered account always receives a new owner.
@@ -7,6 +7,7 @@ untouched; a registered account always receives a new owner.
 import base64
 import hashlib
 import hmac
+import re
 import secrets
 import time
 import unicodedata
@@ -23,6 +24,10 @@ REGISTRATION_WINDOW_SECONDS = 60 * 60
 MAX_FAILED_LOGINS_PER_USER = 5
 MAX_FAILED_LOGINS_PER_IP = 20
 MAX_REGISTRATIONS_PER_IP = 10
+PASSWORD_RESET_SECONDS = 30 * 60
+PASSWORD_RESET_PATH = "/v1/accounts/reset-password"
+PASSWORD_RESET_TOKEN_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+PASSWORD_RESET_INVALID = "重置链接无效、已使用或已过期。"
 PERMISSION_NAMES = ("chat_api", "image_api", "cloud_sync")
 
 
@@ -145,6 +150,10 @@ class Accounts:
                 created_at REAL NOT NULL, expires_at REAL NOT NULL, revoked_at REAL
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS account_sessions_user ON account_sessions(user_id)")
+            db.execute("""CREATE TABLE IF NOT EXISTS account_password_resets (
+                user_id TEXT PRIMARY KEY REFERENCES registered_accounts(user_id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE, expires_at REAL NOT NULL
+            )""")
             db.execute("""CREATE TABLE IF NOT EXISTS account_auth_attempts (
                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, ip_hash TEXT NOT NULL,
                 subject_hash TEXT NOT NULL, created_at REAL NOT NULL, succeeded INTEGER NOT NULL DEFAULT 0
@@ -165,6 +174,7 @@ class Accounts:
             db.execute("INSERT OR IGNORE INTO registration_counter VALUES(1,0)")
             now = time.time()
             db.execute("DELETE FROM account_sessions WHERE expires_at<=?", (now,))
+            db.execute("DELETE FROM account_password_resets WHERE expires_at<=?", (now,))
             db.execute("DELETE FROM account_auth_attempts WHERE created_at<=?", (now - REGISTRATION_WINDOW_SECONDS,))
             db.execute("UPDATE registration_invites SET unused_plaintext=NULL WHERE expires_at<=?", (now,))
 
@@ -198,6 +208,11 @@ class Accounts:
                     WHERE kind=? AND ip_hash=? AND created_at>?""",
                     (kind, ip_hash, now - REGISTRATION_WINDOW_SECONDS)).fetchone()[0]
                 limited = count >= MAX_REGISTRATIONS_PER_IP
+            elif kind == "password_reset":
+                count = db.execute("""SELECT COUNT(*) FROM account_auth_attempts
+                    WHERE kind=? AND ip_hash=? AND created_at>?""",
+                    (kind, ip_hash, now - LOGIN_WINDOW_SECONDS)).fetchone()[0]
+                limited = count >= MAX_FAILED_LOGINS_PER_IP
             else:
                 counts = db.execute("""SELECT COALESCE(SUM(ip_hash=?),0),COALESCE(SUM(subject_hash=?),0)
                     FROM account_auth_attempts WHERE kind='login' AND succeeded=0 AND created_at>?""",
@@ -284,8 +299,7 @@ class Accounts:
             row = db.execute("SELECT user_id FROM registered_accounts WHERE username_key='admin' AND role='admin' AND disabled=0").fetchone()
             if row is None:
                 raise ServiceError(404, "管理员账号不可用")
-            db.execute("UPDATE registered_accounts SET password_hash=? WHERE user_id=?", (encoded, row[0]))
-            db.execute("UPDATE account_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (time.time(), row[0]))
+            self._replace_password(db, row[0], encoded, time.time())
 
     @staticmethod
     def _redeem_invite(db, owner_id, code, now):
@@ -395,7 +409,14 @@ class Accounts:
             db.execute("UPDATE registered_accounts SET disabled=? WHERE user_id=?", (int(not enabled), owner_id))
             db.execute("UPDATE account_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
                        (time.time(), owner_id))
+            db.execute("DELETE FROM account_password_resets WHERE user_id=?", (owner_id,))
         return {"id": owner_id, "enabled": enabled}
+
+    @staticmethod
+    def _replace_password(db, owner_id, encoded, now):
+        db.execute("UPDATE registered_accounts SET password_hash=? WHERE user_id=?", (encoded, owner_id))
+        db.execute("UPDATE account_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (now, owner_id))
+        db.execute("DELETE FROM account_password_resets WHERE user_id=?", (owner_id,))
 
     def reset_password(self, owner_id):
         password = secrets.token_urlsafe(15)
@@ -404,12 +425,49 @@ class Accounts:
             row = db.execute("SELECT username FROM registered_accounts WHERE user_id=?", (owner_id,)).fetchone()
             if row is None:
                 raise ServiceError(404, "注册用户不存在")
-            db.execute("UPDATE registered_accounts SET password_hash=? WHERE user_id=?", (encoded, owner_id))
-            db.execute("UPDATE account_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
-                       (time.time(), owner_id))
+            self._replace_password(db, owner_id, encoded, time.time())
         # The generated password is returned only once through an authenticated
         # administrator endpoint; it never enters call logs or local archives.
         return {"id": owner_id, "username": row["username"], "password": password}
+
+    def issue_password_reset_link(self, owner_id):
+        token = secrets.token_urlsafe(32)
+        with self.store.connection(write=True) as db:
+            row = db.execute("SELECT username,disabled FROM registered_accounts WHERE user_id=?", (owner_id,)).fetchone()
+            if row is None:
+                raise ServiceError(404, "注册用户不存在")
+            if row["disabled"]:
+                raise ServiceError(409, "请先启用该账号，再生成重置链接。")
+            now = time.time()
+            expires = now + PASSWORD_RESET_SECONDS
+            db.execute("DELETE FROM account_password_resets WHERE expires_at<=?", (now,))
+            db.execute("""INSERT INTO account_password_resets(user_id,token_hash,expires_at) VALUES(?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET token_hash=excluded.token_hash, expires_at=excluded.expires_at""",
+                (owner_id, digest(token), expires))
+        return {"id": owner_id, "username": row["username"], "token": token, "expires_at": _iso(expires)}
+
+    def redeem_password_reset_link(self, token, password, client_ip="unknown"):
+        if not isinstance(token, str) or not re.fullmatch(PASSWORD_RESET_TOKEN_PATTERN, token):
+            raise ServiceError(400, PASSWORD_RESET_INVALID)
+        password = _password(password)
+        self._attempt("password_reset", client_ip, "password_reset", time.time())
+        token_hash = digest(token)
+        with self.store.connection() as db:
+            if db.execute("SELECT 1 FROM account_password_resets WHERE token_hash=? AND expires_at>?",
+                          (token_hash, time.time())).fetchone() is None:
+                raise ServiceError(400, PASSWORD_RESET_INVALID)
+        encoded = _hash_password(password)
+        with self.store.connection(write=True) as db:
+            now = time.time()
+            # Recheck under the write lock to serialize concurrent redemption and reissuance.
+            row = db.execute("""SELECT resets.user_id,a.username_key FROM account_password_resets AS resets
+                JOIN registered_accounts AS a ON a.user_id=resets.user_id
+                WHERE resets.token_hash=? AND resets.expires_at>? AND a.disabled=0""", (token_hash, now)).fetchone()
+            if row is None:
+                raise ServiceError(400, PASSWORD_RESET_INVALID)
+            self._replace_password(db, row["user_id"], encoded, now)
+            db.execute("""DELETE FROM account_auth_attempts WHERE kind='login'
+                AND subject_hash=? AND succeeded=0""", (digest(row["username_key"]),))
 
     def logout(self, token):
         if isinstance(token, str) and token and len(token) <= 256:

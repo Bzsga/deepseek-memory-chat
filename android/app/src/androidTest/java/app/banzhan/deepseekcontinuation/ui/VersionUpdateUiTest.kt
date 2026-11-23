@@ -63,7 +63,12 @@ class VersionUpdateUiTest {
         compose.onNodeWithText("可更新至 9.9.0").assertIsDisplayed()
         compose.onNodeWithText("记忆整理直接使用当前聊天 API。").assertIsDisplayed()
         compose.onNodeWithText("下载更新").assertIsDisplayed().performClick()
-        compose.runOnIdle { assertEquals(1, downloads) }
+        compose.runOnIdle {
+            assertEquals(1, downloads)
+            update.value = update.value.copy(status = AppUpdateStatus.FAILED, error = "更新包完整性校验失败。")
+        }
+        compose.onNodeWithText("前往官网下载").performScrollTo().assertIsDisplayed().performClick()
+        compose.runOnIdle { assertEquals("https://digimonlegend.com/deepseek/download", openedUrl) }
     }
 
     @Test fun bannerNotesOpenBeforeAndDuringDownload() {

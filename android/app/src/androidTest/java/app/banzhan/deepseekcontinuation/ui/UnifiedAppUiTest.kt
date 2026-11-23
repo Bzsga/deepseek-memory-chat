@@ -1,9 +1,16 @@
 package app.banzhan.deepseekcontinuation.ui
 
 import android.app.Application
+import android.content.ActivityNotFoundException
+import android.content.ContextWrapper
+import android.content.Intent
 import android.graphics.Bitmap
-import android.webkit.WebView
+import android.provider.Settings
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.test.*
@@ -18,8 +25,10 @@ import app.banzhan.deepseekcontinuation.core.EntryCategory
 import app.banzhan.deepseekcontinuation.data.AppController
 import app.banzhan.deepseekcontinuation.data.ChatContinuationDraft
 import app.banzhan.deepseekcontinuation.data.ChatHandoff
+import app.banzhan.deepseekcontinuation.data.ChatWebViewProvider
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
@@ -36,8 +45,10 @@ class UnifiedAppUiTest {
 
     @Test fun oldWebViewFallbackKeepsMemorySettingsAndImportReachableWithoutLogin() {
         // Modern chat navigation lives in the trusted web page, not in Compose tabs.
-        val webViewMajor = WebView.getCurrentWebViewPackage()?.versionName?.substringBefore('.')?.toIntOrNull() ?: 0
-        assumeTrue("This test covers the native old-WebView fallback only", webViewMajor in 1..104)
+        val provider = ChatWebViewProvider.read(application)
+        assumeTrue("This test covers the native old-WebView fallback only",
+            provider.majorVersion != null && !provider.isCompatible)
+        val rechecks = AtomicInteger()
         val store = ViewModelStore()
         val databaseName = "unified-navigation-${UUID.randomUUID()}.db"
         try {
@@ -53,14 +64,25 @@ class UnifiedAppUiTest {
                     focus.clearFocus(force = true)
                     keyboard?.hide()
                 }
-                ContinuationApp(controller, automaticUpdateChecks = false)
+                ContinuationApp(
+                    controller,
+                    automaticUpdateChecks = false,
+                    webViewProvider = provider,
+                    onRecheckWebView = { rechecks.incrementAndGet() },
+                )
             }
             compose.waitUntil(10_000) {
                 compose.onAllNodesWithText("查看本机记忆").fetchSemanticsNodes().isNotEmpty()
             }
             tab("聊天").assertDoesNotExist()
+            compose.onNodeWithText("当前版本 ${provider.versionName}", substring = true).assertIsDisplayed()
+            compose.onNodeWithTag("webview-recovery-update").assertIsDisplayed()
+            compose.onNodeWithTag("webview-recovery-browser").assertIsDisplayed()
             screenshot("unified-chat-entry.png")
-            compose.onNodeWithText("查看本机记忆").performClick()
+            compose.onNodeWithTag("webview-recovery-recheck").performScrollTo().performClick()
+            compose.onNodeWithText("当前 WebView 仍需更新。").assertIsDisplayed()
+            compose.runOnIdle { assertEquals(1, rechecks.get()) }
+            compose.onNodeWithText("查看本机记忆").performScrollTo().performClick()
             tab("记忆").assertIsSelected()
             screenshot("unified-memory.png")
             compose.onNodeWithContentDescription("导入与资料").assertIsDisplayed().performClick()
@@ -71,17 +93,17 @@ class UnifiedAppUiTest {
             compose.onNodeWithText("本机记忆资料").performClick()
             compose.onNodeWithText("导出备份").assertIsDisplayed()
             compose.onNodeWithContentDescription("返回").performClick()
-            compose.onNodeWithText("关于与反馈").performClick()
+            compose.onNodeWithText("版本与更新").performClick()
             compose.onNode(hasScrollAction()).performScrollToNode(hasText("意见反馈"))
             compose.onNodeWithText("意见反馈").performClick()
             compose.onNodeWithText("意见信箱").assertIsDisplayed()
             compose.onNodeWithContentDescription("返回").performClick()
-            compose.onNodeWithText("关于该软件").assertIsDisplayed()
+            compose.onNodeWithText("版本与更新").assertIsDisplayed()
             compose.onNodeWithContentDescription("返回").performClick()
             compose.onNodeWithText("开发者选项").assertDoesNotExist()
             screenshot("unified-settings.png")
             compose.onNodeWithContentDescription("返回").performClick()
-            compose.onNodeWithText("更新系统 WebView 后开始聊天").assertIsDisplayed()
+            compose.onNodeWithText("应用内聊天需要更新 WebView").assertIsDisplayed()
             tab("聊天").assertDoesNotExist()
         } catch (failure: Throwable) {
             runCatching { screenshot("unified-navigation-failed.png") }
@@ -94,6 +116,111 @@ class UnifiedAppUiTest {
         } finally {
             instrumentation.runOnMainSync { store.clear() }
             application.deleteDatabase(databaseName)
+        }
+    }
+
+    @Test fun oldGoogleWebViewShowsThePublicBrowserBeforeItsPlayListing() {
+        val requests = mutableListOf<Intent>()
+        val provider = ChatWebViewProvider("com.google.android.webview", "102.0.5005.125", "Android System WebView")
+        compose.setContent {
+            val base = LocalContext.current
+            val context = remember(base) {
+                object : ContextWrapper(base) {
+                    override fun startActivity(intent: Intent) {
+                        requests.add(intent)
+                    }
+                }
+            }
+            ContinuationTheme {
+                CompositionLocalProvider(LocalContext provides context) {
+                    WebViewRecoveryScreen(provider, onRecheck = {}, onMemories = {}, onSettings = {}, onDiagnostics = {})
+                }
+            }
+        }
+        compose.onNodeWithText("当前版本 81.0.4044.138 · 要求 83 或更高").assertIsDisplayed()
+        val browser = compose.onNodeWithTag("webview-recovery-browser")
+        val update = compose.onNodeWithTag("webview-recovery-update")
+        assertTrue(browser.getBoundsInRoot().top < update.getBoundsInRoot().top)
+        browser.performClick()
+        update.performClick()
+        compose.runOnIdle {
+            assertEquals(2, requests.size)
+            assertEquals(Intent.ACTION_VIEW, requests[0].action)
+            assertEquals("https://digimonlegend.com/deepseek/", requests[0].dataString)
+            assertEquals(Intent.ACTION_VIEW, requests[1].action)
+            assertEquals("com.android.vending", requests[1].`package`)
+            assertEquals("https://play.google.com/store/apps/details?id=com.google.android.webview", requests[1].dataString)
+        }
+    }
+
+    @Test fun unavailablePlayStaysOnRecoveryPageAndShowsExplicitAlternatives() {
+        val requests = mutableListOf<Intent>()
+        val provider = ChatWebViewProvider("com.google.android.webview", "102.0.5005.125", "Android System WebView")
+        compose.setContent {
+            val base = LocalContext.current
+            val context = remember(base) {
+                object : ContextWrapper(base) {
+                    override fun startActivity(intent: Intent) {
+                        requests.add(intent)
+                        if (intent.`package` == "com.android.vending") throw ActivityNotFoundException()
+                    }
+                }
+            }
+            ContinuationTheme {
+                CompositionLocalProvider(LocalContext provides context) {
+                    WebViewRecoveryScreen(provider, onRecheck = {}, onMemories = {}, onSettings = {}, onDiagnostics = {})
+                }
+            }
+        }
+        val browser = compose.onNodeWithTag("webview-recovery-browser")
+        val update = compose.onNodeWithTag("webview-recovery-update")
+        update.performClick()
+        compose.onNodeWithText("无法打开 Google Play", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("软件更新", substring = true).assertIsDisplayed()
+        update.assertTextEquals("打开系统设置")
+        assertTrue(browser.getBoundsInRoot().top < update.getBoundsInRoot().top)
+        compose.runOnIdle {
+            assertEquals(1, requests.size)
+            assertEquals("com.android.vending", requests.single().`package`)
+        }
+        browser.performClick()
+        update.performClick()
+        compose.runOnIdle {
+            assertEquals(3, requests.size)
+            assertEquals("https://digimonlegend.com/deepseek/", requests[1].dataString)
+            assertEquals(Settings.ACTION_SETTINGS, requests[2].action)
+        }
+    }
+
+    @Test fun startupPanelShowsLoadingAndOffersBrowserAndRecoveryAfterFailure() {
+        val requests = mutableListOf<Intent>()
+        val error = mutableStateOf<String?>(null)
+        val retries = AtomicInteger()
+        val diagnostics = AtomicInteger()
+        compose.setContent {
+            val base = LocalContext.current
+            val context = remember(base) {
+                object : ContextWrapper(base) {
+                    override fun startActivity(intent: Intent) { requests.add(intent) }
+                }
+            }
+            ContinuationTheme {
+                CompositionLocalProvider(LocalContext provides context) {
+                    ChatStartupPanel(error.value, { retries.incrementAndGet() }, {}, {}, { diagnostics.incrementAndGet() })
+                }
+            }
+        }
+        compose.onNodeWithText("正在打开聊天…").assertIsDisplayed()
+        compose.onNodeWithTag("chat-startup-browser").assertDoesNotExist()
+        compose.runOnIdle { error.value = "聊天页面迟迟没有响应。" }
+        compose.onNodeWithText("聊天页面迟迟没有响应。").assertIsDisplayed()
+        compose.onNodeWithTag("chat-startup-browser").assertIsDisplayed().performClick()
+        compose.onNodeWithText("重新加载").performClick()
+        compose.onNodeWithText("技术诊断").performClick()
+        compose.runOnIdle {
+            assertEquals("https://digimonlegend.com/deepseek/", requests.single().dataString)
+            assertEquals(1, retries.get())
+            assertEquals(1, diagnostics.get())
         }
     }
 

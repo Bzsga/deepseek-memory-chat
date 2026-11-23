@@ -18,6 +18,10 @@
   height: 34px;
 }
 
+.message > :global([data-chat-mcp-active]) ~ .waiting {
+  display: none;
+}
+
 .waitingDot {
   width: 6px;
   height: 6px;

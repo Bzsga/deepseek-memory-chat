@@ -3,8 +3,10 @@ import type { ConversationMemory } from './contextMemory.js'
 import type { LocalImageJob } from '../api/imageJobs.js'
 import type { SharedConversationSource } from './sharedSource.js'
 import type { ImageActionTrace } from './imageAction.js'
+import type { McpSource } from './mcpSources.js'
 import type { TranslationMessage } from '../../i18n/index.js'
 import type { ApiErrorKind } from '../api/client.js'
+import type { BackgroundChatTransport } from '../api/client.js'
 import type {
   ChatModel,
   MessageUsage,
@@ -44,6 +46,7 @@ export type UserMessage = MessageBranch & {
   role: 'user'
   content: string
   files: FileAttachment[]
+  mcpSources?: McpSource[]
   createdAt: number
 }
 
@@ -85,7 +88,24 @@ export type ReplyBlock = ThinkingPart | TextPart | ServerToolBlock | GeneratedIm
  */
 export type ReplyStatus = 'pending' | 'streaming' | 'done' | 'stopped' | 'error'
 
+/** Managed task recovery belongs to the originating account and device. */
+export type LocalChatJob = {
+  id: string
+  ownerId: string
+  transport?: BackgroundChatTransport
+  model?: string
+  baseBlockCount: number
+  basePrefix: boolean
+  eventsSeen?: number
+  startedAt: number
+  imageNonce?: string
+  imageProvider?: 'managed' | 'personal'
+  canEditSource?: boolean
+  cancelRequested?: boolean
+}
+
 export type AssistantMessage = MessageBranch & {
+  chatJob?: LocalChatJob
   /** Account-bound recovery marker lives only in local storage. Portable backups omit it. */
   imageJob?: LocalImageJob
   /** Frozen dispatch prompt, retained for same-ID recovery and explicit regeneration. */
@@ -116,6 +136,12 @@ export type AssistantMessage = MessageBranch & {
   stopDetails?: StopDetails
   /** 最近一次请求的用量，续写后更新 */
   usage?: MessageUsage
+  /** Local provider-bound action for a TXT request explicitly rejected for its input length. */
+  largeTxtOffer?: { providerScope: string; inputTokens?: number; maxInputTokens?: number }
+  /** This provider already answered the turn from segmented evidence. */
+  largeTxtProcessed?: string
+  /** 本机保存的本次额外自动整理用量，服务未报告最终用量时保留空记录。 */
+  compactionUsage?: { usage?: MessageUsage }
   error?: {
     /** upload：发送前补传附件失败，请求没有发出 */
     kind: ApiErrorKind | 'upload'
@@ -148,7 +174,10 @@ export type Session = {
 }
 
 /** 会话列表元数据；消息只在打开会话时加载。 */
-export type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt'> & { pendingImageJob?: boolean }
+export type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt'> & {
+  pendingImageJob?: boolean
+  pendingChatJob?: boolean
+}
 
 /** 显式提取字段，避免将完整会话的消息带进列表。 */
 export const toSessionSummary = (session: SessionSummary | Session): SessionSummary => ({
@@ -156,6 +185,9 @@ export const toSessionSummary = (session: SessionSummary | Session): SessionSumm
   title: session.title,
   createdAt: session.createdAt,
   updatedAt: session.updatedAt,
+  ...(('messages' in session
+    ? session.messages.some((message) => message.role === 'assistant' && message.chatJob)
+    : session.pendingChatJob) ? { pendingChatJob: true } : {}),
   ...(('messages' in session
     ? session.messages.some((message) => message.role === 'assistant' && message.imageJob &&
       (!['completed', 'failed', 'cancelled', 'unknown', 'expired'].includes(message.imageJob.state) ||

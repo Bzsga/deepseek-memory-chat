@@ -1,0 +1,112 @@
+.cards {
+  display: grid;
+  gap: 6px;
+  margin-block: 8px;
+}
+
+.card {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.card[data-chat-mcp-status='waiting'] {
+  gap: 8px;
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1px 12px;
+}
+
+.heading strong {
+  min-width: 0;
+  font-weight: 600;
+}
+
+.status,
+.note {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.card[data-chat-mcp-status='waiting'] .status {
+  color: var(--dsw-alias-brand-text);
+}
+
+.card[data-chat-mcp-status='uncertain'] .status,
+.card[data-chat-mcp-status='tool_error'] .status {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.parameters {
+  display: grid;
+  grid-template-columns: fit-content(35%) minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 0;
+}
+
+.parameters dt {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.parameters dd {
+  min-width: 0;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.text {
+  min-width: 0;
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base);
+  white-space: pre-wrap;
+  font: 12px/19px ui-monospace, monospace;
+}
+
+.details {
+  min-width: 0;
+}
+
+.details summary {
+  box-sizing: border-box;
+  min-height: 40px;
+  padding-block: 10px;
+  color: var(--dsw-alias-brand-text);
+  cursor: pointer;
+}
+
+.preview {
+  display: block;
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.details[open] .preview {
+  display: none;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.actions > button {
+  min-height: 44px;
+}

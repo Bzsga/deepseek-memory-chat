@@ -577,7 +577,9 @@ internal fun OrganizationProgressScreen(
         if (!active && !starting) {
             item {
                 ActionRow {
-                    if (task == null) TextButton(onClick = onService) { Text("查看聊天 API 设置") }
+                    if (task == null || task.personalKeyRejected) {
+                        TextButton(onClick = onService) { Text("查看聊天 API 设置") }
+                    }
                     if ((task == null || task.status == "cancelled" || task.status == "completed") && onOriginalArchive == null)
                         TextButton(onClick = onPrepare) { Text("返回准备页") }
                     else if (task != null && task.status !in setOf("cancelled", "completed"))

@@ -5,7 +5,7 @@ import { defineConfig } from '@rspack/cli'
 import { rspack, type Configuration } from '@rspack/core'
 
 const dev = process.env.NODE_ENV !== 'production'
-const targets = ['chrome >= 105', 'edge >= 105', 'safari >= 16', 'firefox >= 110']
+const targets = ['chrome >= 83', 'edge >= 105', 'safari >= 16', 'firefox >= 110']
 const root = path.dirname(fileURLToPath(import.meta.url))
 const { version } = JSON.parse(
   readFileSync(new URL('./package.json', import.meta.url), 'utf8')
@@ -42,6 +42,12 @@ export const createConfig = ({
     clean: true,
   },
   devtool: dev ? 'cheap-module-source-map' : false,
+  optimization: {
+    minimizer: [
+      new rspack.SwcJsMinimizerRspackPlugin({ minimizerOptions: { ecma: 2020 } }),
+      new rspack.LightningCssMinimizerRspackPlugin({ minimizerOptions: { targets } }),
+    ],
+  },
   // 开发模式预编译异步模块，保持首次加载代码高亮和公式时的页面状态
   lazyCompilation: false,
   resolve: {
@@ -69,6 +75,12 @@ export const createConfig = ({
           env: { targets },
         },
         type: 'javascript/auto',
+      },
+      {
+        test: /\.[cm]?js$/,
+        include: /[\\/]node_modules[\\/]/,
+        loader: 'builtin:swc-loader',
+        options: { env: { targets } },
       },
       { test: /\.(woff2?|ttf)$/, type: 'asset/resource' },
       { test: /\.(jpe?g|png|webp)$/, type: 'asset/resource' },

@@ -2,6 +2,7 @@ import { validateContinuationPayload } from '../continuity.js'
 import { validateConversationMemory } from '../contextMemory.js'
 import { validateSharedSource } from '../sharedSource.js'
 import { validateImageActionTrace } from '../imageAction.js'
+import { normalizeMcpSources } from '../mcpSources.js'
 import { BackupError, fail } from './errors.js'
 import {
   EXPORT_FORMAT_VERSION,
@@ -203,6 +204,8 @@ const fragment: Read<Fragment | null> = (value) => {
 
 const message: Read<ChatMessage> = (value) => {
   const item = record(value)
+  const role = oneOf('USER', 'ASSISTANT')(item.role)
+  const mcpSources = role === 'USER' ? normalizeMcpSources(item.mcp_sources) : []
   let imageAction
   let imagePrompt
   try {
@@ -215,6 +218,7 @@ const message: Read<ChatMessage> = (value) => {
     return invalid()
   }
   return {
+    ...(mcpSources.length > 0 ? { mcp_sources: mcpSources } : {}),
     ...(imageAction ? { image_action: imageAction } : {}),
     ...(imagePrompt !== undefined ? { image_prompt: imagePrompt } : {}),
     ...('image_origin' in item ? { image_origin: oneOf('chat', 'edit')(item.image_origin) } : {}),
@@ -236,7 +240,7 @@ const message: Read<ChatMessage> = (value) => {
       : {}),
     id: count(item.id),
     parent_id: nullable(count)(item.parent_id),
-    role: oneOf('USER', 'ASSISTANT')(item.role),
+    role,
     status: oneOf(
       'WIP',
       'FINISHED',

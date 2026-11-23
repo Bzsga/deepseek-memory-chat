@@ -63,6 +63,8 @@ const text = JSON.stringify({
           role: 'ASSISTANT',
           fragments: [
             { type: 'THINK', content: '合成思考不入正文' },
+            { type: 'SEARCH', content: '搜索过程不入正文', queries: ['合成搜索'], results: [] },
+            { type: 'TOOL_SEARCH', queries: ['合成工具搜索'], results: [] },
             { type: 'RESPONSE', content: '原始回答' },
           ],
         },
@@ -76,6 +78,7 @@ assert.equal(parsed.session.messages[0].content, '  保留原话。\n还有一�
 assert.equal(parsed.session.messages[0].files[0].serverId, null)
 assert.equal(parsed.session.messages[0].files[0].isImage, true)
 assert.equal(parsed.session.messages[1].blocks[0].text, '原始回答')
+assert.equal(parsed.visibleMessages[1].content, '原始回答')
 assert.equal(parsed.session.messages[2].content, '未回答的问题')
 assert.equal(parsed.session.sharedSource.rawSnapshot, text)
 assert.equal(parsed.session.messages[0].createdAt, Date.parse('2026-11-17T00:00:00Z'))
@@ -185,6 +188,7 @@ const firstId = await share.continueSharedConversation(preview)
 const duplicateId = await share.continueSharedConversation(preview)
 assert.equal(firstId, duplicateId)
 assert.equal(appended.size, 2)
+assert.equal(appended.get(firstId).sharedSource.rawSnapshot, text)
 assert.ok(appended.has('existing-chat'))
 assert.equal(requests.length, 1, 'Preview confirmation must not fetch or call a model')
 owner = 'another-owner'

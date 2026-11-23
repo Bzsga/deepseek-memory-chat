@@ -163,7 +163,11 @@ const MarkdownBlockContentOrDefinitionContent = memo(
     nodes: Array<BlockContent | DefinitionContent>
     loading: boolean
   }) {
-    return nodes.map((node, index) => {
+    const renderNode = (
+      node: BlockContent | DefinitionContent,
+      index: number,
+      next?: BlockContent | DefinitionContent
+    ) => {
       switch (node.type) {
         case 'math':
           return <MathBlock key={index} value={node.value} />
@@ -182,12 +186,16 @@ const MarkdownBlockContentOrDefinitionContent = memo(
             ? null
             : createElement(
                 `h${node.depth}`,
-                { key: index },
+                { key: index, 'data-before-list': next?.type === 'list' || undefined },
                 <MarkdownPhrasingContent nodes={node.children} />
               )
         case 'paragraph':
           return (
-            <p key={index} className="ds-markdown-paragraph">
+            <p
+              key={index}
+              className="ds-markdown-paragraph"
+              data-before-list={(next?.type === 'list' && next.ordered) || undefined}
+            >
               <MarkdownPhrasingContent nodes={node.children} />
             </p>
           )
@@ -208,7 +216,20 @@ const MarkdownBlockContentOrDefinitionContent = memo(
           // 脚注与定义已在解析时换成段落
           return null
       }
-    })
+    }
+
+    const rendered: ReactNode[] = []
+    let next: BlockContent | DefinitionContent | undefined
+    // Match adjacent DOM elements even when the parser produces an empty heading between them.
+    for (let index = nodes.length - 1; index >= 0; index--) {
+      const node = nodes[index]
+      const element = renderNode(node, index, next)
+      if (element !== null) {
+        rendered.push(element)
+        next = node
+      }
+    }
+    return rendered.reverse()
   }
 )
 

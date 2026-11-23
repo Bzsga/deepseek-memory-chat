@@ -2,6 +2,48 @@
   margin-bottom: 10px;
 }
 
+.usage {
+  margin: 8px 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.usage > summary {
+  width: fit-content;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.usageGroup {
+  max-width: 24rem;
+  margin-top: 5px;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+}
+
+.usageGroup > strong {
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.usageGroup > p,
+.usageValues {
+  margin: 4px 0 0;
+}
+
+.usageValues > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.usageValues dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 .thinkingScroll {
   max-height: min(260px, calc(var(--app-viewport-height, 100vh) * 0.32));
   overflow-y: auto;

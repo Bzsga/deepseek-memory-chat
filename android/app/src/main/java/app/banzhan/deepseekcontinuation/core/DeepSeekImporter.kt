@@ -17,6 +17,9 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
+internal class ImportFailure(val detail: String, message: String, cause: Throwable? = null) :
+    IllegalArgumentException(message, cause)
+
 /** Imports text and metadata only. Attachments are never extracted or fetched. */
 object DeepSeekImporter {
     private const val MAX_INPUT_BYTES = 32 * 1024 * 1024
@@ -28,11 +31,17 @@ object DeepSeekImporter {
     private val sessionIndexFields = setOf("id", "title", "inserted_at", "updated_at", "message_count", "pinned")
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
+    internal fun inputFormat(bytes: ByteArray, fileName: String): String = when {
+        fileName.endsWith(".zip", true) ||
+            bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte() -> "zip"
+        fileName.endsWith(".json", true) -> "json"
+        else -> "unknown"
+    }
+
     fun parse(bytes: ByteArray, fileName: String, temporaryDirectory: File? = null): ImportResult {
-        require(bytes.isNotEmpty()) { "导入文件为空。请选择 DeepSeek 导出的 JSON 或 ZIP。" }
-        require(bytes.size <= MAX_INPUT_BYTES) { "导入文件超过 32 MiB，请拆分后导入。" }
+        if (bytes.isEmpty()) throw ImportFailure("import_empty", "导入文件为空。请选择 DeepSeek 导出的 JSON 或 ZIP。")
+        if (bytes.size > MAX_INPUT_BYTES) throw ImportFailure("import_size_limit", "导入文件超过 32 MiB，请拆分后导入。")
         val warnings = linkedSetOf<String>()
-        val looksLikeZip = bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()
         val conversations = linkedMapOf<String, ImportedConversation>()
         val fingerprints = mutableMapOf<String, String>()
         fun consume(conversation: JsonObject) {
@@ -46,13 +55,13 @@ object DeepSeekImporter {
             fingerprints[result.id] = fingerprint
             conversations[result.id] = result
         }
-        if (fileName.endsWith(".zip", true) || looksLikeZip) {
-            readZip(bytes, temporaryDirectory, warnings, ::consume)
-        } else {
-            require(fileName.endsWith(".json", true)) { "仅支持 DeepSeek JSON 或 ZIP 导出文件。" }
-            readJson(ByteArrayInputStream(bytes), fileName, warnings, ::consume)
+        when (inputFormat(bytes, fileName)) {
+            "zip" -> readZip(bytes, temporaryDirectory, warnings, ::consume)
+            "json" -> readJson(ByteArrayInputStream(bytes), fileName, warnings, ::consume)
+            else -> throw ImportFailure("import_unsupported_file", "仅支持 DeepSeek JSON 或 ZIP 导出文件。")
         }
-        require(conversations.isNotEmpty()) { "未找到可导入的聊天内容。需要含明确角色的 mapping、messages 或会话数组。" }
+        if (conversations.isEmpty()) throw ImportFailure("import_no_conversations",
+            "未找到可导入的聊天内容。需要含明确角色的 mapping、messages 或会话数组。")
         return ImportResult(conversations.values.toList(), warnings.toList())
     }
 
@@ -120,14 +129,16 @@ object DeepSeekImporter {
                     }
                 }
             }
-        } catch (error: IllegalArgumentException) {
+        } catch (error: ImportFailure) {
             throw error
+        } catch (error: IllegalArgumentException) {
+            throw ImportFailure("import_zip_validation", error.message.orEmpty(), error)
         } catch (error: Exception) {
-            throw IllegalArgumentException("ZIP 无法读取，可能已损坏、加密或压缩格式不受支持。", error)
+            throw ImportFailure("import_zip_read", "ZIP 无法读取，可能已损坏、加密或压缩格式不受支持。", error)
         } finally {
             temporary?.delete()
         }
-        require(documents > 0) { "ZIP 中没有 JSON 会话文件。" }
+        if (documents == 0) throw ImportFailure("import_no_conversations", "ZIP 中没有 JSON 会话文件。")
     }
 
     private fun readJson(
@@ -145,8 +156,12 @@ object DeepSeekImporter {
             var sessionIndex = false
             var found = false
             JsonDocumentReader(InputStreamReader(input, decoder)).read { text, arrayItem ->
-                validateStructure(text)
-                val value = json.parseToJsonElement(text)
+                val value = try {
+                    validateStructure(text)
+                    json.parseToJsonElement(text)
+                } catch (error: IllegalArgumentException) {
+                    throw ImportFailure("import_json_syntax", error.message.orEmpty(), error)
+                }
                 if (!arrayItem) {
                     conversationObjects(value).forEach { found = true; consume(it) }
                 } else {
@@ -177,9 +192,15 @@ object DeepSeekImporter {
             }
             if (!found && !sessionIndex) warnings += "$fileName 中未找到受支持的会话结构。"
         } catch (error: IllegalArgumentException) {
-            throw IllegalArgumentException("$fileName 无法导入。${error.message ?: "JSON 格式不正确。"}", error)
+            val detail = when (error) {
+                is ImportFailure -> error.detail
+                is JsonDocumentFailure -> "import_json_syntax"
+                else -> "import_json_structure"
+            }
+            throw ImportFailure(detail,
+                "$fileName 无法导入。${error.message ?: "JSON 格式不正确。"}", error)
         } catch (error: Exception) {
-            throw IllegalArgumentException("$fileName 不是有效的 UTF-8 JSON 文件。", error)
+            throw ImportFailure("import_json_read", "$fileName 不是有效的 UTF-8 JSON 文件。", error)
         }
     }
 
@@ -195,6 +216,15 @@ object DeepSeekImporter {
             }
         }
         is JsonObject -> when {
+            source["format"] == JsonPrimitive("deepseek-session") -> {
+                val manifest = source["manifest"] as? JsonObject
+                require(source["version"] == JsonPrimitive(1) && manifest?.get("export_format_version") == JsonPrimitive(3) &&
+                    source["files"] is JsonArray) { "不支持此单会话导出格式。" }
+                val session = source["session"] as? JsonObject
+                require(session != null && session["messages"] is JsonArray) { "单会话导出缺少有效的会话内容。" }
+                // Native organization imports conversation text and attachment metadata only.
+                listOf(session)
+            }
             source.hasConversationShape() -> listOf(source)
             source["conversations"] is JsonArray -> conversationObjects(source.getValue("conversations"))
             source["chats"] is JsonArray -> conversationObjects(source.getValue("chats"))
@@ -208,8 +238,18 @@ object DeepSeekImporter {
         this["mapping"] is JsonObject || this["messages"] is JsonArray ||
             this["nodes"] is JsonArray || this["tree"] is JsonObject
 
-    private fun JsonObject.hasMessageShape(): Boolean =
-        containsKey("content") && listOf("role", "author", "sender", "type").any { containsKey(it) }
+    private fun JsonObject.hasMessageShape(): Boolean {
+        val hasRoleField = listOf("role", "author", "sender", "type").any { containsKey(it) }
+        if (hasRoleField && containsKey("content")) return true
+        val fragments = this["fragments"] as? JsonArray ?: return false
+        if (hasConversationShape()) return false
+        return hasRoleField || fragments.any {
+            when ((it as? JsonObject)?.value("type")?.uppercase(Locale.ROOT)) {
+                "REQUEST", "RESPONSE", "THINK", "FILE" -> true
+                else -> false
+            }
+        }
+    }
 
     private fun JsonObject.isSessionIndexRow(): Boolean {
         val title = this["title"]

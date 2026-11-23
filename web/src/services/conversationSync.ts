@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import { ApiError, request } from './api/client.js'
+import { managedRequestId } from './api/serviceDiagnostics.js'
+import { recordDiagnostic } from './technicalDiagnostics.js'
 import { API_ORIGIN, accountStorageKey, getRuntime, isSessionActive, isGuestWorkspace, subscribeRuntimeUser } from './runtime.js'
 import * as db from './chat/db.js'
 import {
@@ -74,7 +76,8 @@ let broadcast: ((type: 'conversations' | 'settings') => void) | undefined
 let lifetime = 0
 const knownCloudBlobs = new Set<string>()
 
-const invalid = (): never => {
+const invalid = (code: 'invalid_response' | 'integrity_error' = 'invalid_response'): never => {
+  recordDiagnostic('sync', code, { stage: 'verify' })
   throw new Error('同步服务返回的数据格式无效，请稍后重试。')
 }
 const record = (value: unknown): Record<string, unknown> =>
@@ -198,12 +201,13 @@ const jsonRequest = async (path: string, init: RequestInit = {}): Promise<unknow
   const timeoutController = new AbortController()
   const abort = () => timeoutController.abort()
   let timedOut = false
+  const timeout = path === '' ? 20000 : 180000
   const timer = setTimeout(
     () => {
       timedOut = true
       abort()
     },
-    path === '' ? 20000 : 180000
+    timeout
   )
   init.signal?.addEventListener('abort', abort, { once: true })
   if (init.signal?.aborted) {
@@ -220,9 +224,17 @@ const jsonRequest = async (path: string, init: RequestInit = {}): Promise<unknow
       },
     })
     const bytes = await readBytes(response, MAX_JSON, timeoutController.signal)
-    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown
+    try {
+      return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown
+    } catch (error) {
+      if (!timeoutController.signal.aborted) {
+        recordDiagnostic('sync', 'invalid_response', { stage: 'parse', request_id: managedRequestId(response) })
+      }
+      throw error
+    }
   } catch (error) {
     if (timedOut && !init.signal?.aborted) {
+      recordDiagnostic('sync', 'timeout', { stage: 'request', elapsed_ms: timeout })
       throw new Error('同步请求超时，已保留本机资料，请稍后重试。')
     }
     throw error
@@ -533,7 +545,7 @@ const receiveSession = async (
     })
     const bytes = await readBytes(response, MAX_FILE, signal)
     if (bytes.byteLength !== file.size || (await hash(bytes.buffer)) !== file.sha256) {
-      return invalid()
+      return invalid('integrity_error')
     }
     files.push({ id: file.id, blob: new Blob([bytes], { type: file.mime_type }) })
   }

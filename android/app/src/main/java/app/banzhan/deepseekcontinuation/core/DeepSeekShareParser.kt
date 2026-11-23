@@ -19,7 +19,7 @@ object DeepSeekShareParser {
     private const val INVALID = "分享内容格式暂不支持，请改用 DeepSeek 导出的 ZIP 或 JSON 文件。"
     private val json = Json { ignoreUnknownKeys = true }
     private val extraFragments = setOf("THINK", "TEMPLATE_RESPONSE", "TIP", "CONTENT_RISK", "PARTIAL_FILE_READ",
-        "TOOL_SEARCH", "TOOL_OPEN", "TOOL_FIND", "READ_LINK", "TOOL_IMAGE_SEARCH")
+        "SEARCH", "TOOL_SEARCH", "TOOL_OPEN", "TOOL_FIND", "READ_LINK", "TOOL_IMAGE_SEARCH")
 
     fun parse(bytes: ByteArray, shareId: String): ImportResult {
         require(Regex("[A-Za-z0-9_-]{6,128}").matches(shareId)) { "分享链接无效，请重新复制链接。" }

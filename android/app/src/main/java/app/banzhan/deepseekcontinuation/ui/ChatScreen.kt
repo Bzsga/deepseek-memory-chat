@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.ClipData
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.LayoutInflater
 import android.webkit.*
@@ -28,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import app.banzhan.deepseekcontinuation.R
 import app.banzhan.deepseekcontinuation.data.*
 import app.banzhan.deepseekcontinuation.core.ImportedConversation
@@ -40,6 +43,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 
+private const val CHAT_STARTUP_DELAYED = "聊天页面迟迟没有响应。"
+
 @Composable
 internal fun ChatScreen(
     session: AccountSession?,
@@ -49,30 +54,39 @@ internal fun ChatScreen(
     continuation: ChatContinuationDraft?,
     onContinuationSaved: (String) -> Unit,
     onOrganize: suspend (ByteArray, String?) -> Unit,
-    onMemories: () -> Unit,
+    onMemories: (String?) -> Unit,
+    onReadArchive: suspend (String) -> JsonObject,
     onAccount: (resumeSyncSettings: Boolean) -> Unit,
     onSettings: suspend (NativeSettingsSection?) -> Unit,
+    onDiagnostics: () -> Unit = {},
     onChatProvider: suspend (String, String, String?, String?, String?) -> Unit,
+    personalMcpAllowed: () -> Boolean = { false },
     onThemePreference: (String?, String) -> Unit,
     initialFragment: String = "",
     onReturnFromSettings: (() -> Unit)? = null,
-    webViewMajor: Int,
+    webViewProvider: ChatWebViewProvider,
     webViewHandlesIme: Boolean,
+    onRecheckWebView: () -> Unit,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val currentOrganize by rememberUpdatedState(onOrganize)
     val currentMemories by rememberUpdatedState(onMemories)
+    val currentReadArchive by rememberUpdatedState(onReadArchive)
     val currentAccount by rememberUpdatedState(onAccount)
     val currentSettings by rememberUpdatedState(onSettings)
+    val currentDiagnostics by rememberUpdatedState(onDiagnostics)
     val returnFromSettings by rememberUpdatedState(onReturnFromSettings)
     val liveSession by rememberUpdatedState(session)
     val currentProvider by rememberUpdatedState(onChatProvider)
+    val currentMcpAllowed by rememberUpdatedState(personalMcpAllowed)
     val currentTheme by rememberUpdatedState(onThemePreference)
     val currentSaved by rememberUpdatedState(onContinuationSaved)
-    var error by remember(session?.user?.id) { mutableStateOf<String?>(null) }
     var reload by remember { mutableIntStateOf(0) }
-    var loading by remember { mutableStateOf(false) }
+    var error by remember(session?.token, reload) { mutableStateOf<String?>(null) }
+    var rendererGone by remember(session?.token, reload) { mutableStateOf(false) }
+    var pageReady by remember(session?.token, reload) { mutableStateOf(false) }
     var viewingSettings by remember(session?.token, reload) { mutableStateOf(false) }
     var hasHistory by remember(session?.token, reload) { mutableStateOf(false) }
     var web by remember { mutableStateOf<WebView?>(null) }
@@ -95,6 +109,7 @@ internal fun ChatScreen(
         } else {
             parseChatFilePickerResult(result.resultCode, result.data, context.packageName).also {
                 if (it == null && callback != null && result.resultCode == Activity.RESULT_OK) {
+                    TechnicalDiagnostics.record("attachment", "operation_failed", "read")
                     Toast.makeText(context, "未能读取所选文件，请换一个文件来源后重试。", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -139,22 +154,21 @@ internal fun ChatScreen(
         }
     }
 
-    if (webViewMajor in 1..104) {
+    if (!webViewProvider.isCompatible) {
+        LaunchedEffect(webViewProvider.packageName, webViewProvider.versionName) {
+            TechnicalDiagnostics.recordWebViewInitialization(webViewProvider)
+        }
         if (initialFragment.isNotEmpty()) {
             LaunchedEffect(Unit) { currentSettings(null) }
             return
         }
-        Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text("更新系统 WebView 后开始聊天", style = MaterialTheme.typography.titleLarge)
-            Text("聊天页面需要较新的 Android System WebView。本机记忆和导入资料仍可使用。")
-            Button(onClick = { runCatching { context.startActivity(Intent(Intent.ACTION_VIEW,
-                Uri.parse("market://details?id=com.google.android.webview"))) }.onFailure {
-                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.webview")))
-            } }) { Text("更新 WebView") }
-            TextButton(onClick = onMemories) { Text("查看本机记忆") }
-            TextButton(onClick = { scope.launch { currentSettings(null) } }) { Text("本机设置") }
-            TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(CHAT_PAGE))) }) { Text("在浏览器打开") }
-        }
+        WebViewRecoveryScreen(
+            provider = webViewProvider,
+            onRecheck = onRecheckWebView,
+            onMemories = { onMemories(null) },
+            onSettings = { scope.launch { currentSettings(null) } },
+            onDiagnostics = { currentDiagnostics() },
+        )
         return
     }
     BackHandler(viewingSettings || hasHistory || returnFromSettings != null) {
@@ -203,30 +217,49 @@ internal fun ChatScreen(
             host.importFrame(buildJsonObject { put("finished", true) })
             onImportSaved(batch.id, batch.conversationIds.size)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            if (cancelled is kotlinx.coroutines.TimeoutCancellationException) error = "聊天列表保存超时，请重新加载以继续。" else throw cancelled
-        } catch (failure: Exception) { error = failure.message ?: "聊天列表导入失败，请重新加载。" }
+            if (cancelled !is kotlinx.coroutines.TimeoutCancellationException) throw cancelled
+            TechnicalDiagnostics.record("import", "timeout", "save")
+            error = "聊天列表保存超时，请重新加载以继续。"
+        } catch (failure: Exception) {
+            TechnicalDiagnostics.failure("import", "save", failure)
+            error = failure.message ?: "聊天列表导入失败，请重新加载。"
+        }
     }
     val keyboardPadding = if (webViewHandlesIme) Modifier else Modifier.imePadding()
     Column(Modifier.fillMaxSize().then(keyboardPadding)) {
-        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-        error?.let { message ->
+        if (!pageReady || rendererGone) {
+            ChatStartupPanel(
+                error = error,
+                onRetry = { reload++ },
+                onMemories = { onMemories(null) },
+                onSettings = { scope.launch { currentSettings(null) } },
+                onDiagnostics = { currentDiagnostics() },
+            )
+        } else error?.let { message ->
             Surface(color = MaterialTheme.colorScheme.errorContainer) {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                     Text(message, Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodySmall)
                     Row {
                         TextButton(onClick = { error = null; reload++ }) { Text("重新加载") }
-                        TextButton(onClick = onMemories) { Text("本机记忆") }
+                        TextButton(onClick = { onMemories(null) }) { Text("本机记忆") }
                         TextButton(onClick = { scope.launch { currentSettings(null) } }) { Text("本机设置") }
                     }
+                    TextButton(onClick = { currentDiagnostics() }) { Text("技术诊断") }
                 }
             }
         }
-        key(session?.token, reload) {
+        if (!rendererGone) key(session?.token, reload) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = {
-                    val managed = ChatBrowser(context,
+                    val personalMcp by lazy { PersonalMcpBridge(context) }
+                    val managed = try { ChatBrowser(context,
                         onError = { error = it },
+                        onRendererGone = { rendererGone = true },
+                        onPageReady = {
+                            pageReady = true
+                            if (error == CHAT_STARTUP_DELAYED) error = null
+                        },
                         onHistory = { url, canGoBack ->
                             val hash = Uri.parse(url).fragment.orEmpty()
                             val returnsToMemory = viewingSettings && hash.isEmpty() && trustedChatPage(url)
@@ -234,7 +267,7 @@ internal fun ChatScreen(
                             hasHistory = canGoBack
                             if (returnsToMemory) returnFromSettings?.invoke()
                         },
-                        onLoading = { loading = it },
+                        onLoadingStarted = { pageReady = false },
                         personalImageSessionActive = {
                             session?.token == liveSession?.token && session?.user?.id == liveSession?.user?.id
                         },
@@ -244,11 +277,36 @@ internal fun ChatScreen(
                                 var safeError: String? = "聊天消息格式无效。"
                                 try {
                                     if (!active()) return@launch
-                                    require(raw.toByteArray().size <= CHAT_BRIDGE_LIMIT) { "传递内容过大。" }
+                                    require(raw.length <= CHAT_BRIDGE_LIMIT && raw.toByteArray().size <= CHAT_BRIDGE_LIMIT) {
+                                        "传递内容过大。"
+                                    }
                                     val message = Json.parseToJsonElement(raw).jsonObject
                                     val type = message["type"]?.jsonPrimitive?.content
                                     if (type?.startsWith("image.") == true) {
                                         personalImages.message(type, message, raw.length)
+                                        return@launch
+                                    }
+                                    if (type?.startsWith("mcp.") == true) {
+                                        val mcpSessionActive = {
+                                            active() && session?.token == liveSession?.token &&
+                                                session?.user?.id == liveSession?.user?.id &&
+                                                (session == null || !accountSessionExpired(session)) &&
+                                                lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                                                web?.let { it.isAttachedToWindow && it.isShown && it.windowVisibility == android.view.View.VISIBLE } == true
+                                        }
+                                        if (mcpSessionActive()) {
+                                            personalMcp.respond(type, message, raw.toByteArray(Charsets.UTF_8).size,
+                                                session?.user?.id, mcpSessionActive, currentMcpAllowed,
+                                                portIdentity = active)?.let(reply)
+                                        }
+                                        return@launch
+                                    }
+                                    if (type?.startsWith("personal.chat.") == true) {
+                                        if (session?.token != liveSession?.token || session?.user?.id != liveSession?.user?.id) return@launch
+                                        val visible = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                                            web?.let { it.isAttachedToWindow && it.isShown && it.windowVisibility == android.view.View.VISIBLE } == true
+                                        personalChatBridgeResponse(context, continuationRecipient(session?.user?.id), visible, type, message)
+                                            ?.let(reply)
                                         return@launch
                                     }
                                     if (session != liveSession) return@launch
@@ -259,8 +317,17 @@ internal fun ChatScreen(
                                     when (type) {
                                         "archive.ready" -> {
                                             require(matchesChatBridgeOwner(message["payload"]!!.jsonObject, session?.user?.id))
-                                            browser?.archiveReady = true
+                                            browser?.let { host -> host.archiveReady = true; host.markPageReady() }
                                         }
+                                        "diagnostics.ready" -> browser?.markPageReady()
+                                        "diagnostics.record" -> {
+                                            val payload = message["payload"] as? JsonObject
+                                            if (payload == null || raw.length > 1024 || !TechnicalDiagnostics.recordFromWeb(payload)) {
+                                                reply(bridgeAck(id, "诊断格式无效。"))
+                                                return@launch
+                                            }
+                                        }
+                                        "diagnostics.open" -> currentDiagnostics()
                                         "chat.provider", "chat.theme" -> {
                                             val payload = message["payload"] as? JsonObject ?: error("invalid payload")
                                             val expectedId = session?.user?.id ?: "local"
@@ -286,7 +353,27 @@ internal fun ChatScreen(
                                             require(target == null || target.length <= 200) { "来源记忆标识无效。" }
                                             currentOrganize(bytes, target)
                                         }
-                                        "memory.open" -> currentMemories()
+                                        "memory.open" -> {
+                                            val source = (message["payload"] as? JsonObject)?.stringField("archiveId")
+                                            require(source == null || source.isNotBlank() && source.length <= 200) {
+                                                "来源记忆标识无效。"
+                                            }
+                                            currentMemories(source)
+                                        }
+                                        "memory.refresh" -> {
+                                            val source = (message["payload"] as? JsonObject)?.stringField("archiveId")
+                                            require(source != null && source.isNotBlank() && source.length <= 200) {
+                                                "来源记忆标识无效。"
+                                            }
+                                            val snapshot = currentReadArchive(source)
+                                            if (!active() || session != liveSession) return@launch
+                                            val response = bridgeAck(id, null, snapshot)
+                                            require(response.toByteArray(Charsets.UTF_8).size <= CHAT_BRIDGE_LIMIT) {
+                                                "续聊资料过长，请减少档案内容后再刷新。"
+                                            }
+                                            reply(response)
+                                            return@launch
+                                        }
                                         "account.open" -> currentAccount(
                                             (message["payload"] as? JsonObject)?.stringField("section") == "data"
                                         )
@@ -336,6 +423,7 @@ internal fun ChatScreen(
                                 } else params.createIntent()
                                 chooseFile.launch(intent)
                             } catch (_: Exception) {
+                                TechnicalDiagnostics.record("attachment", "operation_failed", "initialize")
                                 capturePath?.let(::File)?.delete(); capturePath = null
                                 callback.onReceiveValue(null); fileResult = null
                                 error = if (params.isCaptureEnabled) "无法打开相机，请从相册或文件选择图片。" else "无法打开文件选择器。"
@@ -362,17 +450,25 @@ internal fun ChatScreen(
                         onMicrophoneCanceled = { request ->
                             if (audioRequest === request) audioRequest = null
                         },
-                    )
-                    browser = managed; web = managed.view
-                    managed.continuation(continuation)
-                    managed.load(session, initialFragment)
-                    managed.view.apply { tag = managed }
+                    ) } catch (failure: RuntimeException) {
+                        TechnicalDiagnostics.failure("webview", "initialize", failure)
+                        error = "无法启动聊天页面，请重试。"
+                        null
+                    }
+                    if (managed == null) {
+                        android.view.View(context)
+                    } else {
+                        browser = managed; web = managed.view
+                        managed.continuation(continuation)
+                        managed.load(session, initialFragment)
+                        managed.view.apply { tag = managed }
+                    }
                 },
                 onRelease = { released ->
                     (released.tag as? ChatBrowser)?.close()
                     released.tag = null
                     if (web === released) { web = null; browser = null }
-                    released.destroy()
+                    (released as? WebView)?.destroy()
                 },
             )
         }
@@ -389,9 +485,10 @@ internal fun parseChatFilePickerResult(resultCode: Int, data: Intent?, packageNa
 
 private fun JsonObject.stringField(name: String): String? = (get(name) as? JsonPrimitive)?.takeIf { it.isString }?.content
 
-private fun bridgeAck(id: String, error: String?) = buildJsonObject {
+internal fun bridgeAck(id: String, error: String?, payload: JsonObject? = null) = buildJsonObject {
     put("version", 1); put("id", id); put("type", "ack"); put("ok", error == null)
     if (error != null) put("error", error)
+    if (payload != null) put("payload", payload)
 }.toString()
 
 internal fun trustedChatPage(url: String): Boolean = runCatching {
@@ -400,11 +497,43 @@ internal fun trustedChatPage(url: String): Boolean = runCatching {
         uri.userInfo == null && uri.path == "/deepseek/"
 }.getOrDefault(false)
 
+internal class ChatVisualReadiness {
+    private enum class State { INACTIVE, WAITING_FOR_PAGE, WAITING_FOR_DRAW }
+
+    private var generation = 0L
+    private var state = State.INACTIVE
+
+    fun beginNavigation() {
+        generation++
+        state = State.WAITING_FOR_PAGE
+    }
+
+    fun requestDraw(): Long? {
+        if (state != State.WAITING_FOR_PAGE) return null
+        state = State.WAITING_FOR_DRAW
+        return generation
+    }
+
+    val waitingForDraw: Boolean get() = state == State.WAITING_FOR_DRAW
+
+    fun confirmDraw(requestId: Long): Boolean {
+        if (state != State.WAITING_FOR_DRAW || requestId != generation) return false
+        invalidate()
+        return true
+    }
+
+    fun invalidate() {
+        state = State.INACTIVE
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled", "InflateParams")
 private class ChatBrowser(
     private val context: Context,
     private val onError: (String) -> Unit,
-    private val onLoading: (Boolean) -> Unit,
+    private val onRendererGone: () -> Unit,
+    private val onPageReady: () -> Unit,
+    private val onLoadingStarted: () -> Unit,
     private val onHistory: (String, Boolean) -> Unit,
     private val personalImageSessionActive: () -> Boolean,
     private val onMessage: (String, () -> Boolean, (String) -> Unit, PersonalImageChannel) -> Unit,
@@ -423,6 +552,22 @@ private class ChatBrowser(
     private var exportPort: WebMessagePort? = null
     private var transfer: ChatBlobTransfer? = null
     private var disposed = false
+    private var rendererGone = false
+    private var loadStage: String? = null
+    private var loadStartedAt = 0L
+    private val visualReadiness = ChatVisualReadiness()
+    private val startupTimeout = Runnable {
+        val stage = loadStage ?: return@Runnable
+        if (disposed || rendererGone) return@Runnable
+        val detail = when (stage) {
+            "navigate" -> "webview_navigation"
+            "document" -> "webview_document"
+            else -> if (visualReadiness.waitingForDraw) "webview_visual_callback" else "webview_page_ready"
+        }
+        TechnicalDiagnostics.record("webview", "timeout", stage, elapsedMs = loadElapsed(), detail = detail)
+        onError(CHAT_STARTUP_DELAYED)
+        finishLoading()
+    }
     private val scrollCapture = installChatScrollCapture(view) {
         !disposed && trustedChatPage(view.url.orEmpty())
     }
@@ -434,6 +579,7 @@ private class ChatBrowser(
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             setSupportMultipleWindows(false)
             mediaPlaybackRequiresUserGesture = false
+            userAgentString = "$userAgentString ${TechnicalDiagnostics.USER_AGENT_MARKER}"
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, false)
@@ -458,25 +604,54 @@ private class ChatBrowser(
             }
             override fun onPageStarted(web: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 scrollCapture?.reset()
-                resetPorts(); onLoading(true)
+                resetPorts()
+                if (loadStage != "navigate") beginLoading()
+                loadStage = "document"
             }
             override fun onPageFinished(web: WebView, url: String) {
-                onLoading(false)
+                if (loadStage == "document") loadStage = "render"
                 onHistory(url, web.canGoBack())
                 // Same-document history updates can also finish. Keep the active channels for this page.
-                if (port == null && !disposed && trustedChatPage(url) && trustedChatPage(web.url.orEmpty())) connect()
+                if (port == null && !disposed && !rendererGone && trustedChatPage(url) && trustedChatPage(web.url.orEmpty())) {
+                    try {
+                        connect()
+                    } catch (error: RuntimeException) {
+                        resetPorts()
+                        renderFailed(error)
+                    }
+                }
             }
             override fun onReceivedError(web: WebView, request: WebResourceRequest, error: WebResourceError) {
-                if (request.isForMainFrame) { onLoading(false); onError("聊天暂时无法连接，请检查网络后重试。") }
+                val stage = if (request.isForMainFrame) "document" else if (isChatAsset(request.url)) "render" else return
+                TechnicalDiagnostics.record("webview", if (error.errorCode == WebViewClient.ERROR_TIMEOUT) "timeout" else "load_failed",
+                    stage, elapsedMs = loadElapsed())
+                if (request.isForMainFrame) {
+                    failLoading()
+                    onError("聊天暂时无法连接，请检查网络后重试。")
+                }
             }
             override fun onReceivedHttpError(web: WebView, request: WebResourceRequest, response: WebResourceResponse) {
-                if (request.isForMainFrame && response.statusCode >= 400) {
-                    onLoading(false)
+                val stage = if (request.isForMainFrame) "document" else if (isChatAsset(request.url)) "render" else return
+                if (response.statusCode < 400) return
+                TechnicalDiagnostics.record("webview", "http_error", stage, response.statusCode, loadElapsed())
+                if (request.isForMainFrame) {
+                    failLoading()
                     onError("页面暂时无法加载，请重试或打开本机设置。")
                 }
             }
             override fun onReceivedSslError(web: WebView, handler: SslErrorHandler, error: android.net.http.SslError) {
-                handler.cancel(); onLoading(false); onError("安全连接未建立，请稍后重试。")
+                handler.cancel()
+                TechnicalDiagnostics.record("webview", "load_failed", loadStage ?: "document", elapsedMs = loadElapsed())
+                failLoading()
+                onError("安全连接未建立，请稍后重试。")
+            }
+            override fun onRenderProcessGone(web: WebView, detail: RenderProcessGoneDetail): Boolean {
+                rendererGone = true
+                TechnicalDiagnostics.record("webview", "render_gone", loadStage ?: "render", elapsedMs = loadElapsed())
+                failLoading()
+                onError("聊天页面意外关闭，请重新加载。")
+                onRendererGone()
+                return true
             }
         }
         view.webChromeClient = object : WebChromeClient() {
@@ -504,10 +679,75 @@ private class ChatBrowser(
         val cookie = if (session != null)
             "deepseek_session=${session.token}; Path=/deepseek-api; Secure; HttpOnly; SameSite=Strict"
         else "deepseek_session=; Path=/deepseek-api; Max-Age=0; Secure; HttpOnly; SameSite=Strict"
-        CookieManager.getInstance().setCookie(CHAT_API,
-            cookie) {
-            if (!disposed) { CookieManager.getInstance().flush(); view.loadUrl(CHAT_PAGE + initialFragment) }
+        beginLoading()
+        try {
+            CookieManager.getInstance().setCookie(CHAT_API, cookie) {
+                if (!disposed && !rendererGone) {
+                    try {
+                        CookieManager.getInstance().flush()
+                        view.loadUrl(CHAT_PAGE + initialFragment)
+                    } catch (error: RuntimeException) { navigationFailed(error) }
+                }
+            }
+        } catch (error: RuntimeException) { navigationFailed(error) }
+    }
+
+    private fun beginLoading() {
+        view.removeCallbacks(startupTimeout)
+        visualReadiness.beginNavigation()
+        loadStartedAt = SystemClock.elapsedRealtime()
+        loadStage = "navigate"
+        onLoadingStarted()
+        view.postDelayed(startupTimeout, TechnicalDiagnostics.STARTUP_TIMEOUT_MS)
+    }
+
+    private fun finishLoading() {
+        view.removeCallbacks(startupTimeout)
+        loadStage = null
+    }
+
+    fun markPageReady() {
+        if (disposed || rendererGone || !trustedChatPage(view.url.orEmpty())) return
+        val requestId = visualReadiness.requestDraw() ?: return
+        // The bridge runs before WebView's visual state necessarily contains the updated DOM.
+        // Keep the watchdog active until the same navigation is ready for the next draw.
+        try {
+            view.postVisualStateCallback(requestId, object : WebView.VisualStateCallback() {
+                override fun onComplete(requestId: Long) {
+                    if (disposed || rendererGone || !trustedChatPage(view.url.orEmpty())) return
+                    if (!visualReadiness.confirmDraw(requestId)) return
+                    finishLoading()
+                    onPageReady()
+                }
+            })
+        } catch (error: RuntimeException) {
+            renderFailed(error)
         }
+    }
+
+    private fun loadElapsed() = if (loadStage == null) null else SystemClock.elapsedRealtime() - loadStartedAt
+
+    private fun navigationFailed(error: RuntimeException) {
+        TechnicalDiagnostics.failure("webview", "navigate", error)
+        failLoading()
+        onError("无法启动聊天页面，请重新加载。")
+    }
+
+    private fun renderFailed(error: RuntimeException) {
+        TechnicalDiagnostics.failure("webview", "render", error)
+        failLoading()
+        onError("聊天页面无法完成显示，请重新加载。")
+    }
+
+    private fun failLoading() {
+        visualReadiness.invalidate()
+        finishLoading()
+    }
+
+    private fun isChatAsset(uri: Uri): Boolean {
+        val path = uri.path.orEmpty()
+        return uri.scheme == "https" && uri.host == "digimonlegend.com" && uri.port in setOf(-1, 443) &&
+            (path.startsWith("/deepseek/static/js/") || path.startsWith("/deepseek/static/css/"))
     }
 
     fun continuation(draft: ChatContinuationDraft?) { pending = draft; sendPending() }
@@ -539,7 +779,7 @@ private class ChatBrowser(
         val channels = view.createWebMessageChannel()
         val local = channels[0]
         port = local
-        val active = { !disposed && local === port && trustedChatPage(view.url.orEmpty()) }
+        val active = { !disposed && !rendererGone && local === port && trustedChatPage(view.url.orEmpty()) }
         val images = PersonalImageChannel(
             active = { active() && personalImageSessionActive() },
             post = { local.postMessage(WebMessage(it)) },
@@ -553,7 +793,36 @@ private class ChatBrowser(
                     }, images)
             }
         })
-        view.postWebMessage(WebMessage("{\"type\":\"deepseek.connect\",\"version\":1,\"settingsSections\":true,\"archiveImport\":true,\"chatProvider\":true,\"themePreference\":true,\"organizationUsesChatProvider\":true,\"imageOverlayHistory\":true,\"personalImage\":true}", arrayOf(channels[1])), Uri.parse(CHAT_ORIGIN))
+        val hello = buildJsonObject {
+            put("type", "deepseek.connect")
+            put("version", 1)
+            put("settingsSections", true)
+            put("archiveImport", true)
+            put("chatProvider", true)
+            put("themePreference", true)
+            put("memoryRefresh", true)
+            put("organizationUsesChatProvider", true)
+            put("imageOverlayHistory", true)
+            put("personalImage", true)
+            put("diagnostics", true)
+        }
+        view.postWebMessage(WebMessage(hello.toString(), arrayOf(channels[1])), Uri.parse(CHAT_ORIGIN))
+        // Deployed pages accept at most 256 characters in the initial handshake.
+        val capabilities = buildJsonObject {
+            put("version", 1)
+            put("id", "personal-chat-capability")
+            put("type", "personal.chat.capability")
+            put("personalBackgroundChat", true)
+        }
+        runCatching { local.postMessage(WebMessage(capabilities.toString())) }
+        val mcpCapability = buildJsonObject {
+            put("version", 1)
+            put("id", "personal-mcp-capability")
+            put("type", "personal.mcp.capability")
+            put("personalMcp", true)
+            put("personalMcpActions", true)
+        }
+        runCatching { local.postMessage(WebMessage(mcpCapability.toString())) }
         sendPending()
         connectExport()
     }
@@ -621,7 +890,13 @@ private class ChatBrowser(
         transfer?.cancel(); transfer = null
     }
 
-    fun close() { scrollCapture?.close(); disposed = true; resetPorts(); view.stopLoading() }
+    fun close() {
+        disposed = true
+        view.removeCallbacks(startupTimeout)
+        scrollCapture?.close()
+        resetPorts()
+        if (!rendererGone) view.stopLoading()
+    }
 }
 
 private class ChatBlobTransfer(context: Context, item: JsonObject) {

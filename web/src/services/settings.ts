@@ -20,6 +20,7 @@ type Settings = ReplyPreferences & {
   location: UserLocation | null
   ttsVoice: TtsVoice
   autoReadAloud: boolean
+  showReplyUsage: boolean
   thinking: boolean
   search: boolean
   siderCollapsed: boolean
@@ -42,6 +43,7 @@ const KEYS = {
   themePreference: accountStorageKey('theme-preference'),
   ttsVoice: accountStorageKey('tts-voice'),
   autoReadAloud: accountStorageKey('auto-read-aloud'),
+  showReplyUsage: accountStorageKey('show-reply-usage'),
   thinking: accountStorageKey('thinking'),
   search: accountStorageKey('search'),
   siderCollapsed: accountStorageKey('sider-collapsed'),
@@ -132,6 +134,7 @@ export const useSettings = create<Settings>(() => ({
   themePreference: initialThemePreference(),
   ttsVoice: initialTtsVoice(),
   autoReadAloud: read(KEYS.autoReadAloud) === 'true',
+  showReplyUsage: read(KEYS.showReplyUsage) === 'true',
   thinking: read(KEYS.thinking) === 'true',
   search: read(KEYS.search) === 'true',
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
@@ -166,6 +169,11 @@ export const setTtsVoice = (ttsVoice: TtsVoice) => {
 export const setAutoReadAloud = (autoReadAloud: boolean) => {
   write(KEYS.autoReadAloud, autoReadAloud ? 'true' : null)
   useSettings.setState({ autoReadAloud })
+}
+
+export const setShowReplyUsage = (showReplyUsage: boolean) => {
+  write(KEYS.showReplyUsage, showReplyUsage ? 'true' : null)
+  useSettings.setState({ showReplyUsage })
 }
 
 export const setThinking = (thinking: boolean) => {

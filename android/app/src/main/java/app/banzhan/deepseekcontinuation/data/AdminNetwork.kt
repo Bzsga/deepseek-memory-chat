@@ -1,7 +1,9 @@
 package app.banzhan.deepseekcontinuation.data
 
+import java.time.Instant
 import java.time.LocalDate
 import java.time.OffsetDateTime
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -14,6 +16,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -24,6 +27,11 @@ object AdminNetwork {
     private val contentType = "application/json; charset=utf-8".toMediaType()
     private const val OPEN_PERMISSIONS_PATH = "account-feature-access"
     private const val REGISTRATION_POLICY_PATH = "registration-policy"
+    private const val USER_SCAN_PAGE_SIZE = 200
+    private const val DIAGNOSTICS_PATH = "technical-diagnostics"
+    private const val DIAGNOSTICS_PAGE_LIMIT = 50
+    private const val DIAGNOSTICS_RESPONSE_LIMIT = 256 * 1024L
+    private val diagnosticIdPattern = Regex("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 
     suspend fun getAdminConfig(prefs: DeveloperPrefs): AdminConfig {
         val request = authenticated(prefs, "config").get().build()
@@ -69,7 +77,10 @@ object AdminNetwork {
     internal fun registrationPolicyPatchRequest(prefs: DeveloperPrefs, selfService: Boolean): Request =
         sameOriginPatch(prefs, REGISTRATION_POLICY_PATH, buildJsonObject { put("self_service", selfService) })
 
-    private fun sameOriginPatch(prefs: DeveloperPrefs, path: String, json: JsonObject): Request {
+    private fun sameOriginPatch(prefs: DeveloperPrefs, path: String, json: JsonObject): Request =
+        sameOriginMutation(prefs, "PATCH", json, path)
+
+    private fun sameOriginMutation(prefs: DeveloperPrefs, method: String, json: JsonObject, vararg path: String): Request {
         val payload = json.toString().encodeToByteArray()
         val body = object : RequestBody() {
             override fun contentType() = contentType
@@ -77,8 +88,7 @@ object AdminNetwork {
             override fun writeTo(sink: BufferedSink) { sink.write(payload) }
             override fun isOneShot() = true
         }
-        val request = authenticated(prefs, path)
-            .patch(body).build()
+        val request = authenticated(prefs, *path).method(method, body).build()
         val origin = request.url.newBuilder().encodedPath("/").build().toString().removeSuffix("/")
         return request.newBuilder().header("Origin", origin).build()
     }
@@ -102,6 +112,159 @@ object AdminNetwork {
         return parseResponse { parseAdminStats(payload) }
     }
 
+    suspend fun getStorage(prefs: DeveloperPrefs): AdminStorage {
+        val request = authenticated(prefs, "storage").get().build()
+        val payload = SummaryNetwork.exchange(request, mutation = false, secrets = listOf(prefs.sessionToken),
+            maxResponseBytes = 4096)
+        return parseResponse { parseAdminStorage(payload) }
+    }
+
+    suspend fun getDiagnostics(
+        prefs: DeveloperPrefs,
+        range: AdminDiagnosticsRange,
+        status: AdminDiagnosticsStatus,
+    ): AdminDiagnosticsPage {
+        val request = diagnosticsGroupsRequest(prefs, range, Instant.now().epochSecond, status)
+        val payload = SummaryNetwork.exchange(request, mutation = false, secrets = listOf(prefs.sessionToken),
+            maxResponseBytes = DIAGNOSTICS_RESPONSE_LIMIT)
+        return parseResponse { parseAdminDiagnostics(payload, range, status, request.url.queryParameter("since")!!.toLong()) }
+    }
+
+    suspend fun getDiagnostic(prefs: DeveloperPrefs, eventId: String): AdminDiagnosticDetail {
+        val request = diagnosticDetailRequest(prefs, eventId)
+        val payload = SummaryNetwork.exchange(request, mutation = false, secrets = listOf(prefs.sessionToken),
+            maxResponseBytes = DIAGNOSTICS_RESPONSE_LIMIT)
+        return parseResponse { parseAdminDiagnostic(payload, request.url.queryParameter("event_id")!!) }
+    }
+
+    suspend fun setDiagnosticResolution(prefs: DeveloperPrefs, change: AdminDiagnosticResolution): Int {
+        val request = diagnosticResolutionRequest(prefs, change)
+        val payload = SummaryNetwork.exchange(request, mutation = true, secrets = listOf(prefs.sessionToken),
+            maxResponseBytes = DIAGNOSTICS_RESPONSE_LIMIT)
+        return parseResponse(mutation = true) { objectResponse(payload).nonnegativeInteger("updated") }
+    }
+
+    internal fun diagnosticResolutionRequest(prefs: DeveloperPrefs, change: AdminDiagnosticResolution): Request {
+        require(change.groupSince == null || change.groupSince in 0..4_102_444_800L) { "诊断时间范围无效。" }
+        val body = buildJsonObject {
+            put("resolved", change.resolved)
+            change.groupSince?.let { since ->
+                put("group", true)
+                put("since", since)
+            }
+        }
+        return sameOriginMutation(prefs, "PUT", body, DIAGNOSTICS_PATH, normalizeDiagnosticId(change.eventId), "resolution")
+    }
+
+    internal fun diagnosticsGroupsRequest(
+        prefs: DeveloperPrefs,
+        range: AdminDiagnosticsRange,
+        now: Long,
+        status: AdminDiagnosticsStatus = AdminDiagnosticsStatus.PENDING,
+    ): Request {
+        val request = authenticated(prefs, DIAGNOSTICS_PATH).get().build()
+        val url = request.url.newBuilder()
+            .addQueryParameter("limit", DIAGNOSTICS_PAGE_LIMIT.toString())
+            .addQueryParameter("since", (now - range.days * 86_400L).coerceIn(0, 4_102_444_800).toString())
+            .addQueryParameter("status", status.wireValue)
+            .build()
+        return request.newBuilder().url(url).build()
+    }
+
+    internal fun diagnosticDetailRequest(prefs: DeveloperPrefs, eventId: String): Request {
+        val normalizedId = normalizeDiagnosticId(eventId)
+        val request = authenticated(prefs, DIAGNOSTICS_PATH).get().build()
+        val url = request.url.newBuilder().addQueryParameter("event_id", normalizedId).build()
+        return request.newBuilder().url(url).build()
+    }
+
+    private fun normalizeDiagnosticId(eventId: String): String = eventId.trim().lowercase(Locale.ROOT).also {
+        require(it.matches(diagnosticIdPattern)) { "请填写完整的诊断编号。" }
+    }
+
+    internal fun parseAdminStorage(payload: String): AdminStorage = objectResponse(payload).let { root ->
+        AdminStorage(
+            syncBytes = root.count("sync"),
+            syncLimitBytes = root.count("sync_limit"),
+            shareBytes = root.count("shares"),
+            shareLimitBytes = root.count("shares_limit"),
+            diskFreeBytes = root.count("disk_free"),
+            diskReserveBytes = root.count("disk_reserve"),
+            warning = root.boolean("warning"),
+        )
+    }
+
+    internal fun parseAdminDiagnostics(
+        payload: String,
+        range: AdminDiagnosticsRange,
+        status: AdminDiagnosticsStatus = AdminDiagnosticsStatus.PENDING,
+        since: Long = 0,
+    ): AdminDiagnosticsPage {
+        val root = objectResponse(payload)
+        val groups = root.diagnosticObjects("groups", DIAGNOSTICS_PAGE_LIMIT).map { group ->
+            AdminDiagnosticGroup(
+                source = group.diagnosticText("source", 24),
+                area = group.diagnosticText("area", 48),
+                code = group.diagnosticText("code", 48),
+                stage = group.optionalDiagnosticText("stage", 48),
+                count = group.count("count"),
+                firstAt = group.count("first_at"),
+                lastAt = group.count("last_at"),
+                lastReceivedAt = group.count("last_received_at"),
+                latestEventId = group.diagnosticIdentifier("latest_event_id"),
+                releases = group.diagnosticObjects("releases", 8).map {
+                    AdminDiagnosticRelease(it.diagnosticText("release", 80), it.count("count"))
+                },
+                models = group.diagnosticObjects("models", 8).map {
+                    AdminDiagnosticModel(it.optionalDiagnosticText("manufacturer", 80), it.diagnosticText("model", 80), it.count("count"))
+                },
+            )
+        }
+        return AdminDiagnosticsPage(range, groups, root.nonnegativeInteger("retention_days"), status, since,
+            supportsResolution = "supports_resolution" in root && root.boolean("supports_resolution"))
+    }
+
+    internal fun parseAdminDiagnostic(payload: String, expectedEventId: String): AdminDiagnosticDetail {
+        val root = objectResponse(payload)
+        val event = when (val value = root["event"]) {
+            JsonNull -> null
+            is JsonObject -> parseDiagnosticEvent(value)
+            else -> error("诊断详情缺少事件字段")
+        }
+        val related = root.diagnosticObjects("related_events", 10).map(::parseDiagnosticEvent)
+        require(event == null || event.eventId == expectedEventId) { "诊断编号与请求不一致" }
+        require(related.isEmpty() || event?.requestId != null &&
+            related.all { it.eventId != event.eventId && it.requestId == event.requestId }) { "关联诊断与主事件不一致" }
+        return AdminDiagnosticDetail(event, related, root.nonnegativeInteger("retention_days"),
+            supportsResolution = "supports_resolution" in root && root.boolean("supports_resolution"))
+    }
+
+    private fun parseDiagnosticEvent(event: JsonObject): AdminDiagnosticEvent = AdminDiagnosticEvent(
+        eventId = event.diagnosticIdentifier("event_id"),
+        occurredAt = event.count("occurred_at"),
+        receivedAt = event.count("received_at"),
+        source = event.diagnosticText("source", 24),
+        release = event.diagnosticText("release", 80),
+        area = event.diagnosticText("area", 48),
+        code = event.diagnosticText("code", 48),
+        stage = event.optionalDiagnosticText("stage", 48),
+        androidSdk = event.optionalDiagnosticInteger("android_sdk", 1..1000),
+        manufacturer = event.optionalDiagnosticText("manufacturer", 80),
+        model = event.optionalDiagnosticText("model", 80),
+        webviewVersion = event.optionalDiagnosticText("webview_version", 40),
+        webviewProvider = event.optionalDiagnosticText("webview_provider", 120),
+        httpStatus = event.optionalDiagnosticInteger("http_status", 100..599),
+        elapsedMs = event.optionalDiagnosticInteger("elapsed_ms", 0..86_400_000)?.toLong(),
+        requestId = event.optionalDiagnosticText("request_id", 36)?.also { require(it.matches(diagnosticIdPattern)) },
+        detail = event.optionalDiagnosticText("detail", 40),
+        inputFormat = event.optionalDiagnosticText("input_format", 10),
+        inputSizeBand = event.optionalDiagnosticText("input_size_band", 20),
+        serviceMode = event.optionalDiagnosticText("service_mode", 10),
+        resolvedAt = if (event["resolved_at"] == JsonNull) null else event.optionalCount("resolved_at")?.also {
+            require(it <= 4_102_444_800L) { "诊断解决时间无效。" }
+        },
+    )
+
     suspend fun getUsers(prefs: DeveloperPrefs, limit: Int = 50, offset: Int = 0): AdminUsersPage {
         require(limit in 1..200 && offset >= 0) { "用户列表分页参数无效" }
         val url = SummaryNetwork.companionEndpoint(prefs.serviceUrl, "admin", "users").newBuilder()
@@ -109,6 +272,71 @@ object AdminNetwork {
         val request = authenticated(prefs, "users").url(url).get().build()
         val payload = SummaryNetwork.exchange(request, mutation = false, secrets = listOf(prefs.sessionToken))
         return parseResponse { parseAdminUsers(payload) }
+    }
+
+    internal suspend fun getUsersPage(
+        limit: Int,
+        offset: Int,
+        query: String,
+        statusFilter: AdminUserStatusFilter,
+        fetch: suspend (limit: Int, offset: Int) -> AdminUsersPage,
+    ): AdminUsersPage {
+        require(limit in 1..USER_SCAN_PAGE_SIZE && offset >= 0) { "用户列表分页参数无效" }
+        suspend fun fetchPage(size: Int, start: Int): AdminUsersPage {
+            val page = fetch(size, start)
+            if (page.limit != size || page.offset != start) {
+                throw SummaryFailure("用户列表分页响应无效，请重新刷新。", ambiguous = false)
+            }
+            return page
+        }
+
+        val keyword = query.trim()
+        if (keyword.isEmpty() && statusFilter == AdminUserStatusFilter.ALL) {
+            val page = fetchPage(limit, offset)
+            val correctedOffset = availableUsersOffset(limit, offset, page.total)
+            return when {
+                correctedOffset == offset -> page
+                page.total == 0L -> page.copy(offset = 0)
+                else -> fetchPage(limit, correctedOffset)
+            }
+        }
+
+        val first = fetchPage(USER_SCAN_PAGE_SIZE, 0)
+        val matched = mutableListOf<UserUsage>()
+        val seen = mutableSetOf<String>()
+        var page = first
+        while (true) {
+            if (page.week != first.week || page.resetAt != first.resetAt) {
+                throw SummaryFailure("本周额度已重置，请重新刷新用户列表。", ambiguous = false)
+            }
+            if (page.users.isEmpty()) break
+            for (user in page.users) {
+                if (!seen.add(user.id)) continue
+                val statusMatches = when (statusFilter) {
+                    AdminUserStatusFilter.ALL -> true
+                    AdminUserStatusFilter.ENABLED -> user.enabled
+                    AdminUserStatusFilter.DISABLED -> !user.enabled
+                }
+                if (statusMatches && (user.id.contains(keyword, ignoreCase = true) ||
+                        user.username?.contains(keyword, ignoreCase = true) == true)) {
+                    matched.add(user)
+                }
+            }
+            val nextOffset = page.offset.toLong() + page.limit
+            if (nextOffset >= first.total || nextOffset > Int.MAX_VALUE) break
+            page = fetchPage(USER_SCAN_PAGE_SIZE, nextOffset.toInt())
+        }
+
+        val matchOffset = availableUsersOffset(limit, offset, matched.size.toLong())
+        val end = minOf(matchOffset.toLong() + limit, matched.size.toLong()).toInt()
+        return first.copy(limit = limit, offset = matchOffset, total = matched.size.toLong(),
+            users = matched.subList(matchOffset, end).toList(), query = keyword, statusFilter = statusFilter)
+    }
+
+    private fun availableUsersOffset(limit: Int, offset: Int, total: Long): Int = when {
+        total == 0L -> 0
+        offset < total -> offset
+        else -> (((total - 1) / limit) * limit).toInt()
     }
 
     internal fun parseAdminConfig(payload: String): AdminConfig {
@@ -208,7 +436,15 @@ object AdminNetwork {
                 managedEligible = permissions?.chatApi ?: (user.readAccountFlag("managed_eligible") == true),
                 enabled = if ("enabled" in user) user.boolean("enabled") else true,
                 permissions = permissions,
-                inviteRedeemable = user.readAccountFlag("invite_redeemable"))
+                inviteRedeemable = user.readAccountFlag("invite_redeemable"),
+                role = if ("role" in user) user.text("role").also {
+                    require(it == "user" || it == "admin") { "用户角色无效" }
+                } else null,
+                effectivePermissions = user["effective_permissions"]?.let { value ->
+                    val effective = value as? JsonObject ?: error("生效权限格式无效")
+                    ServicePermissions(effective.boolean("chat_api"), effective.boolean("image_api"),
+                        effective.boolean("cloud_sync"))
+                })
         }
         return AdminUsersPage(limit, offset, root.count("total"), users,
             week = root.optionalText("week")?.also { LocalDate.parse(it) },
@@ -305,21 +541,27 @@ object AdminNetwork {
     internal fun userStatusPayload(enabled: Boolean): String =
         buildJsonObject { put("enabled", enabled) }.toString()
 
-    suspend fun resetUserPassword(prefs: DeveloperPrefs, userId: String): AdminPasswordReset {
+    suspend fun createPasswordResetLink(prefs: DeveloperPrefs, userId: String): AdminPasswordResetLink {
         require(userId.isNotBlank() && userId.length <= 256) { "用户编号无效" }
-        val payload = SummaryNetwork.exchange(authenticated(prefs, "users", userId, "reset-password")
+        val payload = SummaryNetwork.exchange(authenticated(prefs, "users", userId, "password-reset-link")
             .post("{}".toRequestBody(contentType)).build(), mutation = true, secrets = listOf(prefs.sessionToken))
-        return parseResponse { parsePasswordReset(payload, userId) }
+        return parseResponse(mutation = true) { parsePasswordResetLink(payload, userId, prefs.serviceUrl) }
     }
 
-    internal fun parsePasswordReset(payload: String, expectedUserId: String): AdminPasswordReset {
+    internal fun parsePasswordResetLink(payload: String, expectedUserId: String, serviceUrl: String): AdminPasswordResetLink {
         val root = objectResponse(payload)
         val id = root.text("id")
         val username = root.text("username")
-        val password = root.text("password")
+        val url = root.text("url")
+        val expiresAt = root.text("expires_at")
+        val expectedPage = SummaryNetwork.companionEndpoint(serviceUrl, "accounts", "reset-password")
+        val parsed = url.toHttpUrlOrNull()
         require(id == expectedUserId && username.isNotBlank() && username.length <= 256 &&
-            password.length in 8..128 && password.all { it.code in 33..126 }) { "密码重置响应无效" }
-        return AdminPasswordReset(id, username, password)
+            parsed?.isHttps == true && parsed.toString() == url &&
+            parsed.newBuilder().fragment(null).build() == expectedPage &&
+            parsed.encodedFragment?.matches(Regex("token=[A-Za-z0-9_-]{43}")) == true &&
+            runCatching { OffsetDateTime.parse(expiresAt) }.isSuccess) { "密码重置链接响应无效" }
+        return AdminPasswordResetLink(id, username, url, expiresAt)
     }
 
     internal fun userQuotaPayload(weeklyLimit: Int?, thisWeekRemaining: Int?, week: String?): String {
@@ -388,6 +630,24 @@ object AdminNetwork {
 
     private fun JsonObject.optionalText(key: String): String? =
         if (this[key] == null || this[key] == JsonNull) null else text(key)
+
+    private fun JsonObject.diagnosticObjects(key: String, maxSize: Int): List<JsonObject> {
+        val values = this[key] as? JsonArray ?: error("诊断响应缺少列表")
+        require(values.size <= maxSize) { "诊断列表超过上限" }
+        return values.map { it as? JsonObject ?: error("诊断记录格式无效") }
+    }
+
+    private fun JsonObject.diagnosticText(key: String, maxLength: Int): String =
+        text(key).also { require(it.isNotEmpty() && it.length <= maxLength) }
+
+    private fun JsonObject.optionalDiagnosticText(key: String, maxLength: Int): String? =
+        optionalText(key)?.also { require(it.length <= maxLength) }
+
+    private fun JsonObject.diagnosticIdentifier(key: String): String =
+        text(key).also { require(it.matches(diagnosticIdPattern)) }
+
+    private fun JsonObject.optionalDiagnosticInteger(key: String, range: IntRange): Int? =
+        if (this[key] == null || this[key] == JsonNull) null else integer(key).also { require(it in range) }
 
     private fun JsonObject.boolean(key: String): Boolean {
         val value = (this[key] as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull

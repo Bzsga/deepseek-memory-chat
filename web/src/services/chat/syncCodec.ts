@@ -1,10 +1,12 @@
 import type { TranslationMessage } from '../../i18n/index.js'
+import { readOutputTokenDetails } from '../api/parseEvent.js'
 import type { ChatModel, ServerToolBlock, ServerToolInput, TextCitation } from '../api/types.js'
 import { validateSharedJsonStructure } from '../sharedConversation.js'
 import { normalizeSession } from './branches.js'
 import { validateConversationMemory } from './contextMemory.js'
 import { validateContinuationPayload } from './continuity.js'
 import { validateImageActionTrace } from './imageAction.js'
+import { normalizeMcpSources } from './mcpSources.js'
 import { validateSharedSource } from './sharedSource.js'
 import type { AssistantMessage, FileAttachment, Message, ReplyBlock, Session } from './types.js'
 
@@ -278,11 +280,15 @@ const reply = (
   }
   if (item.usage !== undefined) {
     const usage = object(item.usage)
+    const outputTokens = count(usage.output_tokens)
+    const outputDetails = readOutputTokenDetails(usage.output_tokens_details, outputTokens)
     result.usage = {
       input_tokens: count(usage.input_tokens),
       cache_creation_input_tokens: count(usage.cache_creation_input_tokens),
       cache_read_input_tokens: count(usage.cache_read_input_tokens),
-      output_tokens: count(usage.output_tokens),
+      ...(usage.cache_usage_reported === false ? { cache_usage_reported: false } : {}),
+      output_tokens: outputTokens,
+      ...(outputDetails ? { output_tokens_details: outputDetails } : {}),
       ...(usage.server_tool_use !== undefined
         ? {
             server_tool_use: {
@@ -319,11 +325,13 @@ const message = (value: unknown): Message => {
     ...(item.selectedChildId !== undefined ? { selectedChildId: id(item.selectedChildId) } : {}),
   }
   if (item.role === 'user') {
+    const mcpSources = normalizeMcpSources(item.mcpSources)
     return {
       ...base,
       role: item.role,
       content: text(item.content),
       files: list(item.files, attachment),
+      ...(mcpSources.length > 0 ? { mcpSources } : {}),
     }
   }
   if (item.role !== 'assistant') {
@@ -390,7 +398,8 @@ export const encodeSyncSnapshot = (session: Session): SyncSnapshot => {
   for (const message of session.messages) {
     if (
       message.role === 'assistant' &&
-      (message.status === 'pending' ||
+      (message.chatJob ||
+        message.status === 'pending' ||
         message.status === 'streaming' ||
         (message.imageJob &&
           !['completed', 'failed', 'cancelled', 'unknown', 'expired'].includes(

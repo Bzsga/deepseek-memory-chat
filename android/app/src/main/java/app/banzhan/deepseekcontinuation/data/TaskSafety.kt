@@ -66,6 +66,15 @@ internal fun requireTaskSlot(archiveId: String, taskId: String?, tasks: List<Tas
 internal fun taskSourcesFit(task: TaskRecord, allowedIds: Set<String>): Boolean =
     task.chunks.all { chunk -> (chunk.messages + chunk.contextMessages).all { it.id in allowedIds } }
 
+internal fun replacementOrganizationKey(frozen: ServiceSettings, current: ServiceSettings): String {
+    require(current.mode == "byok" && current.model == frozen.model &&
+        SummaryNetwork.chatEndpoint(current.baseUrl) == SummaryNetwork.chatEndpoint(frozen.baseUrl)) {
+        "请在聊天 API 设置中选择此任务原来的服务地址和模型，再继续。"
+    }
+    require(current.apiKey.isNotBlank()) { "请先在聊天 API 设置中保存个人 API Key，再继续。" }
+    return current.apiKey
+}
+
 internal fun TaskRecord.afterDispatchFailures(failures: List<ChunkDispatchFailure>): TaskRecord {
     var updated = withoutInFlight()
     var needsAcknowledgment = uncertain

@@ -25,7 +25,6 @@
 
 .imageThumb {
   position: relative;
-  container-type: inline-size;
 }
 
 button.image {
@@ -98,7 +97,7 @@ button.missingImage {
   right: 0;
   bottom: 0;
   left: 0;
-  display: flex;
+  display: var(--message-file-image-reason-display, flex);
   align-items: flex-end;
   justify-content: center;
   box-sizing: border-box;
@@ -112,13 +111,6 @@ button.missingImage {
   color: var(--dsw-static-neutral-bluish-00);
   background: linear-gradient(to bottom, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.65));
   pointer-events: none;
-}
-
-/* 比缩略图最小尺寸还窄时放不下文案，只保留状态 */
-@container (max-width: 63px) {
-  .reason {
-    display: none;
-  }
 }
 
 .spinner {

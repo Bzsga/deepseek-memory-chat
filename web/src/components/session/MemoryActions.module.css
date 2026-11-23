@@ -93,7 +93,7 @@
   padding: 12px;
   cursor: pointer;
 }
-.exportChoice:has(input:checked) {
+.exportChoice[data-selected] {
   border-color: var(--dsw-alias-brand-primary);
   background: var(--dsw-alias-button-ghost-active-fill);
 }

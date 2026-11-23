@@ -1,4 +1,4 @@
-import { useTranslate } from '../../i18n/index.js'
+import { useTranslate, type TranslationKey } from '../../i18n/index.js'
 import clsx from 'clsx'
 import { memo, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import {
@@ -15,6 +15,8 @@ import {
   IconThinkOutline16,
 } from '../base/icons.js'
 import type { AssistantMessage } from '../../services/chat/types.js'
+import type { MessageUsage } from '../../services/api/types.js'
+import { useSettings } from '../../services/settings.js'
 import {
   getAreaTitle,
   isDeepSearchKind,
@@ -116,6 +118,91 @@ export const ReplyArea = memo(function ReplyArea({
     </div>
   )
 })
+
+export const ReplyUsage = memo(function ReplyUsage({
+  message,
+  streaming,
+}: {
+  message: AssistantMessage
+  streaming: boolean
+}) {
+  const t = useTranslate()
+  const show = useSettings((state) => state.showReplyUsage)
+  const locale = useSettings((state) => state.locale)
+  if (!show || streaming || message.chatJob || (!message.usage && !message.compactionUsage)) {
+    return null
+  }
+  return (
+    <details className={styles.usage}>
+      <summary>
+        {t('replyUsageDetails')}
+        {message.usage ? ` · ${t('replyUsageCacheRate')} ${cacheHitRate(message.usage, locale, t)}` : null}
+      </summary>
+      <UsageGroup label={t('replyUsageMain')} usage={message.usage} />
+      {message.compactionUsage ? (
+        <UsageGroup label={t('replyUsageCompaction')} usage={message.compactionUsage.usage} showCacheRate />
+      ) : null}
+    </details>
+  )
+})
+
+const cacheHitRate = (usage: MessageUsage, locale: string, t: ReturnType<typeof useTranslate>): string => {
+  if (usage.cache_usage_reported === false) {return t('replyUsageCacheRateUnavailable')}
+  const totalInput = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+  if (totalInput === 0) {return t('replyUsageCacheRateNoInput')}
+  return (usage.cache_read_input_tokens / totalInput)
+    .toLocaleString(locale, { style: 'percent', maximumFractionDigits: 1 })
+}
+
+const UsageGroup = ({ label, usage, showCacheRate }: {
+  label: string
+  usage?: MessageUsage
+  showCacheRate?: boolean
+}) => {
+  const t = useTranslate()
+  const locale = useSettings((state) => state.locale)
+  if (!usage) {
+    return (
+      <div className={styles.usageGroup}>
+        <strong>{label}</strong>
+        <p>{t('replyUsageUnavailable')}</p>
+      </div>
+    )
+  }
+  const rows: [TranslationKey, number][] = usage.cache_usage_reported === false
+    ? [['replyUsageInputUnsplit', usage.input_tokens]]
+    : [
+        ['replyUsageCacheHit', usage.cache_read_input_tokens],
+        ['replyUsageCacheMiss', usage.input_tokens],
+      ]
+  if (usage.cache_creation_input_tokens > 0) {
+    rows.push(['replyUsageCacheWrite', usage.cache_creation_input_tokens])
+  }
+  rows.push(['replyUsageOutput', usage.output_tokens])
+  const thinking = usage.output_tokens_details?.thinking_tokens
+  if (thinking !== undefined) {
+    rows.push(['replyUsageThinking', thinking])
+  }
+  return (
+    <div className={styles.usageGroup}>
+      <strong>{label}</strong>
+      <dl className={styles.usageValues}>
+        {showCacheRate ? (
+          <div>
+            <dt>{t('replyUsageCacheRate')}</dt>
+            <dd>{cacheHitRate(usage, locale, t)}</dd>
+          </div>
+        ) : null}
+        {rows.map(([key, value]) => (
+          <div key={key}>
+            <dt>{t(key)}</dt>
+            <dd>{value.toLocaleString(locale)}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
 
 const ignoreOuterScroll = () => {}
 

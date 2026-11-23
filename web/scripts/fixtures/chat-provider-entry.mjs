@@ -86,6 +86,13 @@ window.fetch = async (url, init = {}) => {
       status: 401,
       headers: { 'X-Session-Expired': '1' },
     })
+  if (path.endsWith('/messages') && responseMode === 'input-limit-http')
+    return new Response(JSON.stringify({ error: syntheticInputLimit }), { status: 400 })
+  if (path.endsWith('/messages') && responseMode === 'input-limit-managed')
+    return new Response(JSON.stringify({ error: { message: 'synthetic-private-rejection', code: 'chat_input_too_long' } }),
+      { status: 400 })
+  if (path.endsWith('/messages') && responseMode === 'input-limit-sse')
+    return inputLimitSse()
   if (responseMode === 'file400' && path.endsWith('/messages'))
     return new Response(
       JSON.stringify({
@@ -126,6 +133,24 @@ window.fetch = async (url, init = {}) => {
   return new Response(JSON.stringify({ ok: true }), {
     headers: { 'Content-Type': 'application/json' },
   })
+}
+const syntheticInputLimit = {
+  message: 'user input too long, 643317 tokens exceeds max 32768 tokens (synthetic-private-rejection)',
+}
+const inputLimitSse = () => new Response(
+  'event: error\ndata: ' + JSON.stringify({ error: syntheticInputLimit }) + '\n\n',
+  { headers: { 'Content-Type': 'text/event-stream' } }
+)
+const expectInputLimit = async (events, label) => {
+  try {
+    for await (const _event of events) {}
+  } catch (error) {
+    check(error?.code === 'chat_input_too_long' && error.status === 400 &&
+      error.localMessage?.key === 'replyContextInputTooLong' && !error.message.includes('643317') &&
+      !error.message.includes('synthetic-private-rejection'), label)
+    return
+  }
+  throw Error(label)
 }
 const waitUntil = async (predicate, code) => {
   for (let index = 0; index < 100; index++) {
@@ -174,6 +199,10 @@ try {
       'managed_transport_failed'
     )
     results.cases.push('managed default and same-origin transport')
+    responseMode = 'input-limit-managed'
+    await expectInputLimit(api.streamMessage('server-managed', { model: 'deepseek-flash', messages: [] },
+      new AbortController().signal), 'managed_context_limit_not_normalized')
+    responseMode = 'ok'
     await provider.configureChatProvider({ mode: 'personal', apiKey: KEY_A })
     const scopeA = provider.getChatProviderScope(KEY_A)
     const rows = await credentialRows()
@@ -355,6 +384,17 @@ try {
     results.cases.push(
       'personal authentication and streaming errors redact key and preserve app login'
     )
+    for (const mode of ['input-limit-http', 'input-limit-sse']) {
+      responseMode = mode
+      await expectInputLimit(api.streamMessage(KEY_B, { model: 'deepseek-flash', messages: [] },
+        new AbortController().signal), mode)
+    }
+    const { readCompatibleChatResponse } = await import('../../src/services/api/compatibleChat.ts')
+    for (const response of [new Response(JSON.stringify({ error: syntheticInputLimit }), { status: 400 }), inputLimitSse()]) {
+      await expectInputLimit(readCompatibleChatResponse(response, 'synthetic-model', new AbortController().signal),
+        'compatible_context_limit_not_normalized')
+    }
+    results.cases.push('managed and personal input-limit errors show fixed capacity guidance without exposing provider text')
     responseMode = 'ok'
     const store = await import('../../src/services/chat/store.ts')
     const db = await import('../../src/services/chat/db.ts')
@@ -447,6 +487,15 @@ try {
         .serverId === null,
       'personal_stale_id_not_cleared'
     )
+    const limited = await runStore(
+      makeSession('qa-context-limited', 'file-api-context-original', provider.getChatProviderScope(KEY_B)),
+      'input-limit-http'
+    )
+    const preserved = store.useChatStore.getState().sessionCache['qa-context-limited'].messages
+    check(limited.filter((call) => call.path.endsWith('/messages')).length === 1 &&
+      preserved[0].files[0].serverId === 'file-api-context-original' && preserved[2].content === '合成新问题。' &&
+      preserved[3].status === 'error' && preserved[3].error.localMessage?.key === 'replyContextInputTooLong',
+      'context_limit_replayed_or_lost_originals')
     check(sessionEnding === 0, 'provider_change_ended_sync')
     results.cases.push(
       'actual store filters old fileScope and never auto-replays personal file errors'

@@ -10,6 +10,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DeepSeekImporterTest {
+    @Test fun diagnosticSeparatesSyntaxStructureAndArchiveFailures() {
+        fun reason(document: String, fileName: String): String = try {
+            DeepSeekImporter.parse(document.toByteArray(), fileName)
+            error("Expected import failure")
+        } catch (error: ImportFailure) {
+            error.detail
+        }
+        assertEquals("import_json_syntax", reason("[{", "broken.json"))
+        assertEquals("import_json_structure", reason("[1]", "unrecognized.json"))
+        assertEquals("import_zip_read", reason("broken zip", "broken.zip"))
+        assertEquals("import_unsupported_file", reason("not an export", "text.txt"))
+    }
+
     private fun parse(source: String) = DeepSeekImporter.parse(source.toByteArray(), "conversations.json")
 
     private fun fixture(name: String): ByteArray {
@@ -21,6 +34,21 @@ class DeepSeekImporterTest {
         val thrown = runCatching(action).exceptionOrNull()
         assertTrue("Expected IllegalArgumentException, got $thrown", thrown is IllegalArgumentException)
         assertTrue("Expected message containing $fragment, got ${thrown?.message}", thrown?.message?.contains(fragment) == true)
+    }
+
+    @Test fun messageArraysRecognizeOfficialFragmentsWithoutPlainContentFields() {
+        val messages = """
+            [{"id":1,"parent_id":null,"fragments":[{"type":"REQUEST","content":"示例问题"}]},
+             {"id":2,"parent_id":1,"role":"ASSISTANT","fragments":[
+              {"type":"THINK","content":"不导入的推理"},{"type":"RESPONSE","content":"示例回答"}]}]
+        """.trimIndent()
+        for (document in listOf(messages, """{"data":$messages}""")) {
+            val branch = parse(document).conversations.single().branches.single()
+            assertEquals(listOf("user", "assistant"), branch.messages.map { it.role })
+            assertEquals(listOf("示例问题", "示例回答"), branch.messages.map { it.content })
+        }
+        val mixed = messages.dropLast(1) + """,{"id":"metadata","title":"无聊天内容"}]"""
+        assertRejected("会话数组含无法识别的对象") { parse(mixed) }
     }
 
     @Test fun sharedZipKeepsAllChatsAndTheSelectedAnswer() {
@@ -89,6 +117,53 @@ class DeepSeekImporterTest {
         val messages = chat.getValue("messages").jsonArray.map { it.jsonObject }.associateBy { it.getValue("id") }
         val root = messages.getValue(chat.getValue("root"))
         assertEquals("路线 B", messages.getValue(root.getValue("next")).getValue("text").jsonPrimitive.content)
+    }
+
+    @Test fun appSessionExportPreservesSourceIdentityAndBranchesFromJsonAndZip() {
+        val session = """
+            {"id":"synthetic-session","title":"示例会话","current_message_id":3,"messages":[
+                {"id":1,"parent_id":null,"role":"USER","fragments":[
+                    {"type":"REQUEST","content":"示例提问"},
+                    {"type":"FILE","files":[{"file_name":"synthetic.png","export_path":"chat_sessions/synthetic-session_files/image.png"}]}]},
+                {"id":2,"parent_id":1,"role":"ASSISTANT","fragments":[{"type":"RESPONSE","content":"原分支"}]},
+                {"id":3,"parent_id":1,"role":"ASSISTANT","fragments":[{"type":"RESPONSE","content":"当前分支"}]}]}
+        """.trimIndent()
+        val files = """[{"path":"chat_sessions/synthetic-session_files/image.png","mime_type":"image/png",
+            "data_base64":"U1lOVEhFVElDLUlNQUdFLUJPRFk="}]"""
+        val wrapped = """{"format":"deepseek-session","version":1,"manifest":{"export_format_version":3},
+            "session":$session,"files":$files}"""
+        val original = parse(session).conversations.single()
+        val direct = parse(wrapped).conversations.single()
+        val zipped = DeepSeekImporter.parse(zip(listOf("session.json" to wrapped.toByteArray())), "session.zip")
+            .conversations.single()
+        assertEquals(original, direct)
+        assertEquals(direct, zipped)
+        val current = direct.branches.single { it.isCurrent }
+        assertEquals(listOf("示例提问", "当前分支"), current.messages.map { it.content })
+        assertEquals(listOf("user", "assistant"), current.messages.map { it.role })
+        assertEquals(current.messages.first().id, direct.branches.single { !it.isCurrent }.messages.first().id)
+        assertEquals("synthetic.png", Json.parseToJsonElement(current.messages.first().attachments.single())
+            .jsonObject.getValue("file_name").jsonPrimitive.content)
+        assertFalse(direct.toString().contains("U1lOVEhFVElDLUlNQUdFLUJPRFk="))
+    }
+
+    @Test fun appSessionExportRequiresRecognizedVersionsAndConversation() {
+        val valid = """{"format":"deepseek-session","version":1,"manifest":{"export_format_version":3},
+            "session":{"messages":[{"role":"user","content":"示例正文"}]},"files":[]}"""
+        listOf(
+            valid.replace("deepseek-session", "unrecognized-export") to "import_no_conversations",
+            valid.replace("\"version\":1", "\"version\":2") to "import_json_structure",
+            valid.replace("\"export_format_version\":3", "\"export_format_version\":4") to "import_json_structure",
+            valid.replace("\"messages\"", "\"unrecognized-field\"") to "import_json_structure",
+            valid.replace("\"files\":[]", "\"files\":null") to "import_json_structure"
+        ).forEach { (document, expected) ->
+            val direct = assertThrows(ImportFailure::class.java) { parse(document) }
+            assertEquals(expected, direct.detail)
+            val zipped = assertThrows(ImportFailure::class.java) {
+                DeepSeekImporter.parse(zip(listOf("session.json" to document.toByteArray())), "session.zip")
+            }
+            assertEquals(expected, zipped.detail)
+        }
     }
 
     @Test fun splitZipRequiresActualValidConversationDocuments() {

@@ -1,4 +1,5 @@
 import { formatDate } from '../../utils/format.js'
+import { cloneSnapshot } from '../../utils/cloneSnapshot.js'
 import { getRuntime, isSessionActive } from '../runtime.js'
 import { getVisibleMessages } from './branches.js'
 import { memoryForExport } from './contextMemory.js'
@@ -105,7 +106,7 @@ export const createSessionExport = async (
     assertExportAccount(accountId)
     return { ...file, accountId }
   }
-  const snapshot = structuredClone(session)
+  const snapshot = await cloneSnapshot(session)
   if (format === 'markdown' || format === 'text') {
     return finish({
       name: fileName(snapshot, format === 'markdown' ? 'md' : 'txt'),

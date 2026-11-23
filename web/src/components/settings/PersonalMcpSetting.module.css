@@ -1,0 +1,72 @@
+.setting {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  padding-top: 8px;
+}
+
+.trigger {
+  display: flex;
+  min-height: 44px;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 13px;
+  text-align: start;
+  cursor: pointer;
+}
+
+.trigger::after {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: rotate(45deg);
+  margin-inline: 3px;
+}
+
+.trigger[aria-expanded='true']::after {
+  transform: rotate(225deg);
+}
+
+.trigger strong {
+  font-weight: 600;
+  flex: none;
+}
+
+.trigger span {
+  margin-inline-start: auto;
+}
+
+.rowSummary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--dsw-alias-label-primary);
+}

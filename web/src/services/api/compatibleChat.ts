@@ -1,5 +1,7 @@
-import { providerApiUrl } from '../providerEndpoint.js'
+import { normalizeProviderBase, OFFICIAL_BASE, providerApiUrl } from '../providerEndpoint.js'
 import { ApiError } from './ApiError.js'
+import { apiErrorField, chatInputLimitError, readSmallErrorJson } from './errors.js'
+import { readOutputTokenDetails, usageTokenCount } from './parseEvent.js'
 import { readServerSentEvents } from './sse.js'
 import type { CreateMessageRequest, MessageStreamEvent, MessageUsage, StopReason } from './types.js'
 
@@ -54,20 +56,57 @@ function compatibleMessages(body: CreateMessageRequest) {
 }
 const invalidStream = () =>
   new ApiError('protocol', '兼容聊天服务返回了无法读取的流式数据。', undefined, 'personal_protocol')
+const interruptedStream = () =>
+  new ApiError('interrupted', '兼容聊天服务的回复流已中断。', undefined, 'personal_interrupted')
 const record = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
-const tokenCount = (value: unknown) =>
-  Number.isSafeInteger(value) && (value as number) >= 0 ? (value as number) : 0
+function readCompatibleUsage(value: unknown): MessageUsage | undefined {
+  if (!record(value)) {return undefined}
+  const prompt = usageTokenCount(value.prompt_tokens)
+  const output = usageTokenCount(value.completion_tokens)
+  if (prompt === undefined || output === undefined) {return undefined}
+  const promptDetails = record(value.prompt_tokens_details) ? value.prompt_tokens_details : undefined
+  const miss = usageTokenCount(value.prompt_cache_miss_tokens)
+  const hit = usageTokenCount(promptDetails?.cached_tokens) ?? usageTokenCount(value.prompt_cache_hit_tokens) ??
+    (miss !== undefined && miss <= prompt ? prompt - miss : undefined)
+  const cacheKnown = hit !== undefined && hit <= prompt && (miss === undefined || hit + miss === prompt)
+  const completionDetails = record(value.completion_tokens_details) ? value.completion_tokens_details : undefined
+  const outputDetails = readOutputTokenDetails({ thinking_tokens: completionDetails?.reasoning_tokens,
+    safety_tokens: completionDetails?.safety_tokens }, output)
+  return {
+    input_tokens: cacheKnown ? prompt - hit : prompt,
+    cache_read_input_tokens: cacheKnown ? hit : 0,
+    cache_creation_input_tokens: 0,
+    ...(!cacheKnown ? { cache_usage_reported: false } : {}),
+    output_tokens: output,
+    ...(outputDetails ? { output_tokens_details: outputDetails } : {}),
+  }
+}
+
+export function compatibleChatRequest(model: string, body: CreateMessageRequest, baseUrl?: string): string {
+  const base = baseUrl === undefined ? undefined : normalizeProviderBase(baseUrl)
+  const official = base === OFFICIAL_BASE || base === `${OFFICIAL_BASE}/beta`
+  return JSON.stringify({
+    model,
+    messages: compatibleMessages(body),
+    stream: true,
+    ...(official ? { thinking: body.thinking } : {}),
+    ...(body.output_config ? { reasoning_effort: body.output_config.effort } : {}),
+    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+    ...(body.max_tokens !== undefined ? { max_tokens: body.max_tokens } : {}),
+  })
+}
 
 export async function* streamCompatibleChat(
   baseUrl: string,
   model: string,
   key: string,
   body: CreateMessageRequest,
-  signal: AbortSignal
+  signal: AbortSignal,
+  onResponse?: () => void
 ): AsyncGenerator<MessageStreamEvent> {
   const url = providerApiUrl(baseUrl, 'chat/completions')
-  const messages = compatibleMessages(body)
+  const requestBody = compatibleChatRequest(model, body, baseUrl)
   signal.throwIfAborted()
   let response: Response
   try {
@@ -83,13 +122,7 @@ export async function* streamCompatibleChat(
         'Content-Type': 'application/json',
         Accept: 'text/event-stream',
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-        ...(body.output_config ? { reasoning_effort: body.output_config.effort } : {}),
-        ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
-      }),
+      body: requestBody,
     })
   } catch {
     signal.throwIfAborted()
@@ -100,12 +133,26 @@ export async function* streamCompatibleChat(
       'personal_network'
     )
   }
+  onResponse?.()
+  yield* readCompatibleChatResponse(response, model, signal)
+}
+
+export async function* readCompatibleChatResponse(
+  response: Response,
+  model: string,
+  signal: AbortSignal
+): AsyncGenerator<MessageStreamEvent> {
   if (
     !response.ok ||
     !response.body ||
     !response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
   ) {
-    await response.body?.cancel().catch(() => {})
+    if (response.status === 400) {
+      const inputLimit = chatInputLimitError('http', apiErrorField(await readSmallErrorJson(response)))
+      if (inputLimit) {throw inputLimit}
+    } else {
+      await response.body?.cancel().catch(() => {})
+    }
     throw new ApiError(
       response.ok ? 'protocol' : 'http',
       response.ok
@@ -121,12 +168,12 @@ export async function* streamCompatibleChat(
   let active: 'thinking' | 'text' | undefined,
     stop: StopReason | undefined,
     usage: MessageUsage | undefined
-  for await (const frame of readServerSentEvents(response.body, signal)) {
+  const failRead = (error: unknown) => {
+    throw error instanceof ApiError ? error : interruptedStream()
+  }
+  for await (const frame of readServerSentEvents(response.body, signal, failRead)) {
     signal.throwIfAborted()
-    if (frame.event === 'error') {
-      throw new ApiError('stream', '兼容聊天服务在生成时返回错误。', undefined, 'personal_stream')
-    }
-    if (frame.data.trim() === '[DONE]') {
+    if (frame.data.trim() === '[DONE]' && frame.event !== 'error') {
       done = true
       break
     }
@@ -134,28 +181,20 @@ export async function* streamCompatibleChat(
     try {
       chunk = JSON.parse(frame.data)
     } catch {
-      throw invalidStream()
+      if (frame.event !== 'error') {throw invalidStream()}
+    }
+    const upstreamError = apiErrorField(chunk)
+    if (frame.event === 'error' || upstreamError) {
+      throw chatInputLimitError('stream', upstreamError ?? frame.data) ??
+        new ApiError('stream', '兼容聊天服务在生成时返回错误。', undefined, 'personal_stream')
     }
     if (!record(chunk)) {
       throw invalidStream()
     }
-    if (chunk.error) {
-      throw new ApiError('stream', '兼容聊天服务在生成时返回错误。', undefined, 'personal_stream')
-    }
     if (!Array.isArray(chunk.choices)) {
       throw invalidStream()
     }
-    if (record(chunk.usage)) {
-      const cached = record(chunk.usage.prompt_tokens_details)
-        ? tokenCount(chunk.usage.prompt_tokens_details.cached_tokens)
-        : 0
-      usage = {
-        input_tokens: Math.max(0, tokenCount(chunk.usage.prompt_tokens) - cached),
-        cache_read_input_tokens: cached,
-        cache_creation_input_tokens: 0,
-        output_tokens: tokenCount(chunk.usage.completion_tokens),
-      }
-    }
+    usage = readCompatibleUsage(chunk.usage) ?? usage
     if (!chunk.choices.length) {
       continue
     }
@@ -234,12 +273,7 @@ export async function* streamCompatibleChat(
   }
   signal.throwIfAborted()
   if (!started || (!done && !stop)) {
-    throw new ApiError(
-      'interrupted',
-      '兼容聊天服务的回复流已中断。',
-      undefined,
-      'personal_interrupted'
-    )
+    throw interruptedStream()
   }
   if (active) {
     yield { type: 'content_block_stop', index }

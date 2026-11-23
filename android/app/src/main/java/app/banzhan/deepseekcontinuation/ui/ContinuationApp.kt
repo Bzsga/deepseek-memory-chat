@@ -11,7 +11,6 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
-import android.webkit.WebView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -43,6 +42,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 private data class AiRequest(
     val archiveId: String,
@@ -53,17 +54,28 @@ private data class AiRequest(
 )
 
 @Composable
-fun ContinuationApp(
+internal fun ContinuationApp(
     controller: AppController,
     incomingImport: PendingIncomingImport? = null,
     onIncomingImportConfirmed: (String) -> Unit = {},
     onIncomingImportConsumed: (String) -> Unit = {},
     onShareLinkReceived: (String) -> Unit = {},
     automaticUpdateChecks: Boolean = true,
-    webViewMajor: Int = WebView.getCurrentWebViewPackage()?.versionName?.substringBefore('.')?.toIntOrNull() ?: 0,
+    webViewProvider: ChatWebViewProvider,
     webViewHandlesIme: Boolean = false,
+    onRecheckWebView: () -> Unit = {},
 ) {
     val state by controller.state.collectAsStateWithLifecycle()
+    val diagnosticChoice by TechnicalDiagnostics.choice.collectAsStateWithLifecycle()
+    var diagnosticsVisible by rememberSaveable { mutableStateOf(false) }
+    var initializationDelayed by remember { mutableStateOf(false) }
+    LaunchedEffect(state.accountInitialized) {
+        if (!state.accountInitialized) {
+            kotlinx.coroutines.delay(TechnicalDiagnostics.STARTUP_TIMEOUT_MS)
+            initializationDelayed = true
+            TechnicalDiagnostics.record("startup", "timeout", "initialize", elapsedMs = TechnicalDiagnostics.STARTUP_TIMEOUT_MS)
+        }
+    }
     val politicalState by controller.politicalExport.state.collectAsStateWithLifecycle()
     val updates: AppUpdateViewModel = viewModel()
     val updateState by updates.state.collectAsStateWithLifecycle()
@@ -524,6 +536,7 @@ fun ContinuationApp(
                     )
                 }
             } catch (_: android.content.ActivityNotFoundException) {
+                TechnicalDiagnostics.record("update", "operation_failed", "install")
                 permissionPendingVersion = null
                 snackbars.showSnackbar("系统暂时无法打开更新安装页面，请稍后再试。")
             } catch (_: SecurityException) {
@@ -660,6 +673,11 @@ fun ContinuationApp(
         ) { padding ->
             Column(Modifier.fillMaxSize().padding(padding)) {
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (diagnosticChoice == DiagnosticChoice.UNDECIDED && state.accountInitialized &&
+                    route in setOf("chat", "home", "archives") && incomingImport == null &&
+                    !existingModal && !diagnosticsVisible && !WindowInsets.isImeVisible) {
+                    TechnicalDiagnosticsStartChoice()
+                }
                 if (
                     updateState.promptVisible &&
                         route in setOf("chat", "home", "archives", "settings") &&
@@ -724,19 +742,61 @@ fun ContinuationApp(
                                     importTargetArchiveId = target?.takeIf { id -> controller.state.value.archives.any { it.id == id } }
                                     imported(ids)
                                 },
-                                onMemories = { chatSettingsReturn = null; route = "archives" },
+                                onMemories = { source ->
+                                    chatSettingsReturn = null
+                                    if (source != null && controller.state.value.archives.any { it.id == source }) {
+                                        archiveId = source
+                                        route = "archive"
+                                    } else route = "archives"
+                                },
+                                onReadArchive = { source ->
+                                    val snapshot = controller.state.value
+                                    val archive = snapshot.archives.firstOrNull { it.id == source }
+                                        ?: error("本机找不到来源档案。")
+                                    val text = withContext(Dispatchers.Default) {
+                                        ArchiveLogic.continuationExport(archive, snapshot.conversations).text
+                                    }
+                                    val current = controller.state.value
+                                    check(current.account.currentUser?.id == snapshot.account.currentUser?.id) {
+                                        "聊天账号已变化，请重新刷新背景。"
+                                    }
+                                    check(current.archives.firstOrNull { it.id == source } == archive &&
+                                        current.conversations === snapshot.conversations) {
+                                        "来源档案已变化，请重新刷新背景。"
+                                    }
+                                    require(text.isNotBlank() && text.toByteArray(Charsets.UTF_8).size <= 1536 * 1024) {
+                                        "续聊资料为空或过长，请调整档案内容后再刷新。"
+                                    }
+                                    buildJsonObject {
+                                        put("title", archive.title)
+                                        put("text", text)
+                                        put("sourceArchiveId", archive.id)
+                                    }
+                                },
                                 onAccount = { resumeSync -> account("chat", resumeSync) },
                                 onSettings = { section -> openSettingsSection(section, fromChat = true) },
+                                onDiagnostics = { diagnosticsVisible = true },
                                 onChatProvider = controller::updateChatProvider,
+                                personalMcpAllowed = {
+                                    controller.state.value.chatProvider?.let { it.mode == "personal" && it.apiKey.isNotBlank() } == true
+                                },
                                 onThemePreference = { userId, preference ->
                                     check(controller.state.value.account.currentUser?.id == userId)
                                     NativeThemePreference.save(context, continuationRecipient(userId), preference)
                                 },
                                 initialFragment = chatFragment,
                                 onReturnFromSettings = if (chatSettingsReturn != null) ::returnFromChatApiSettings else null,
-                                webViewMajor = webViewMajor,
+                                webViewProvider = webViewProvider,
                                 webViewHandlesIme = webViewHandlesIme,
-                            )
+                                onRecheckWebView = onRecheckWebView,
+                            ) else Column(Modifier.fillMaxSize().padding(24.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Text(if (initializationDelayed) "本机初始化耗时较长" else "正在准备聊天…")
+                                if (initializationDelayed) TextButton(onClick = { diagnosticsVisible = true }) {
+                                    Text("技术诊断")
+                                }
+                                else LinearProgressIndicator(Modifier.fillMaxWidth())
+                            }
                             "home" ->
                                 HomeScreen(
                                     state,
@@ -1028,6 +1088,7 @@ fun ContinuationApp(
                                     )
                             }
                             "settings" -> LocalSettingsIndex(state, onAccount = { account("settings") },
+                                onDiagnostics = { diagnosticsVisible = true },
                                 onOpen = { section -> run { openSettingsSection(section, fromChat = false) } })
                             "data" -> MemoryDataSettings(
                                     busy,
@@ -1297,6 +1358,7 @@ fun ContinuationApp(
                 onShareLinkReceived(link)
             },
         )
+        if (diagnosticsVisible) TechnicalDiagnosticsDialog(onDismiss = { diagnosticsVisible = false })
         incomingImport?.takeIf { it.status == IncomingImportStatus.PREVIEW && !existingModal }?.let { pending ->
             pending.preview?.let { preview ->
                 ShareImportPreviewDialog(

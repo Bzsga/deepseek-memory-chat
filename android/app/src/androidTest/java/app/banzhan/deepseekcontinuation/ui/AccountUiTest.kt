@@ -13,7 +13,14 @@ import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.autofill.Autofill
+import androidx.compose.ui.autofill.AutofillNode
+import androidx.compose.ui.autofill.AutofillTree
+import androidx.compose.ui.autofill.AutofillType
+import androidx.compose.ui.platform.LocalAutofill
+import androidx.compose.ui.platform.LocalAutofillTree
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.StateRestorationTester
@@ -85,6 +92,55 @@ class AccountUiTest {
         assertEquals(1, attempts.size)
     }
 
+    @Test fun forgottenPasswordShowsRecoveryForTheOriginalUsername() {
+        showAccount()
+        accountNode("account-username").performTextInput("local-user")
+        accountNode("account-password").performTextInput("temporary-input")
+        accountNode("account-password").performImeAction()
+        accountNode("account-forgot-password").performClick()
+        compose.onNodeWithText("找回原账号").assertIsDisplayed()
+        compose.onNodeWithText("当前用户名：local-user").assertIsDisplayed()
+        compose.onNodeWithText("一次性链接", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("知道了").performClick()
+        accountNode("account-password").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
+        accountNode("account-register-mode").performClick()
+        compose.onNodeWithTag("account-forgot-password").assertDoesNotExist()
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun accountAutofillRegistersLoginAndNewCredentialHints() {
+        val tree = AutofillTree()
+        val fakeAutofill = object : Autofill {
+            override fun requestAutofillForNode(autofillNode: AutofillNode) {}
+            override fun cancelAutofillForNode(autofillNode: AutofillNode) {}
+        }
+        compose.setContent {
+            ContinuationTheme {
+                val scope = rememberCoroutineScope()
+                CompositionLocalProvider(LocalAutofill provides fakeAutofill, LocalAutofillTree provides tree) {
+                    AccountTestFrame {
+                        AccountScreenContent(AppState(), false, { action -> scope.launch { action() } },
+                            { _, _ -> }, { _, _, _ -> }, {}, {})
+                    }
+                }
+            }
+        }
+        compose.runOnIdle {
+            val nodes = tree.children.values.associateBy { it.autofillTypes.single() }
+            assertEquals(setOf(AutofillType.Username, AutofillType.Password), nodes.keys)
+            tree.performAutofill(nodes.getValue(AutofillType.Username).id, "autofilled-user")
+            tree.performAutofill(nodes.getValue(AutofillType.Password).id, "synthetic-password")
+        }
+        accountNode("account-username").assertTextContains("autofilled-user")
+        accountNode("account-submit").assertIsEnabled()
+        accountNode("account-register-mode").performClick()
+        compose.runOnIdle {
+            assertEquals(setOf(AutofillType.NewUsername, AutofillType.NewPassword),
+                tree.children.values.map { it.autofillTypes.single() }.toSet())
+        }
+        accountNode("account-submit").assertIsNotEnabled()
+    }
+
     @Test fun selfServiceRegistrationCanSubmitWithoutAnInvitation() {
         val supplied = AtomicReference<Triple<String, String, String>?>(null)
         showAccount(
@@ -153,17 +209,14 @@ class AccountUiTest {
             9, 2, 1, 6, 3, 1, 0, 0, 0, 0, 0, username = "合成用户", registrationKind = "public", weeklyLimitOverride = 9, managedEligible = true)
         compose.setContent {
             ContinuationTheme {
-                AccountTestFrame {
-                    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                        RegisteredUserQuotaCard(user, 5, false) { limit, remaining -> saved.set(limit to remaining) }
-                    }
-                }
+                AdminUserDetailsDialog(user, 5, false, null, {}, {}, {}, {},
+                    onSaveQuota = { limit, remaining -> saved.set(limit to remaining) })
             }
         }
-        compose.onNodeWithTag("admin-user-toggle:synthetic-user").performClick()
+        compose.onNodeWithTag("admin-user-open-quota:synthetic-user").performScrollTo().performClick()
         compose.onNodeWithTag("admin-user-follow-default:synthetic-user").performScrollTo().assertIsOff().performClick()
         compose.onNodeWithText("仅本周的剩余次数（选填）").performScrollTo().performTextInput("4")
-        compose.onNodeWithTag("admin-user-save:synthetic-user").performScrollTo().performClick()
+        compose.onNodeWithTag("admin-user-save:synthetic-user").performClick()
         assertEquals(null to 4, saved.get())
         compose.onNodeWithText("个人每周免费次数").assertDoesNotExist()
         screenshot("admin-personal-quota.png")
@@ -194,23 +247,43 @@ class AccountUiTest {
         val loading = mutableStateOf(false)
         val user = UserUsage("synthetic-disabled", "public", "2026-11-14T00:00:00+08:00", null,
             35, 2, 0, 33, 2, 2, 0, 0, 0, 0, 0, username = "停用用户", registrationKind = "public", enabled = false)
+        val listedUser = mutableStateOf(user)
+        val resetLink = AdminPasswordResetLink(user.id, "停用用户",
+            "https://example.com/deepseek-api/v1/accounts/reset-password#token=${"a".repeat(43)}",
+            "2026-11-21T12:00:00+08:00")
         compose.setContent {
             ContinuationTheme {
-                AccountTestFrame {
-                    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                        RegisteredUserQuotaCard(user, 35, loading.value,
-                            onSetEnabled = { status.set(it) }, onResetPassword = { resets.incrementAndGet() }) { _, _ -> }
-                    }
-                }
+                AdminUserDetailsDialog(listedUser.value, 35, loading.value, null, {},
+                    onSetEnabled = { status.set(it) }, onCreateResetLink = { report ->
+                        resets.incrementAndGet()
+                        report(resetLink)
+                    },
+                    onSavePermissions = {}, onSaveQuota = { _, _ -> })
             }
         }
         compose.onNodeWithTag("admin-user-status:${user.id}").assertDoesNotExist()
-        compose.onNodeWithTag("admin-user-toggle:${user.id}").performClick()
-        compose.onNodeWithText("账号已停用").assertIsDisplayed()
+        compose.onNodeWithText("账号已停用", substring = true).assertIsDisplayed()
+        compose.onNodeWithTag("admin-user-open-account:${user.id}").performScrollTo().performClick()
+        compose.onNodeWithTag("admin-user-reset:${user.id}").assertIsNotEnabled()
         compose.onNodeWithTag("admin-user-status:${user.id}").performScrollTo().performClick()
+        assertNull(status.get())
+        compose.onNodeWithTag("admin-user-confirm:${user.id}").performClick()
         assertEquals(true, status.get())
+        compose.runOnIdle { listedUser.value = user.copy(enabled = true) }
         compose.onNodeWithTag("admin-user-reset:${user.id}").performScrollTo().performClick()
+        assertEquals(0, resets.get())
+        compose.onNodeWithTag("admin-user-confirm:${user.id}").performClick()
         assertEquals(1, resets.get())
+        compose.onNodeWithText("密码重置链接已生成").assertIsDisplayed()
+        compose.onNodeWithText("有效至", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("复制链接").performClick()
+        compose.runOnIdle {
+            val context = InstrumentationRegistry.getInstrumentation().targetContext
+            val clipboard = context.getSystemService(ClipboardManager::class.java)
+            val copied = clipboard.primaryClip
+            assertEquals(resetLink.url, copied?.getItemAt(0)?.text?.toString())
+            assertEquals(true, copied?.description?.extras?.getBoolean("android.content.extra.IS_SENSITIVE"))
+        }
         compose.runOnIdle { loading.value = true }
         compose.onNodeWithTag("admin-user-status:${user.id}").assertIsNotEnabled()
         compose.onNodeWithTag("admin-user-reset:${user.id}").assertIsNotEnabled()
@@ -257,27 +330,26 @@ class AccountUiTest {
         val saved = AtomicReference<ServicePermissions?>(null)
         val user = UserUsage("image-user", "public", "2026-11-14T00:00:00+08:00", null,
             5, 2, 0, 3, 2, 2, 0, 0, 0, 0, 0, username = "生图用户",
-            permissions = ServicePermissions.None.copy(imageApi = true))
+            permissions = ServicePermissions.None.copy(imageApi = true),
+            effectivePermissions = ServicePermissions.None.copy(imageApi = true, cloudSync = true))
         val listedUser = mutableStateOf(user)
         compose.setContent {
             ContinuationTheme {
-                AccountTestFrame {
-                    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                        RegisteredUserQuotaCard(listedUser.value, 5, false, onSavePermissions = { saved.set(it) }) { _, _ -> }
-                    }
-                }
+                AdminUserDetailsDialog(listedUser.value, 5, false, null, {}, {}, {},
+                    onSavePermissions = { saved.set(it) }, onSaveQuota = { _, _ -> })
             }
         }
-        compose.onNodeWithText("3 / 5").assertIsDisplayed()
-        compose.onNodeWithTag("admin-user-toggle:${user.id}").performClick()
-        compose.onNodeWithTag("admin-user-save:${user.id}").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithTag("admin-user-save-permissions:${user.id}").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("3 / 5 次").assertIsDisplayed()
+        compose.onNodeWithText("生图 API、云同步").assertIsDisplayed()
+        compose.onNodeWithTag("admin-user-open-quota:${user.id}").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("admin-user-open-permissions:${user.id}").performScrollTo().performClick()
+        compose.onNodeWithTag("admin-user-save-permissions:${user.id}").assertIsNotEnabled()
         compose.onNodeWithTag("admin-user-permissions:${user.id}:chat").performScrollTo().assertIsOff().performClick()
         compose.onNodeWithTag("admin-user-permissions:${user.id}:image").performScrollTo().assertIsOn().performClick()
-        compose.onNodeWithTag("admin-user-save-permissions:${user.id}").performScrollTo().performClick()
+        compose.onNodeWithTag("admin-user-save-permissions:${user.id}").performClick()
         assertEquals(ServicePermissions.None.copy(chatApi = true), saved.get())
         compose.runOnIdle { listedUser.value = user.copy(permissions = ServicePermissions.None, inviteRedeemable = true) }
-        compose.onNodeWithTag("admin-user-save-permissions:${user.id}").performScrollTo().assertIsEnabled().performClick()
+        compose.onNodeWithTag("admin-user-save-permissions:${user.id}").assertIsEnabled().performClick()
         assertEquals(ServicePermissions.None, saved.get())
         compose.runOnIdle { listedUser.value = listedUser.value.copy(inviteRedeemable = false) }
         compose.onNodeWithTag("admin-user-save-permissions:${user.id}").assertIsNotEnabled()

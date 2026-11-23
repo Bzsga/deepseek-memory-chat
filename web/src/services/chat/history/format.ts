@@ -2,6 +2,7 @@ import type { ContinuityContext } from '../continuity.js'
 import type { ConversationMemory } from '../contextMemory.js'
 import type { SharedConversationSource } from '../sharedSource.js'
 import type { ImageActionTrace } from '../imageAction.js'
+import type { McpSource } from '../mcpSources.js'
 
 /**
  * 历史会话导出产物（deepseek_data-*.zip）的类型定义。
@@ -66,6 +67,7 @@ export type GeneratedImageEntry = {
 }
 
 export type ChatMessage = {
+  mcp_sources?: McpSource[]
   image_action?: ImageActionTrace
   image_prompt?: string
   image_origin?: 'chat' | 'edit'

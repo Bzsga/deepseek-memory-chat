@@ -6,17 +6,23 @@ import { getVisibleMessages } from '../../services/chat/branches.js'
 import { buildOrganizePayload } from '../../services/chat/organize.js'
 import {
   isNativeConnected,
+  nativeArchiveRefreshAvailable,
+  openNativeSourceArchive,
+  readNativeArchiveBackground,
   sendNative,
   subscribeNativeBridge,
 } from '../../services/nativeBridge.js'
 import {
   addPinnedMemory,
+  refreshContinuityBackground,
   removeMemoryEntry,
   retryMemoryPreparation,
+  setConversationContextMode,
   setMemoryEnabled,
   updateMemoryEntry,
   useChatStore,
 } from '../../services/chat/store.js'
+import type { ContinuityContext } from '../../services/chat/continuity.js'
 import type { Message, Session } from '../../services/chat/types.js'
 import { Button } from '../base/Button.js'
 import { IconButton } from '../base/IconButton.js'
@@ -166,7 +172,11 @@ const ExportPanel = ({
       <p className={styles.explanation}>{t('exportSessionDescription')}</p>
       <div className={styles.exportChoices}>
         {choices.map((choice) => (
-          <label key={choice.value} className={styles.exportChoice}>
+          <label
+            key={choice.value}
+            className={styles.exportChoice}
+            data-selected={format === choice.value || undefined}
+          >
             <input
               type="radio"
               name="session-export-format"
@@ -265,6 +275,22 @@ const MemoryPanel = ({
       {memory?.enabled === false ? (
         <p className={styles.explanation}>{t('memoryDisabledHint')}</p>
       ) : null}
+      <label className={styles.memorySwitch}>
+        <span>
+          <strong>{t('memoryCompactContext')}</strong>
+          <small>{t('memoryCompactContextDescription')}</small>
+        </span>
+        <input
+          type="checkbox"
+          checked={memory?.contextMode === 'compact'}
+          disabled={readonly}
+          onChange={(event) => {
+            if (!setConversationContextMode(session.id, event.target.checked ? 'compact' : 'full')) {
+              showToast(t('memoryChangeFailed'))
+            }
+          }}
+        />
+      </label>
       {activity?.status === 'compressing' ? (
         <p className={styles.status} role="status">
           {t('memoryCompressing')}
@@ -466,10 +492,77 @@ const MemoryPanel = ({
             {t('memoryOriginalBackground')} · {session.continuity.title}
           </summary>
           <p className={styles.explanation}>{t('memoryBackgroundExplanation')}</p>
+          <ArchiveBackgroundActions
+            key={session.id}
+            sessionId={session.id}
+            background={session.continuity}
+            disabled={readonly}
+            onClose={onClose}
+          />
           <pre className={styles.original}>{session.continuity.text}</pre>
         </details>
       ) : null}
     </Modal>
+  )
+}
+
+const ArchiveBackgroundActions = ({ sessionId, background, disabled, onClose }: {
+  sessionId: string
+  background: ContinuityContext
+  disabled: boolean
+  onClose: () => void
+}) => {
+  const t = useTranslate()
+  const available = useSyncExternalStore(subscribeNativeBridge, nativeArchiveRefreshAvailable)
+  const [state, setState] = useState<'idle' | 'opening' | 'confirm' | 'refreshing'>('idle')
+  if (!available) {return null}
+
+  const open = async () => {
+    setState('opening')
+    try {
+      await openNativeSourceArchive(background.sourceArchiveId)
+      onClose()
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : t('memoryHandoffFailed'))
+    } finally {
+      setState('idle')
+    }
+  }
+
+  const refresh = async () => {
+    setState('refreshing')
+    try {
+      const saved = await refreshContinuityBackground(sessionId, background, () =>
+        readNativeArchiveBackground(background.sourceArchiveId))
+      showToast(t(saved ? 'memoryBackgroundRefreshed' : 'memoryBackgroundRefreshFailed'))
+      setState(saved ? 'idle' : 'confirm')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : t('memoryBackgroundRefreshFailed'))
+      setState('confirm')
+    }
+  }
+
+  return state === 'confirm' || state === 'refreshing' ? (
+    <>
+      <p className={styles.explanation}>{t('memoryRefreshBackgroundConfirm')}</p>
+      <div className={styles.entryActions}>
+        <Button type="button" size="s" disabled={disabled || state === 'refreshing'} onClick={() => void refresh()}>
+          {t(state === 'refreshing' ? 'memoryRefreshingBackground' : 'memoryConfirmBackgroundRefresh')}
+        </Button>
+        <Button type="button" size="s" variant="outlined" disabled={state === 'refreshing'} onClick={() => setState('idle')}>
+          {t('cancel')}
+        </Button>
+      </div>
+    </>
+  ) : (
+    <div className={styles.entryActions}>
+      <Button type="button" size="s" variant="outlined" disabled={disabled || state === 'opening'} onClick={() => void open()}>
+        {t(state === 'opening' ? 'memoryOpening' : 'memoryOpenSourceArchive')}
+      </Button>
+      <Button type="button" size="s" variant="outlined" disabled={disabled || state === 'opening'} onClick={() => setState('confirm')}>
+        {t('memoryRefreshBackground')}
+      </Button>
+    </div>
   )
 }
 

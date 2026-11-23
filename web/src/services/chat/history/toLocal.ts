@@ -51,6 +51,7 @@ const toUser = (message: ChatMessage): UserMessage => ({
   createdAt: time(message.inserted_at),
   content: message.fragments.map((item) => (item.type === 'REQUEST' ? item.content : '')).join(''),
   files: message.fragments.flatMap((item) => (item.type === 'FILE' ? item.files.map(toFile) : [])),
+  ...(message.mcp_sources?.length ? { mcpSources: message.mcp_sources } : {}),
 })
 
 /** 归档不带原调用 ID，以消息和片段位置生成稳定 ID，调用与结果共用。 */
@@ -260,7 +261,7 @@ const toAssistant = (message: ChatMessage): AssistantMessage => {
  * current_message_id 到根的路径为当前分支；其余节点默认选中 id 最大的子消息。
  */
 const buildTree = (file: SessionFile): Pick<Session, 'messages' | 'rootMessageId'> => {
-  const sorted = file.messages.toSorted((a, b) => a.id - b.id)
+  const sorted = [...file.messages].sort((a, b) => a.id - b.id)
   const byId = new Map<number, Message>()
   const messages = sorted.map((message) => {
     const { id, parent_id } = message

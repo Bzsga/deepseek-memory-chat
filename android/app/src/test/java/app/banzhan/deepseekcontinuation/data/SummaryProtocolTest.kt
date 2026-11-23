@@ -4,8 +4,10 @@ import app.banzhan.deepseekcontinuation.core.ArchiveEntry
 import app.banzhan.deepseekcontinuation.core.ChatMessage
 import app.banzhan.deepseekcontinuation.core.EntryCategory
 import app.banzhan.deepseekcontinuation.core.EntryKind
+import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.Assert.assertEquals
@@ -60,6 +62,49 @@ class SummaryProtocolTest {
         assertThrows(Exception::class.java) {
             SummaryProtocol.validateEntries("""{"entries":[{"id":"a","category":"BACKGROUND","kind":"USER_FACT","text":"test","sourceIds":[]}]}""", messages)
         }
+    }
+
+    @Test
+    fun personalOrganizationIgnoresModelEntryIdsAndStillValidatesSources() {
+        val fields = """{"category":"BACKGROUND","kind":"USER_FACT","text":"test","sourceIds":["c1-user"]}"""
+        val withoutModelId = """{"entries":[$fields]}"""
+        val expected = SummaryProtocol.validateEntries(withoutModelId, messages).single()
+        assertTrue(expected.id.startsWith("summary-"))
+        assertEquals(listOf("c1-user"), expected.sourceIds)
+        assertEquals("test", expected.text)
+        listOf(JsonPrimitive(123), JsonPrimitive("arbitrary-id"), JsonPrimitive("a".repeat(300))).forEach { modelId ->
+            val withModelId = """{"entries":[${fields.dropLast(1)},"id":$modelId}]}"""
+            assertEquals(expected, SummaryProtocol.validateEntries(withModelId, messages).single())
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            SummaryProtocol.validateEntries(withoutModelId.replace("c1-user", "unknown-source"), messages)
+        }
+        assertThrows(IllegalStateException::class.java) {
+            SummaryNetwork.parseJob("""{"id":"job-1","status":"completed","entries":[$fields]}""")
+        }
+    }
+
+    @Test
+    fun personalResponseReportsAResumableFailureAtTheSpecificParsingStep() = runTest {
+        val failures = mapOf(
+            "[]" to PersonalSummaryResponseFailure.ENVELOPE,
+            """{"choices":[{"message":{"content":[]} }]}""" to PersonalSummaryResponseFailure.ENVELOPE,
+            """{"choices":[{"finish_reason":"synthetic-provider-value"}]}""" to PersonalSummaryResponseFailure.INCOMPLETE,
+            """{"choices":[{"finish_reason":"stop","message":{"content":"   "}}]}""" to PersonalSummaryResponseFailure.BLANK,
+            """{"choices":[{"message":{"content":"{}"}}]}""" to PersonalSummaryResponseFailure.ENTRIES,
+        )
+        failures.forEach { (response, expected) ->
+            val failure = runCatching {
+                SummaryNetwork.parsePersonalSummaryResponse(response, messages)
+            }.exceptionOrNull() as SummaryFailure
+            assertEquals(expected.detail, failure.failureDetail)
+            assertTrue(failure.ambiguous)
+            assertFalse(failure.message.orEmpty().contains("synthetic-provider-value"))
+        }
+        val valid = """{"choices":[{"finish_reason":"stop","message":{"content":"{\"entries\":[{\"category\":\"BACKGROUND\",\"kind\":\"USER_FACT\",\"text\":\"fixture\",\"sourceIds\":[\"c1-user\"]}]}"}}]}"""
+        val entry = SummaryNetwork.parsePersonalSummaryResponse(valid, messages).single()
+        assertEquals(listOf("c1-user"), entry.sourceIds)
+        assertEquals("fixture", entry.text)
     }
 
     @Test

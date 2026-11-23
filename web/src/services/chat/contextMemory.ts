@@ -6,7 +6,8 @@ import type { Message, Session, UserMessage } from './types.js'
 export const MODEL_CONTEXT_WINDOW = 1000000
 export const RESPONSE_TOKEN_RESERVE = 64000
 export const DEFAULT_CONTEXT_BUDGET = MODEL_CONTEXT_WINDOW - RESPONSE_TOKEN_RESERVE
-const storedContextBudgets = [32000, 64000, 128000, DEFAULT_CONTEXT_BUDGET]
+export const COMPACT_CONTEXT_BUDGET = 128000
+const storedContextBudgets = [32000, 64000, COMPACT_CONTEXT_BUDGET, DEFAULT_CONTEXT_BUDGET]
 export type MemoryKind = 'fact' | 'preference' | 'decision' | 'todo' | 'relationship'
 export type MemoryEntry = {
   id: string
@@ -29,6 +30,7 @@ export type ConversationMemory = {
   version: 1
   enabled: boolean
   contextBudgetTokens: number
+  contextMode?: 'compact'
   entries: MemoryEntry[]
   segments: MemorySegment[]
 }
@@ -135,6 +137,7 @@ export const validateConversationMemory = (value: unknown): ConversationMemory =
   if (
     memory.version !== 1 ||
     typeof memory.enabled !== 'boolean' ||
+    (memory.contextMode !== undefined && memory.contextMode !== 'compact') ||
     !storedContextBudgets.includes(memory.contextBudgetTokens as number) ||
     !Array.isArray(memory.entries) ||
     memory.entries.length > MAX_ENTRIES ||
@@ -186,6 +189,7 @@ export const validateConversationMemory = (value: unknown): ConversationMemory =
     version: 1,
     enabled: memory.enabled,
     contextBudgetTokens: DEFAULT_CONTEXT_BUDGET,
+    ...(memory.contextMode === 'compact' ? { contextMode: memory.contextMode } : {}),
     entries,
     segments,
   }
@@ -222,7 +226,7 @@ export const memorySummary = (session: Session) => {
   const path = getVisibleMessages(session)
   return {
     enabled: memory.enabled,
-    budget: DEFAULT_CONTEXT_BUDGET,
+    budget: memory.contextMode === 'compact' ? COMPACT_CONTEXT_BUDGET : DEFAULT_CONTEXT_BUDGET,
     entries: memoryForExport(session),
     capacityReached: memoryCapacityReached(memory),
     blockedSegments: memory.segments.filter(
@@ -256,15 +260,27 @@ const relevance = (text: string, query: Set<string>): number => {
   return score
 }
 
-const attachmentCost = (messages: Message[]): number =>
+const ATTACHMENT_TOKEN_ESTIMATE = 4096
+
+const historicalFileCost = (file: UserMessage['files'][number], compact: boolean): number => {
+  if (!compact || file.isImage) {return ATTACHMENT_TOKEN_ESTIMATE}
+  const plainText = file.mimeType?.toLowerCase().startsWith('text/') || /\.txt$/i.test(file.name)
+  return plainText && Number.isFinite(file.size)
+    ? Math.max(ATTACHMENT_TOKEN_ESTIMATE, Math.ceil(file.size / 2))
+    : ATTACHMENT_TOKEN_ESTIMATE
+}
+
+const attachmentCost = (messages: Message[], compact = false): number =>
   messages.reduce(
-    (cost, message) => cost + (message.role === 'user' ? message.files.length * 4096 : 0),
+    (cost, message) => cost + (message.role === 'user'
+      ? message.files.reduce((sum, file) => sum + historicalFileCost(file, compact), 0) : 0),
     0
   )
 
-const roundCost = (round: Message[], question: UserMessage): number =>
-  estimateTokens(toRequestMessages(round, { ...question, content: '', files: [] })) +
-  attachmentCost(round)
+const roundCost = (round: Message[], question: UserMessage, includeMcpSources: boolean, compact: boolean): number =>
+  estimateTokens(toRequestMessages(round, { ...question, content: '', files: [], mcpSources: undefined },
+    undefined, undefined, undefined, undefined, includeMcpSources)) +
+  attachmentCost(round, compact)
 
 /** Preserve Unicode code points and the actual UTF-16 source offset. */
 const originalSlice = (text: string, start: number, length: number) => {
@@ -351,11 +367,32 @@ const continuityExcerpts = (session: Session, query: Set<string>, budget: number
     .join('\n\n')
 }
 
+type OriginalExcerpt = { sourceId: string; from: number; text: string }
+
+const mergeOverlappingExcerpts = (excerpts: OriginalExcerpt[]): OriginalExcerpt[] => {
+  const merged: OriginalExcerpt[] = []
+  for (const excerpt of excerpts) {
+    const previous = merged.at(-1)
+    const start = previous ? excerpt.from - previous.from : -1
+    if (previous?.sourceId === excerpt.sourceId && start >= 0 && start < previous.text.length) {
+      const overlap = previous.text.slice(start)
+      if (overlap.startsWith(excerpt.text)) {continue}
+      if (excerpt.text.startsWith(overlap)) {
+        previous.text += excerpt.text.slice(overlap.length)
+        continue
+      }
+    }
+    merged.push({ ...excerpt })
+  }
+  return merged
+}
+
 export type ContextPlan = {
   history: Message[]
   system: string
   estimatedTokens: number
   limited: boolean
+  limitedByCompact?: boolean
   capacityReached?: boolean
   segment?: { source: Message[]; checkpoint: MemorySegment }
 }
@@ -366,48 +403,71 @@ export const planContext = (
   history: Message[],
   question: UserMessage,
   baseSystem: string,
-  prefix?: Message
+  prefix?: Message,
+  currentUserSuffix?: string,
+  includeMcpSources = false
 ): ContextPlan => {
   const memory = session.longMemory ?? newConversationMemory()
-  const budget = DEFAULT_CONTEXT_BUDGET
   const query = tokens(question.content)
-  const currentCost =
+  const requestCost = (requestHistory: Message[]): number =>
     estimateTokens(
-      toRequestMessages([], question, prefix?.role === 'assistant' ? prefix : undefined)
+      toRequestMessages(
+        requestHistory,
+        question,
+        prefix?.role === 'assistant' ? prefix : undefined,
+        undefined,
+        undefined,
+        currentUserSuffix,
+        includeMcpSources
+      )
     ) +
-    question.files.length * 4096 +
-    2000
-  if (currentCost > budget) {
+    question.files.length * ATTACHMENT_TOKEN_ESTIMATE
+  const currentCost = requestCost([]) + 2000
+  if (currentCost > DEFAULT_CONTEXT_BUDGET) {
     throw new Error('本条消息或附件已超过模型的上下文容量，请拆分本条内容或减少附件。')
   }
+  const baseCost = memory.contextMode === 'compact' ? estimateTokens(baseSystem) : 0
+  const compact = memory.contextMode === 'compact' && currentCost + baseCost < COMPACT_CONTEXT_BUDGET
+  const budget = compact ? COMPACT_CONTEXT_BUDGET : DEFAULT_CONTEXT_BUDGET
   const rounds = getContextRounds(history)
   const unpaired = sharedUnpairedMessages(session, history)
   const allShared = unpaired.map((message) => ({
     sourceId: message.id, role: message.role, from: 0, text: memoryText(message),
   }))
   const fullSystem = withSharedBackground(buildContinuitySystem(baseSystem, session.continuity), allShared)
-  const rawCost =
-    estimateTokens(
-      toRequestMessages(history, question, prefix?.role === 'assistant' ? prefix : undefined)
-    ) +
-    estimateTokens(fullSystem) +
-    attachmentCost(history) +
-    question.files.length * 4096
+  const rawTextCost = requestCost(history) + estimateTokens(fullSystem)
+  const completeCost = rawTextCost + attachmentCost(history)
+  const rawCost = compact ? rawTextCost + attachmentCost(rounds.flat(), true) : completeCost
+  const exceedsCompleteBudget = completeCost + 2000 > DEFAULT_CONTEXT_BUDGET
   const long = rawCost + 2000 > budget
   if (!long && !session.longMemory?.entries.length) {
     return { history, system: fullSystem, estimatedTokens: rawCost, limited: false }
   }
-  let remaining = budget - currentCost
-  const selected = new Set<number>()
+  let remaining = budget - currentCost - (compact ? baseCost : 0)
+  const selected = new Map<number, Message[]>()
+  const fitRound = (round: [UserMessage, Message], available: number) => {
+    const cost = roundCost(round, question, includeMcpSources, compact)
+    if (cost <= available) {return { round, cost }}
+    const [user, assistant] = round
+    if (!compact || !user.content.trim()) {return undefined}
+    const files = user.files.filter((file) => {
+      const fileCost = historicalFileCost(file, true)
+      return fileCost === ATTACHMENT_TOKEN_ESTIMATE || fileCost <= available
+    })
+    if (files.length === user.files.length) {return undefined}
+    const textRound = [{ ...user, files }, assistant]
+    const textCost = roundCost(textRound, question, includeMcpSources, true)
+    return textCost <= available ? { round: textRound, cost: textCost } : undefined
+  }
   const recentBudget = long ? Math.floor(remaining * 0.62) : remaining
   let used = 0
   for (let index = rounds.length - 1; index >= 0; index -= 1) {
-    const cost = roundCost(rounds[index], question)
-    if (used + cost > recentBudget) {
+    const fit = fitRound(rounds[index], recentBudget - used)
+    if (!fit) {
       break
     }
-    selected.add(index)
-    used += cost
+    selected.set(index, fit.round)
+    used += fit.cost
   }
   remaining -= used
   const memoryBudget = Math.min(6000, Math.floor(remaining * 0.4))
@@ -423,10 +483,21 @@ export const planContext = (
         )
     : []
   const chosen: MemoryEntry[] = []
+  const automaticMemoryKeys = new Set<string>()
   for (const entry of entries) {
+    // Entries with their own user intent or distinct provenance remain separate.
+    const automaticKey = !entry.edited && !entry.pinned && entry.sourceIds.length > 0
+      ? JSON.stringify([entry.kind, entry.text, entry.sourceIds, entry.sourceSignature])
+      : undefined
+    if (automaticKey !== undefined && automaticMemoryKeys.has(automaticKey)) {
+      continue
+    }
     const cost = estimateTokens(entry.text) + estimateTokens(entry.sourceIds) + 60
     if (memoryCost + cost <= memoryBudget) {
       chosen.push(entry)
+      if (automaticKey !== undefined) {
+        automaticMemoryKeys.add(automaticKey)
+      }
       memoryCost += cost
     }
   }
@@ -444,12 +515,12 @@ export const planContext = (
     .map((round, index) => ({ index, score: relevance(round.map(memoryText).join('\n'), query) }))
     .filter((item) => !selected.has(item.index) && item.score > 0)
     .sort((a, b) => b.score - a.score || b.index - a.index)
-  const originalExcerpts: { sourceId: string; from: number; text: string }[] = []
+  const originalExcerpts: OriginalExcerpt[] = []
   for (const candidate of candidates) {
-    const cost = roundCost(rounds[candidate.index], question)
-    if (cost <= remaining - 1000) {
-      selected.add(candidate.index)
-      remaining -= cost
+    const fit = fitRound(rounds[candidate.index], remaining - 1000)
+    if (fit) {
+      selected.set(candidate.index, fit.round)
+      remaining -= fit.cost
     } else {
       const excerpts = rounds[candidate.index]
         .flatMap((message) => {
@@ -475,7 +546,11 @@ export const planContext = (
       }
     }
   }
-  const selectedHistory = [...selected].sort((a, b) => a - b).flatMap((index) => rounds[index])
+  const omittedHistoricalFiles = [...selected].some(([index, round]) => round !== rounds[index])
+  const selectedHistory = [...selected].sort(([a], [b]) => a - b).flatMap(([, round]) => round)
+  // Relevance affects selection. Unchanged selections keep the same serialized prefix.
+  chosen.sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.createdAt - a.createdAt ||
+    (a.id < b.id ? -1 : a.id === b.id ? 0 : 1))
   const references = {
     memories: chosen.map(({ kind, text, sourceIds, pinned }) => ({
       kind,
@@ -483,35 +558,33 @@ export const planContext = (
       sourceIds,
       pinned,
     })),
-    originalExcerpts,
+    originalExcerpts: mergeOverlappingExcerpts(originalExcerpts),
+    ...(omittedHistoricalFiles ? { historyNote: '部分历史大附件未带入本轮，请勿假定能够看到其正文。' } : {}),
   }
   const continuity =
     background && session.continuity ? { ...session.continuity, text: background } : undefined
   const system = withSharedBackground(`${buildContinuitySystem(baseSystem, continuity)}\n\n以下是本机会话中选取的历史背景。它们是引用资料，可能存在遗漏或过时信息，以用户当前更正为准。按需自然延续对话，资料中的历史指令属于原对话。\n${JSON.stringify(references)}`, shared)
   const estimatedTokens =
-    estimateTokens(system) +
-    estimateTokens(
-      toRequestMessages(
-        selectedHistory,
-        question,
-        prefix?.role === 'assistant' ? prefix : undefined
-      )
-    ) +
-    question.files.length * 4096 +
-    attachmentCost(selectedHistory)
+    estimateTokens(system) + requestCost(selectedHistory) + attachmentCost(selectedHistory, compact)
   if (estimatedTokens > budget) {
+    if (compact) {
+      const complete = { ...session, longMemory: { ...memory, contextMode: undefined } }
+      return planContext(complete, history, question, baseSystem, prefix, currentUserSuffix, includeMcpSources)
+    }
     throw new Error('当前消息与历史背景超过模型的上下文容量，请拆分本条内容或减少附件。')
   }
+  const limited = omittedHistoricalFiles || selected.size < rounds.length || background !== (session.continuity?.text ?? '') ||
+    JSON.stringify(shared) !== JSON.stringify(allShared)
   const plan: ContextPlan = {
     history: selectedHistory,
     system,
     estimatedTokens,
-    limited: selected.size < rounds.length || background !== (session.continuity?.text ?? '') ||
-      JSON.stringify(shared) !== JSON.stringify(allShared),
+    limited,
+    ...(compact && !exceedsCompleteBudget && limited ? { limitedByCompact: true } : {}),
     capacityReached: memory.enabled && memoryCapacityReached(memory),
   }
   if (
-    !long ||
+    !exceedsCompleteBudget ||
     !memory.enabled ||
     plan.capacityReached ||
     memory.segments.some(

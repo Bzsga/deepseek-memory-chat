@@ -93,6 +93,45 @@ class AppUpdateDownloadsTest {
     }
 
     @Test
+    fun terminalVerificationFailureRetiresCorruptBytesAndRetryEnqueuesFreshId() {
+        val fixture = fixture()
+        val download = fixture.completed(byteArrayOf(1, 2, 3, 4))
+        val part = File(fixture.parts, "candidate.part")
+        val apk = File(fixture.parts, "candidate.apk")
+        val error = assertThrows(AppUpdateVerificationException::class.java) {
+            fixture.manager.verifyCompleted(download) {
+                fixture.manager.copyTo(download, part)
+                assertTrue(part.renameTo(apk))
+                verifyAppUpdateFile(apk, temporary.root, download.manifest)
+            }
+        }
+        assertEquals(AppUpdateVerificationFailure.CHECKSUM, error.failure)
+        assertNull(fixture.manager.restore())
+        assertEquals(listOf(download.id), fixture.platform.removed)
+        assertEquals(1, fixture.platform.enqueued)
+
+        val retry = fixture.manager.start(download.manifest)
+        assertNotEquals(download.id, retry.id)
+        assertEquals(2, fixture.platform.enqueued)
+    }
+
+    @Test
+    fun temporaryCacheReadFailurePreservesTheCompletedDownload() {
+        val fixture = fixture()
+        val download = fixture.completed(byteArrayOf(1, 2, 3, 4))
+        val missing = File(fixture.parts, "missing.apk")
+        val error = assertThrows(AppUpdateVerificationException::class.java) {
+            fixture.manager.verifyCompleted(download) {
+                verifyAppUpdateFile(missing, temporary.root, download.manifest)
+            }
+        }
+        assertEquals(AppUpdateVerificationFailure.FILE, error.failure)
+        assertEquals(download, fixture.manager.restore())
+        assertTrue(fixture.platform.removed.isEmpty())
+        assertEquals(1, fixture.platform.enqueued)
+    }
+
+    @Test
     fun truncatedAndOversizedCopiesDeleteOnlyThePartialCopyAndKeepTheSystemTask() {
         val fixture = fixture()
         val download = fixture.completed(byteArrayOf(1, 2, 3, 4))
@@ -188,7 +227,7 @@ class AppUpdateDownloadsTest {
     private fun fixture(): Fixture {
         val platform = FakePlatform()
         val store = FakeStore()
-        val parts = temporary.newFolder("parts")
+        val parts = temporary.newFolder("app-updates")
         val tokens = listOf(FIRST_TOKEN, SECOND_TOKEN).iterator()
         val manager = PersistentAppUpdateDownloads(platform, store, parts) { tokens.next() }
         return Fixture(platform, store, parts, manager)

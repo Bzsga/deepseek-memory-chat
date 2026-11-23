@@ -1,9 +1,9 @@
 import { useTranslate } from '../../i18n/index.js'
 import clsx from 'clsx'
 import { memo, useLayoutEffect, useRef, useState } from 'react'
-import { useIsMobile } from '../../app/viewport.js'
 import { IconEditOutline16 } from '../base/icons.js'
 import { editMessage, retryUpload } from '../../services/chat/store.js'
+import { normalizeMcpSources } from '../../services/chat/mcpSources.js'
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import type { UserMessage as UserMessageType } from '../../services/chat/types.js'
 import { Button } from '../base/Button.js'
@@ -42,8 +42,8 @@ export const UserMessage = memo(function UserMessage({
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(message.content)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const isMobile = useIsMobile()
   const canSend = !busy && (draft.trim() !== '' || message.files.length > 0)
+  const sources = normalizeMcpSources(message.mcpSources)
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current
@@ -95,18 +95,13 @@ export const UserMessage = memo(function UserMessage({
             aria-label={t('editMessage')}
             autoFocus
             rows={1}
+            enterKeyHint="enter"
             value={draft}
             disabled={busy}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
-              if (event.nativeEvent.isComposing) {
-                return
-              }
-              if (event.key === 'Escape') {
+              if (event.key === 'Escape' && !event.nativeEvent.isComposing) {
                 setEditing(false)
-              } else if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !isMobile) {
-                event.preventDefault()
-                sendEdit()
               }
             }}
           />
@@ -122,6 +117,20 @@ export const UserMessage = memo(function UserMessage({
       ) : (
         <>
           {message.content ? <div className={styles.bubble}>{message.content}</div> : null}
+          {sources.length > 0 ? (
+            <details className={styles.sources}>
+              <summary>{t('chatKnowledgeSources', { count: sources.length })}</summary>
+              <ul>
+                {sources.map(({ title, url, text }, index) => (
+                  <li key={`${url}-${index}`}>
+                    <a href={url} target="_blank" rel="noreferrer">{title}</a>
+                    <small>{new URL(url).host}</small>
+                    <p>{text}</p>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ) : null}
           <div className={styles.bottom}>
             <div className={clsx(styles.actions, isLast && styles.alwaysShow)}>
               {message.content ? <CopyButton text={message.content} /> : null}

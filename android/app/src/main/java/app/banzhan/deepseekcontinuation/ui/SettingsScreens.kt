@@ -67,6 +67,7 @@ internal fun MemoryDataSettings(
 internal fun LocalSettingsIndex(
     state: AppState,
     onAccount: () -> Unit,
+    onDiagnostics: () -> Unit,
     onOpen: (NativeSettingsSection) -> Unit,
 ) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp),
@@ -76,6 +77,7 @@ internal fun LocalSettingsIndex(
             .filter { (section, _) -> section != NativeSettingsSection.DEVELOPER || state.developerPrefs.sessionToken.isNotEmpty() }) { (section, label) ->
             OutlinedButton(onClick = { onOpen(section) }, modifier = Modifier.fillMaxWidth()) { Text(label) }
         }
+        item { OutlinedButton(onClick = onDiagnostics, modifier = Modifier.fillMaxWidth()) { Text("技术诊断") } }
         item { AccountSummaryCard(state, onAccount) }
     }
 }

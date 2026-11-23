@@ -19,6 +19,7 @@ import wave
 from dataclasses import dataclass, field
 from email import policy
 from email.parser import BytesParser
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -26,8 +27,11 @@ import anyio
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from .admin_access import _client_ip
+from .chat_jobs import (AUTH_INTERVAL, CHAT_INPUT_LIMIT_CODE, CHAT_INPUT_LIMIT_MESSAGE, MAX_CHAT_JOB_BODY,
+                        ChatJobError, capture_sse, chat_input_limit)
 from .image_jobs import ImageEditSource, ImageJobError
 from .store import ServiceError, digest
 
@@ -67,6 +71,7 @@ KINDS = {"/anthropic/v1/messages": "chat", "/anthropic/v1/files": "file",
 COMMON_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                   "Referrer-Policy": "same-origin"}
 MANAGED_CHAT_UNAVAILABLE = "managed_chat_unavailable"
+CHAT_MESSAGES_PATH = "/anthropic/v1/messages"
 
 
 @dataclass(frozen=True)
@@ -86,24 +91,25 @@ class ImageProvider:
 
 
 class ChatError(Exception):
-    def __init__(self, status, message, headers=None, code=None):
+    def __init__(self, status, message, headers=None, code=None, *, input_limit=None):
         self.status, self.message, self.headers = status, message, headers or {}
         self.code = code
+        self.input_limit = input_limit
 
 
-class ImageStreamingResponse(StreamingResponse):
+class ClosingStreamingResponse(StreamingResponse):
     async def stream_response(self, send):
         try:
             await super().stream_response(send)
         finally:
             # ASGI 2.4 can report a disconnect through send(), after a yield.
-            # Close the owned generator immediately so it cancels generation.
+            # Close the generator immediately so it releases its resources.
             with anyio.CancelScope(shield=True):
                 await self.body_iterator.aclose()
 
 
-def _error(status, message, headers=None, code=None):
-    error = {"message": message}
+def _error(status, message, headers=None, code=None, *, input_limit=None):
+    error = {"message": message, **(input_limit or {})}
     if code:
         error["code"] = code
     return JSONResponse({"error": error}, status_code=status,
@@ -396,7 +402,7 @@ def _origin_ok(request, origin):
     return request.headers.get("sec-fetch-site") not in ("cross-site", "same-site")
 
 
-async def _body(request, limit=MAX_BODY, size_message="文件或请求过大，单次请求最多支持 70 MB。"):
+async def _body(request, limit=MAX_BODY, size_message="文件或请求过大，单次请求最多支持 70 MB。", *, idle_timeout=15):
     length = request.headers.get("content-length")
     if length is not None:
         try:
@@ -410,7 +416,7 @@ async def _body(request, limit=MAX_BODY, size_message="文件或请求过大，�
     iterator = request.stream().__aiter__()
     while True:
         try:
-            chunk = await asyncio.wait_for(anext(iterator), timeout=15)
+            chunk = await asyncio.wait_for(anext(iterator), timeout=idle_timeout)
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError:
@@ -489,7 +495,7 @@ def _validated_images(images):
     return result
 
 
-def _auth_page(register=False, error="", *, self_service=False):
+def _auth_page(register=False, error="", *, self_service=False, official_service=False):
     action, title = ("register", "创建账号") if register else ("login", "欢迎回来")
     register_prompt = "还没有账号？" if self_service else "有邀请码？"
     link = (f'已有账号？<a href="{PUBLIC_API_PATH}{PREFIX}/login">登录</a>' if register else
@@ -500,17 +506,21 @@ def _auth_page(register=False, error="", *, self_service=False):
     invitation = (f'<label for="invitation_code">{invite_label}</label><input id="invitation_code" name="invitation_code" '
                   f'autocomplete="off" autocapitalize="none" spellcheck="false"{required_invite} maxlength="128">'
                   if register else "")
+    contact = "联系管理员（QQ 1076755135）" if official_service else "联系本站管理员"
+    recovery = (f'<details><summary>忘记密码？</summary><p>{contact}，提供注册时的用户名。'
+                '核实账号后，管理员会发给你一次性重置链接。请用新密码登录原账号，原有权限不变。</p></details>'
+                if not register else "")
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} · DeepSeek 记忆聊天</title><style>*{{box-sizing:border-box}}body{{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;background:#f7f8fc;color:#24252b;font:15px system-ui,sans-serif}}main{{width:min(100%,400px);padding:30px;border-radius:20px;background:white;border:1px solid #e8eaf0}}h1{{font-size:24px;margin:0 0 10px}}p{{color:#747987;line-height:1.6}}label{{display:block;margin:16px 0 8px}}input,button{{width:100%;min-height:44px;border-radius:10px;font:inherit}}input{{border:1px solid #d9dde8;padding:10px 12px}}button{{border:0;margin-top:22px;background:#4d6bfe;color:white}}a{{color:#4d6bfe}}.error{{color:#b83737}}@media(prefers-color-scheme:dark){{body{{background:#1b1c20;color:#eee}}main{{background:#232429;border-color:#363942}}input{{background:#1c1d21;color:#eee;border-color:#444957}}}}</style>
+<title>{title} · DeepSeek 记忆聊天</title><style>*{{box-sizing:border-box}}body{{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;background:#f7f8fc;color:#24252b;font:15px system-ui,sans-serif}}main{{width:min(100%,400px);padding:30px;border-radius:20px;background:white;border:1px solid #e8eaf0}}h1{{font-size:24px;margin:0 0 10px}}p{{color:#747987;line-height:1.6}}label{{display:block;margin:16px 0 8px}}input,button{{width:100%;min-height:44px;border-radius:10px;font:inherit}}input{{border:1px solid #d9dde8;padding:10px 12px}}button{{border:0;margin-top:22px;background:#4d6bfe;color:white}}a{{color:#4d6bfe}}details{{margin-top:12px}}summary{{cursor:pointer;padding:10px 0;font-weight:600}}details p{{margin:0}}.error{{color:#b83737}}@media(prefers-color-scheme:dark){{body{{background:#1b1c20;color:#eee}}main{{background:#232429;border-color:#363942}}input{{background:#1c1d21;color:#eee;border-color:#444957}}}}</style>
 <main><h1>{title}</h1>{introduction}
 <form method="post" action="{PUBLIC_API_PATH}{PREFIX}/{action}"><label for="username">用户名</label><input id="username" name="username" autocomplete="username" required minlength="3" maxlength="32">
 <label for="password">密码</label><input id="password" name="password" type="password" autocomplete="{'new-password' if register else 'current-password'}" required minlength="8" maxlength="128">
 {invitation}
-<p class="error" role="alert">{html.escape(error)}</p><button type="submit">{'注册' if register else '登录'}</button></form><p>{link}</p></main></html>'''
+<p class="error" role="alert">{html.escape(error)}</p><button type="submit">{'注册' if register else '登录'}</button></form>{recovery}<p>{link}</p></main></html>'''
 
 
 def build_chat_router(store, *, client_factory=None, provider_loader=None, image_provider_loader=None,
-                      public_origin=None, image_jobs=None):
+                      public_origin=None, image_jobs=None, chat_jobs=None):
     """Build routes without opening credentials, databases or network connections."""
     router = APIRouter(prefix=PREFIX)
     origin = (public_origin or os.environ.get("PUBLIC_ORIGIN", "https://digimonlegend.com")).rstrip("/")
@@ -549,10 +559,245 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
+    async def chat_request_body(body, owner_id, model, *, streaming=False):
+        try:
+            document = json.loads(body)
+            if not isinstance(document, dict) or not isinstance(document.get("messages"), list) or not document["messages"]:
+                raise ValueError
+            tools = document.get("tools")
+            if isinstance(tools, list) and any(isinstance(tool, dict) and tool.get("name") == "generate_image" for tool in tools):
+                raise ChatError(409, "聊天生图调用已更新，请重新打开聊天页面后重试。", code="image_protocol_updated")
+            pending = [document]
+            verified_files = set()
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    if value.get("type") == "file" and "file_id" in value:
+                        reference = value["file_id"]
+                        if not isinstance(reference, str) or not FILE_ID.fullmatch(reference):
+                            raise ChatError(403, "文件不属于当前账号，请重新上传附件。")
+                        if reference not in verified_files:
+                            if not await asyncio.to_thread(_files, store, "owns", owner_id, reference):
+                                raise ChatError(403, "文件不属于当前账号，请重新上传附件。")
+                            verified_files.add(reference)
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+            document["model"] = model
+            if streaming:
+                document["stream"] = True
+            return json.dumps(document, ensure_ascii=False).encode("utf-8")
+        except (ValueError, UnicodeError, RecursionError):
+            raise ChatError(400, "消息格式无效。") from None
+
+    def provider_headers(request, provider):
+        headers = {"Authorization": "Bearer " + provider.api_key, "x-api-key": provider.api_key,
+                   "Accept-Encoding": "identity", "User-Agent": "DeepSeek-Memory-Chat/2.0"}
+        for name in ("Content-Type", "anthropic-beta", "anthropic-version", "Accept"):
+            if name in request.headers:
+                headers[name] = request.headers[name]
+        return headers
+
+    def upstream_chat_error(upstream_status):
+        status = upstream_status if upstream_status in (400, 413, 415, 422, 429) else 502
+        if upstream_status in (401, 403):
+            return ChatError(status, "配套聊天服务暂不可用，可以配置个人 API 后重试。", code=MANAGED_CHAT_UNAVAILABLE)
+        message = {400: "模型服务未接受此请求，请检查消息或附件。", 413: "附件超过模型服务的大小限制。",
+                   415: "模型服务不支持此文件格式。", 422: "模型服务无法处理此文件格式。",
+                   429: "模型服务繁忙或额度受限，请稍后重试。"}.get(status, "模型服务暂不可用，请稍后重试。")
+        return ChatError(status, message)
+
+    async def classified_upstream_chat_error(response, *, background=False):
+        if response.status_code != 400:
+            return upstream_chat_error(response.status_code)
+        # Provider errors can echo input. Inspect bounded data and return fixed messages.
+        body = bytearray()
+        try:
+            with anyio.move_on_after(2):
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > MAX_SMALL_RESPONSE:
+                        break
+                    body.extend(chunk)
+                else:
+                    try:
+                        payload = json.loads(body)
+                    except (ValueError, UnicodeError, RecursionError):
+                        payload = None
+                    error = payload.get("error") if isinstance(payload, dict) else None
+                    counts = chat_input_limit(error)
+                    if counts is not None:
+                        return ChatError(400, CHAT_INPUT_LIMIT_MESSAGE, code=CHAT_INPUT_LIMIT_CODE, input_limit=counts)
+                    if background and any(pattern in body.lower() for pattern in (
+                        b"file_ids do not exist or are not created under your account",
+                        b"file data not found for file_id", b".source.file_id: invalid file_id",
+                    )):
+                        return ChatJobError(400, "file data not found for file_id", "chat_job_stale_file")
+        except (httpx.HTTPError, OSError):
+            pass  # Failure to read optional evidence still preserves the known HTTP status.
+        return upstream_chat_error(response.status_code)
+
+    async def background_chunks(upstream, token, owner_id):
+        loop = asyncio.get_running_loop()
+        checked, reading = 0, None
+        try:
+            iterator = upstream.aiter_bytes().__aiter__()
+            while True:
+                if loop.time() >= checked:
+                    if await asyncio.to_thread(store.accounts.authenticate, token) != owner_id:
+                        raise ChatJobError(401, "登录已过期，请重新登录。", "chat_job_session_expired")
+                    checked = loop.time() + AUTH_INTERVAL
+                if reading is None:
+                    reading = asyncio.create_task(anext(iterator))
+                done, _ = await asyncio.wait({reading}, timeout=max(0, checked - loop.time()))
+                if done:
+                    try:
+                        chunk = reading.result()
+                    except StopAsyncIteration:
+                        return
+                    reading = None
+                    if chunk:
+                        yield chunk
+        finally:
+            if reading is not None:
+                with anyio.CancelScope(shield=True):
+                    if not reading.done():
+                        reading.cancel()
+                    await asyncio.gather(reading, return_exceptions=True)
+
+    async def generate_background_reply(token, owner_id, provider_origin, headers, body, publish):
+        client, upstream, call_id, chunks = None, None, None, None
+        outcome = "failed"
+        try:
+            client = client_factory()
+            outgoing = client.build_request("POST", provider_origin + CHAT_MESSAGES_PATH, headers=headers, content=body)
+            ledger = asyncio.create_task(asyncio.to_thread(store.begin_chat_call, owner_id, "chat",
+                                                          account_session_hash=digest(token)))
+            try:
+                call_id = await asyncio.shield(ledger)
+            except asyncio.CancelledError:
+                with anyio.CancelScope(shield=True):
+                    call_id = await ledger
+                raise
+            with anyio.fail_after(15 * 60):
+                upstream = await open_upstream(client, outgoing, None, token, owner_id, watch_disconnect=False)
+                if not upstream.is_success:
+                    raise await classified_upstream_chat_error(upstream, background=True)
+                if "text/event-stream" not in upstream.headers.get("Content-Type", ""):
+                    raise ChatJobError(502, "模型服务未返回有效回复。", "chat_job_interrupted")
+                chunks = background_chunks(upstream, token, owner_id)
+                status = await capture_sse(chunks, publish, chat_jobs.max_result_bytes)
+            outcome = "success" if status == "completed" else "failed"
+            return status
+        except (ChatError, ServiceError) as error:
+            if call_id is not None and error.status in (401, 499):
+                outcome = "aborted"
+            raise ChatJobError(error.status, error.message, error.code or "chat_job_upstream_error",
+                               input_limit=getattr(error, "input_limit", None)) from None
+        except ChatJobError as error:
+            if error.code == "chat_job_session_expired":
+                outcome = "aborted"
+            elif error.code == "chat_job_no_progress":
+                outcome = "uncertain"
+            raise
+        except (httpx.HTTPError, OSError, TimeoutError):
+            outcome = "uncertain"
+            raise ChatJobError(502, "后台回复未完整收到，无法恢复本次生成。", "chat_job_interrupted") from None
+        except asyncio.CancelledError:
+            outcome = "aborted"
+            raise
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    if chunks is not None:
+                        await chunks.aclose()
+                    if upstream is not None:
+                        await upstream.aclose()
+                    if client is not None:
+                        await client.aclose()
+                finally:
+                    if call_id is not None:
+                        await asyncio.to_thread(store.finish_chat_call, call_id, outcome)
+
+    def background_chat():
+        if chat_jobs is None or not chat_jobs.ready:
+            raise ChatJobError(503, "后台聊天暂不可用。", "chat_job_unavailable")
+        return chat_jobs
+
+    async def chat_job_context(request):
+        token, owner_id, account = await context(request)
+        if not account["user"]["permissions"]["chat_api"]:
+            raise ChatError(403, CHAT_PERMISSION_REQUIRED, code="managed_ineligible")
+        return token, owner_id, account["quota"]
+
+    @router.post("/api/chat-jobs/{client_id}")
+    async def create_chat_job(client_id: str, request: Request):
+        try:
+            if request.url.query or not _origin_ok(request, origin):
+                raise ChatError(403, "请从本站发起操作。")
+            token, owner_id, quota = await chat_job_context(request)
+            jobs = background_chat()
+            async with jobs.accepting():
+                with anyio.move_on_after(60) as intake:
+                    raw = await _body(request, MAX_CHAT_JOB_BODY, "后台聊天请求过大，请缩短内容后重试。")
+                if intake.cancelled_caught:
+                    raise ChatError(408, "上传后台聊天请求超时。")
+                try:
+                    provider = provider_loader()
+                except (ValueError, OSError, KeyError, TypeError):
+                    raise ChatError(503, "聊天服务配置暂不可用。", code=MANAGED_CHAT_UNAVAILABLE) from None
+                body = await chat_request_body(raw, owner_id, provider.model, streaming=True)
+                if len(body) > MAX_CHAT_JOB_BODY:
+                    raise ChatError(413, "后台聊天请求过大，请缩短内容后重试。")
+                headers = provider_headers(request, provider)
+                headers.setdefault("Content-Type", "application/json")
+                headers["Accept"] = "text/event-stream"
+                fingerprint = sha256(headers.get("anthropic-beta", "").encode("utf-8") + b"\x00")
+                fingerprint.update(body)
+
+                async def generate(publish):
+                    return await generate_background_reply(token, owner_id, provider.origin, headers, body, publish)
+
+                await jobs.create(owner_id, client_id, fingerprint.hexdigest(), generate, quota)
+            return JSONResponse({"id": client_id}, status_code=202, headers=COMMON_HEADERS)
+        except ClientDisconnect:
+            return _error(499, "上传后台聊天请求时连接已断开。")
+        except (ChatError, ServiceError, ChatJobError) as error:
+            return _error(error.status, error.message, getattr(error, "headers", None), error.code)
+
+    @router.get("/api/chat-jobs/{client_id}/events")
+    async def get_chat_job_events(client_id: str, request: Request):
+        try:
+            if request.url.query:
+                raise ChatError(404, "接口不存在。")
+            token, owner_id, _quota = await chat_job_context(request)
+
+            async def authorize():
+                return await asyncio.to_thread(store.accounts.authenticate, token) == owner_id
+
+            events = await background_chat().get_events(owner_id, client_id, authorize)
+            return ClosingStreamingResponse(events, media_type="text/event-stream",
+                                            headers={**COMMON_HEADERS, "X-Accel-Buffering": "no"})
+        except (ChatError, ServiceError, ChatJobError) as error:
+            return _error(error.status, error.message, getattr(error, "headers", None), error.code)
+
+    @router.post("/api/chat-jobs/{client_id}/cancel")
+    async def cancel_chat_job(client_id: str, request: Request):
+        try:
+            if request.url.query or not _origin_ok(request, origin):
+                raise ChatError(403, "请从本站发起操作。")
+            _, owner_id, _quota = await chat_job_context(request)
+            await background_chat().cancel(owner_id, client_id)
+            return JSONResponse({"id": client_id}, headers=COMMON_HEADERS)
+        except (ChatError, ServiceError, ChatJobError) as error:
+            return _error(error.status, error.message, getattr(error, "headers", None), error.code)
+
     async def account_page(register, error="", status=200):
         policy = await asyncio.to_thread(store.accounts.registration_policy)
-        return HTMLResponse(_auth_page(register, error, self_service=policy["self_service"]),
-                            status_code=status, headers=COMMON_HEADERS)
+        return HTMLResponse(
+            _auth_page(register, error, self_service=policy["self_service"],
+                       official_service=origin == "https://digimonlegend.com"),
+            status_code=status, headers=COMMON_HEADERS,
+        )
 
     async def auth(request, register=False):
         if request.method == "GET":
@@ -623,7 +868,8 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                     pass
             return JSONResponse({"provider": "DeepSeek", "model": model,
                 "features": {"search": True, "files": True, "speech": True,
-                             "image_generation": image_provider is not None},
+                             "image_generation": image_provider is not None,
+                             **({"background_chat": chat_jobs.ready} if chat_jobs is not None else {})},
                 "image_model": image_provider.model if image_provider else None,
                 "user": {"id": str(owner_id), "username": user["username"], "role": user["role"],
                          "managed_eligible": permissions["chat_api"], "permissions": permissions,
@@ -894,7 +1140,7 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             if provider is None:
                 raise ChatError(503, "生图服务尚未配置，请联系管理员。", code="image_provider_disabled")
             if "text/event-stream" in request.headers.get("accept", "").lower():
-                return ImageStreamingResponse(image_events(request, token, owner_id, provider, document["prompt"]),
+                return ClosingStreamingResponse(image_events(request, token, owner_id, provider, document["prompt"]),
                     media_type="text/event-stream", headers={**COMMON_HEADERS, "X-Accel-Buffering": "no"})
             result = await generate_image(request, token, owner_id, provider, document["prompt"], watch_disconnect=True)
             return JSONResponse(result, headers=COMMON_HEADERS)
@@ -919,36 +1165,14 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                 body = await _body(request, MAX_ASR_BYTES + 65536, "录音超过 8 MiB，请缩短后重试。")
             else:
                 body = await _body(request)
-        managed_chat = route == "/anthropic/v1/messages"
+        managed_chat = route == CHAT_MESSAGES_PATH
         try:
             provider = provider_loader()
         except (ValueError, OSError, KeyError, TypeError):
             raise ChatError(503, "聊天服务配置暂不可用。",
                             code=MANAGED_CHAT_UNAVAILABLE if managed_chat else None) from None
         if managed_chat:
-            try:
-                document = json.loads(body)
-                if not isinstance(document, dict) or not isinstance(document.get("messages"), list) or not document["messages"]:
-                    raise ValueError
-                tools = document.get("tools")
-                if isinstance(tools, list) and any(isinstance(tool, dict) and tool.get("name") == "generate_image" for tool in tools):
-                    raise ChatError(409, "聊天生图调用已更新，请重新打开聊天页面后重试。", code="image_protocol_updated")
-                pending = [document]
-                while pending:
-                    value = pending.pop()
-                    if isinstance(value, dict):
-                        if value.get("type") == "file" and "file_id" in value:
-                            reference = value["file_id"]
-                            if (not isinstance(reference, str) or not FILE_ID.fullmatch(reference)
-                                    or not await asyncio.to_thread(_files, store, "owns", owner_id, reference)):
-                                raise ChatError(403, "文件不属于当前账号，请重新上传附件。")
-                        pending.extend(value.values())
-                    elif isinstance(value, list):
-                        pending.extend(value)
-                document["model"] = provider.model
-                body = json.dumps(document, ensure_ascii=False).encode("utf-8")
-            except (ValueError, UnicodeError, RecursionError):
-                raise ChatError(400, "消息格式无效。") from None
+            body = await chat_request_body(body, owner_id, provider.model)
         elif route == "/v1/tools/tts":
             try:
                 document = json.loads(body)
@@ -966,11 +1190,7 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
                 _validate_file_upload(body, content_type)
         if deletion and not await asyncio.to_thread(_files, store, "owns", owner_id, file_id):
             raise ChatError(403, "文件不属于当前账号。")
-        headers = {"Authorization": "Bearer " + provider.api_key, "x-api-key": provider.api_key,
-                   "Accept-Encoding": "identity", "User-Agent": "DeepSeek-Memory-Chat/2.0"}
-        for name in ("Content-Type", "anthropic-beta", "anthropic-version", "Accept"):
-            if name in request.headers:
-                headers[name] = request.headers[name]
+        headers = provider_headers(request, provider)
         if route == "/anthropic/v1/files":
             headers.setdefault("anthropic-beta", FILES_BETA)
         client, upstream, call_id = None, None, None
@@ -1016,14 +1236,14 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
             message = {400: "模型服务未接受此请求，请检查消息或附件。", 413: "附件超过模型服务的大小限制。",
                        415: "模型服务不支持此文件格式。", 422: "模型服务无法处理此请求。",
                        429: "模型服务繁忙或额度受限，请稍后重试。"}.get(status, "模型服务暂不可用，请稍后重试。")
-            await upstream.aclose()
-            await client.aclose()
-            if call_id:
-                await asyncio.to_thread(store.finish_chat_call, call_id, "failed")
-            if managed_chat and upstream.status_code in (401, 403):
-                raise ChatError(status, "配套聊天服务暂不可用，可以配置个人 API 后重试。",
-                                code=MANAGED_CHAT_UNAVAILABLE)
-            raise asr_failure or ChatError(status, message)
+            try:
+                chat_failure = await classified_upstream_chat_error(upstream) if managed_chat else None
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+                if call_id:
+                    await asyncio.to_thread(store.finish_chat_call, call_id, "failed")
+            raise chat_failure or asr_failure or ChatError(status, message)
         if route == "/v1/tools/asr":
             outcome = "failed"
             task = asyncio.create_task(_asr_document(upstream))
@@ -1136,6 +1356,7 @@ def build_chat_router(store, *, client_factory=None, provider_loader=None, image
         try:
             return await proxy(request, "/" + path)
         except (ChatError, ServiceError) as error:
-            return _error(error.status, error.message, getattr(error, "headers", None), getattr(error, "code", None))
+            return _error(error.status, error.message, getattr(error, "headers", None), getattr(error, "code", None),
+                          input_limit=getattr(error, "input_limit", None))
 
     return router

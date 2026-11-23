@@ -72,6 +72,10 @@ class AppController internal constructor(application: Application, databaseName:
     private val adminStatsMutex = Mutex()
     private val adminUsersMutex = Mutex()
     private val adminRegistrationMutex = Mutex()
+    private val adminPanelGuard = Any()
+    private val adminStorageRequest = AtomicInteger()
+    private val adminDiagnosticsRequest = AtomicInteger()
+    private val adminDiagnosticDetailRequest = AtomicInteger()
     private val feedbackSubmitMutex = Mutex()
     private val feedbackImageMutex = Mutex()
     private val feedbackGuard = Any()
@@ -146,6 +150,7 @@ class AppController internal constructor(application: Application, databaseName:
                 }
                 ready.complete(Unit)
             } catch (error: Exception) {
+                TechnicalDiagnostics.failure("startup", "initialize", error)
                 mutableState.update { it.copy(accountInitialized = true, notice = "本地数据加载失败。${error.message.orEmpty()}") }
                 ready.completeExceptionally(error)
             }
@@ -162,10 +167,12 @@ class AppController internal constructor(application: Application, databaseName:
 
     private suspend fun importSource(bytes: ByteArray, fileName: String, parse: () -> ImportResult): List<String> = operation {
         val startedAt = System.nanoTime()
+        var stage = "parse"
         try {
             require(fileName.isNotBlank() && fileName.length <= 1024) { "导入文件名无效或过长" }
             DiagnosticLog.record("import", "parse", mapOf("input_bytes" to bytes.size.toLong()))
             val result = parse()
+            stage = "save"
             DiagnosticLog.record("import", "save", mapOf("conversation_count" to result.conversations.size.toLong(),
                 "message_count" to result.conversations.sumOf { conversation -> conversation.branches.sumOf { it.messages.size.toLong() } }))
             mutex.withLock {
@@ -197,7 +204,18 @@ class AppController internal constructor(application: Application, databaseName:
             if (error !is CancellationException) {
                 DiagnosticLog.record("import", "failed",
                     mapOf("input_bytes" to bytes.size.toLong(), "elapsed_ms" to (System.nanoTime() - startedAt) / 1_000_000), error)
-                if (error is Exception) viewModelScope.launch { prepareDiagnosticsIdentity() }
+                val sizeBand = when {
+                    bytes.isEmpty() -> "empty"
+                    bytes.size <= 256 * 1024 -> "up_to_256_kib"
+                    bytes.size <= 1024 * 1024 -> "up_to_1_mib"
+                    bytes.size <= 8 * 1024 * 1024 -> "up_to_8_mib"
+                    bytes.size <= 32 * 1024 * 1024 -> "up_to_32_mib"
+                    else -> "over_32_mib"
+                }
+                TechnicalDiagnostics.failure("import", stage, error, elapsedMs = (System.nanoTime() - startedAt) / 1_000_000,
+                    detail = if (stage == "save") "import_save"
+                        else (error as? app.banzhan.deepseekcontinuation.core.ImportFailure)?.detail ?: "import_validation",
+                    inputFormat = DeepSeekImporter.inputFormat(bytes, fileName), inputSizeBand = sizeBand)
             }
             throw error
         }
@@ -296,6 +314,8 @@ class AppController internal constructor(application: Application, databaseName:
                         quotaLoading = false, quotaError = null) }
                 }
             } catch (error: Exception) {
+                if (error is SummaryFailure || error is java.io.IOException || error is kotlinx.serialization.SerializationException)
+                    TechnicalDiagnostics.failure("account", "request", error, unexpectedOnly = true)
                 if (error !is CancellationException) mutableState.update {
                     it.copy(account = it.account.copy(error = error.message ?: "账户登录失败，请稍后再试。"))
                 }
@@ -406,28 +426,6 @@ class AppController internal constructor(application: Application, databaseName:
         Unit
     }
 
-    /** Diagnostics reuse the same anonymous account and never start a model request. */
-    suspend fun prepareDiagnosticsIdentity() = withContext(Dispatchers.IO) {
-        try {
-            ready.await()
-            val current = state.value.settings
-            if (!DiagnosticPrivacy.usesCompanion(current.mode, current.companionUrl)) {
-                return@withContext
-            }
-            if (current.trialToken.isNotBlank()) {
-                DiagnosticLog.bindAnonymousIdentity(current.mode, current.companionUrl, current.trialToken)
-                return@withContext
-            }
-            if (!DiagnosticLog.shouldAcquireIdentity()) return@withContext
-            val identity = ensureCompanionIdentity(requireFreeMode = false, diagnosticsOnly = true)
-            DiagnosticLog.bindAnonymousIdentity(identity.mode, identity.companionUrl, identity.trialToken)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            // Retain local reports; a later foreground retries without disrupting the user.
-        }
-    }
-
     /** Read-only preflight. A passed check does not reserve funds or call a model. */
     suspend fun checkOrganizationAvailability(): String? = operation {
         try {
@@ -470,7 +468,7 @@ class AppController internal constructor(application: Application, databaseName:
     }
 
     private suspend fun ensureCompanionIdentity(requireFreeMode: Boolean = true,
-        diagnosticsOnly: Boolean = false, allowLegacyCreate: Boolean = false): ServiceSettings {
+        allowLegacyCreate: Boolean = false): ServiceSettings {
         val snapshot = validateSettings(if (requireFreeMode) state.value.organizationSettings else state.value.settings)
         if (requireFreeMode) {
             require(snapshot.mode == "companion") { "当前使用自己的 AI 服务。" }
@@ -480,13 +478,12 @@ class AppController internal constructor(application: Application, databaseName:
             }
             return snapshot.copy(trialToken = session.token)
         }
-        require(!diagnosticsOnly || DiagnosticPrivacy.usesCompanion(snapshot.mode, snapshot.companionUrl)) { "诊断服务设置已改变" }
-        // Feedback may explicitly acquire a legacy identity. Startup, diagnostics and exports only reuse one.
+        // Feedback may explicitly acquire a legacy identity. Exports only reuse one.
         return sessionMutex.withLock {
             val identityKey = companionIdentityKey(snapshot.companionUrl)
             val existing = snapshot.trialToken.ifBlank { credentials.get(identityKey) }
             val token = if (existing.isNotBlank()) existing else {
-                require(allowLegacyCreate && !diagnosticsOnly) { "尚无可用的意见记录身份。" }
+                require(allowLegacyCreate) { "尚无可用的意见记录身份。" }
                 organizationNetwork.createSession(snapshot).token
             }
             require(token.isNotBlank()) { "服务未返回有效身份，请稍后再试。" }
@@ -704,88 +701,163 @@ class AppController internal constructor(application: Application, databaseName:
         }
     }
 
-    suspend fun refreshAdminUsers(limit: Int = 50, offset: Int = 0) = withContext(Dispatchers.IO) {
+    suspend fun refreshAdminStorage() = requestAdminPanel(
+        sequence = adminStorageRequest,
+        loading = { it.copy(adminStorageLoading = true, adminStorageError = null) },
+        loaded = { state, snapshot -> state.copy(adminStorage = snapshot, adminStorageLoading = false) },
+        failed = { state, message -> state.copy(adminStorageLoading = false, adminStorageError = message) },
+        fallbackMessage = "存储用量读取失败，请重试。",
+        fetch = AdminNetwork::getStorage,
+    )
+
+    suspend fun refreshAdminDiagnostics(
+        range: AdminDiagnosticsRange = AdminDiagnosticsRange.LAST_24_HOURS,
+        status: AdminDiagnosticsStatus = AdminDiagnosticsStatus.PENDING,
+        access: DeveloperPrefs? = null,
+    ) = requestAdminPanel(
+        sequence = adminDiagnosticsRequest,
+        loading = { it.copy(adminDiagnosticsLoading = true, adminDiagnosticsError = null) },
+        loaded = { state, page -> state.copy(adminDiagnostics = page, adminDiagnosticsLoading = false) },
+        failed = { state, message -> state.copy(adminDiagnosticsLoading = false, adminDiagnosticsError = message) },
+        fallbackMessage = "故障诊断列表读取失败，请重试。",
+        expectedAccess = access,
+        fetch = { AdminNetwork.getDiagnostics(it, range, status) },
+    )
+
+    suspend fun loadAdminDiagnostic(eventId: String, access: DeveloperPrefs? = null) = requestAdminPanel(
+        sequence = adminDiagnosticDetailRequest,
+        loading = { it.copy(adminDiagnosticDetail = null, adminDiagnosticDetailLoading = true, adminDiagnosticDetailError = null) },
+        loaded = { state, detail -> state.copy(adminDiagnosticDetail = detail, adminDiagnosticDetailLoading = false) },
+        failed = { state, message -> state.copy(adminDiagnosticDetailLoading = false, adminDiagnosticDetailError = message) },
+        fallbackMessage = "故障详情读取失败，请重试。",
+        expectedAccess = access,
+        fetch = { AdminNetwork.getDiagnostic(it, eventId) },
+    )
+
+    suspend fun setAdminDiagnosticResolution(access: DeveloperPrefs, change: AdminDiagnosticResolution): Int {
         ready.await()
-        adminUsersMutex.withLock {
-            mutableState.update { it.copy(adminUsers = null, adminUsersLoading = true, adminUsersError = null) }
-            try {
-                val access = state.value.developerPrefs
-                val users = withDeveloperSession(access) { AdminNetwork.getUsers(it, limit, offset) }
-                publishAdmin(access) { it.copy(adminUsers = users) }
-            } catch (error: Exception) {
-                if (error !is CancellationException && state.value.developerPrefs.sessionToken.isNotBlank()) {
-                    mutableState.update { it.copy(adminUsersError = error.message ?: "注册用户统计读取失败。") }
-                }
-                throw error
-            } finally { mutableState.update { it.copy(adminUsersLoading = false) } }
+        val updated = withDeveloperSession(access) { AdminNetwork.setDiagnosticResolution(it, change) }
+        synchronized(adminPanelGuard) {
+            if (state.value.developerPrefs != access) throw CancellationException("管理登录状态已改变")
+            adminDiagnosticsRequest.incrementAndGet()
+            publishAdmin(access) { it.copy(adminDiagnosticsLoading = false) }
+        }
+        return updated
+    }
+
+    fun clearAdminDiagnostic() = synchronized(adminPanelGuard) {
+        adminDiagnosticDetailRequest.incrementAndGet()
+        mutableState.update { it.copy(adminDiagnosticDetail = null, adminDiagnosticDetailLoading = false, adminDiagnosticDetailError = null) }
+    }
+
+    private suspend fun <T> requestAdminPanel(
+        sequence: AtomicInteger,
+        loading: (AppState) -> AppState,
+        loaded: (AppState, T) -> AppState,
+        failed: (AppState, String?) -> AppState,
+        fallbackMessage: String,
+        expectedAccess: DeveloperPrefs? = null,
+        fetch: suspend (DeveloperPrefs) -> T,
+    ) {
+        ready.await()
+        val (access, request) = synchronized(adminPanelGuard) {
+            val access = state.value.developerPrefs
+            if (expectedAccess != null && access != expectedAccess) return
+            val request = sequence.incrementAndGet()
+            publishAdmin(access, loading)
+            access to request
+        }
+        fun publishLatest(action: (AppState) -> AppState) = synchronized(adminPanelGuard) {
+            if (sequence.get() == request) publishAdmin(access, action)
+        }
+        try {
+            val result = withContext(Dispatchers.IO) { withDeveloperSession(access, fetch) }
+            publishLatest { loaded(it, result) }
+        } catch (cancelled: CancellationException) {
+            publishLatest { failed(it, null) }
+            throw cancelled
+        } catch (error: Exception) {
+            publishLatest { failed(it, error.message ?: fallbackMessage) }
         }
     }
 
+    suspend fun refreshAdminUsers(
+        limit: Int = 50,
+        offset: Int = 0,
+        query: String = "",
+        statusFilter: AdminUserStatusFilter = AdminUserStatusFilter.ALL,
+    ) = withAdminUsersLoading("用户列表读取失败。") { access ->
+        val users = loadAdminUsers(access, limit, offset, query, statusFilter)
+        publishAdmin(access) { it.copy(adminUsers = users) }
+    }
+
+    private suspend fun loadAdminUsers(
+        access: DeveloperPrefs,
+        limit: Int,
+        offset: Int,
+        query: String,
+        statusFilter: AdminUserStatusFilter,
+    ): AdminUsersPage = AdminNetwork.getUsersPage(limit, offset, query, statusFilter) { size, start ->
+        withDeveloperSession(access) { AdminNetwork.getUsers(it, size, start) }
+    }
+
     suspend fun updateAdminUserQuota(userId: String, weeklyLimit: Int?, thisWeekRemaining: Int? = null, week: String? = null) =
-        withContext(Dispatchers.IO) {
-            ready.await()
-            adminUsersMutex.withLock {
-                val page = state.value.adminUsers
-                mutableState.update { it.copy(adminUsersLoading = true, adminUsersError = null) }
-                try {
-                    val access = state.value.developerPrefs
-                    val users = withDeveloperSession(access) { prefs ->
-                        AdminNetwork.updateUserQuota(prefs, userId, weeklyLimit, thisWeekRemaining, week)
-                        AdminNetwork.getUsers(prefs, page?.limit ?: 50, page?.offset ?: 0)
-                    }
-                    publishAdmin(access) { it.copy(adminUsers = users, quota = null, quotaError = null) }
-                } catch (error: Exception) {
-                    if (error !is CancellationException) mutableState.update {
-                        it.copy(adminUsersError = error.message ?: "个人额度保存失败，请刷新确认。")
-                    }
-                    throw error
-                } finally { mutableState.update { it.copy(adminUsersLoading = false) } }
-            }
+        changeAdminUser("个人额度保存失败，请刷新确认。") {
+            AdminNetwork.updateUserQuota(it, userId, weeklyLimit, thisWeekRemaining, week)
         }
 
     suspend fun setAdminUserEnabled(userId: String, enabled: Boolean) =
-        changeAdminUser { AdminNetwork.setUserEnabled(it, userId, enabled) }
+        changeAdminUser("用户状态更新失败，请刷新确认。") { AdminNetwork.setUserEnabled(it, userId, enabled) }
 
     suspend fun updateAdminUserPermissions(userId: String, permissions: ServicePermissions) {
-        changeAdminUser { AdminNetwork.updateUserPermissions(it, userId, permissions) }
+        changeAdminUser("用户权限更新失败，请刷新确认。") { AdminNetwork.updateUserPermissions(it, userId, permissions) }
         if (state.value.account.currentUser?.id == userId) {
             updateAccountProfile(expectedOwnerId = userId) { accountNetwork.me(it) }
         }
     }
 
-    private suspend fun changeAdminUser(action: suspend (DeveloperPrefs) -> Unit) = withContext(Dispatchers.IO) {
-        ready.await()
-        adminUsersMutex.withLock {
+    private suspend fun changeAdminUser(errorMessage: String, action: suspend (DeveloperPrefs) -> Unit) =
+        withAdminUsersLoading(errorMessage) { access ->
             val page = state.value.adminUsers
-            mutableState.update { it.copy(adminUsersLoading = true, adminUsersError = null) }
+            withDeveloperSession(access, action)
+            publishAdmin(access) { it.copy(quota = null, quotaError = null) }
             try {
-                val access = state.value.developerPrefs
-                val users = withDeveloperSession(access) { prefs ->
-                    action(prefs)
-                    AdminNetwork.getUsers(prefs, page?.limit ?: 25, page?.offset ?: 0)
-                }
-                publishAdmin(access) { it.copy(adminUsers = users, quota = null, quotaError = null) }
+                val users = loadAdminUsers(access, page?.limit ?: 50, page?.offset ?: 0,
+                    page?.query.orEmpty(), page?.statusFilter ?: AdminUserStatusFilter.ALL)
+                publishAdmin(access) { it.copy(adminUsers = users) }
             } catch (error: Exception) {
-                if (error !is CancellationException) mutableState.update {
-                    it.copy(adminUsersError = error.message ?: "用户状态更新失败，请刷新确认。")
+                if (error is CancellationException || state.value.developerPrefs != access) throw error
+                publishAdmin(access) {
+                    it.copy(adminUsersError = "修改已保存，用户列表刷新失败。请重新刷新列表。")
                 }
-                throw error
-            } finally { mutableState.update { it.copy(adminUsersLoading = false) } }
+            }
         }
-    }
 
-    suspend fun resetAdminUserPassword(userId: String): AdminPasswordReset = withContext(Dispatchers.IO) {
+    suspend fun createAdminPasswordResetLink(userId: String): AdminPasswordResetLink =
+        withAdminUsersLoading("暂时无法生成重置链接，请稍后重试。") { access ->
+            withDeveloperSession(access) { AdminNetwork.createPasswordResetLink(it, userId) }
+        }
+
+    private suspend fun <T> withAdminUsersLoading(
+        errorMessage: String,
+        action: suspend (DeveloperPrefs) -> T,
+    ): T {
         ready.await()
-        adminUsersMutex.withLock {
-            mutableState.update { it.copy(adminUsersLoading = true, adminUsersError = null) }
-            try {
-                withDeveloperSession { AdminNetwork.resetUserPassword(it, userId) }
-            } catch (error: Exception) {
-                if (error !is CancellationException) mutableState.update {
-                    it.copy(adminUsersError = error.message ?: "密码重置结果不明，请刷新后确认。")
+        val access = state.value.developerPrefs
+        return withContext(Dispatchers.IO) {
+            adminUsersMutex.withLock {
+                publishAdmin(access) { it.copy(adminUsersLoading = true, adminUsersError = null) }
+                try {
+                    action(access)
+                } catch (error: Exception) {
+                    if (error !is CancellationException) {
+                        publishAdmin(access) { it.copy(adminUsersError = error.message ?: errorMessage) }
+                    }
+                    throw error
+                } finally {
+                    publishAdmin(access) { it.copy(adminUsersLoading = false) }
                 }
-                throw error
-            } finally { mutableState.update { it.copy(adminUsersLoading = false) } }
+            }
         }
     }
 
@@ -861,13 +933,19 @@ class AppController internal constructor(application: Application, databaseName:
         }
     }
 
-    private fun clearDeveloperState(prefs: DeveloperPrefs, error: String? = null) {
+    private fun clearDeveloperState(prefs: DeveloperPrefs, error: String? = null) = synchronized(adminPanelGuard) {
         adminFeedbackRequest.incrementAndGet()
         adminFeedbackDetailRequest.incrementAndGet()
+        adminStorageRequest.incrementAndGet()
+        adminDiagnosticsRequest.incrementAndGet()
+        adminDiagnosticDetailRequest.incrementAndGet()
         mutableState.update { it.copy(developerPrefs = prefs, adminConfig = null, adminLoading = false, adminError = error,
             adminOpenPermissions = null, adminOpenPermissionsLoading = false, adminOpenPermissionsError = null,
             adminSelfServiceRegistration = null, adminSelfServiceRegistrationLoading = false, adminSelfServiceRegistrationError = null,
             adminStats = null, adminStatsLoading = false, adminStatsError = null,
+            adminStorage = null, adminStorageLoading = false, adminStorageError = null,
+            adminDiagnostics = null, adminDiagnosticsLoading = false, adminDiagnosticsError = null,
+            adminDiagnosticDetail = null, adminDiagnosticDetailLoading = false, adminDiagnosticDetailError = null,
             adminUsers = null, adminUsersLoading = false, adminUsersError = null,
             adminRegistrationInvites = null, adminRegistrationLoading = false, adminRegistrationError = null,
             adminFeedback = null, adminFeedbackLoading = false, adminFeedbackError = null,
@@ -1485,6 +1563,10 @@ class AppController internal constructor(application: Application, databaseName:
                 secretRef = secretRef.ifBlank { "task:$taskId" }
                 // A logout revokes the old token. Only this explicit same-owner resume rebinds it.
                 credentials.put(secretRef, session!!.token)
+            } else if (task.needsPersonalKey) {
+                val key = replacementOrganizationKey(task.settings, state.value.organizationSettings)
+                secretRef = secretRef.ifBlank { "task:$taskId" }
+                credentials.put(secretRef, key)
             } else if (secretRef.isBlank() || credentials.get(secretRef).isBlank()) {
                 val current = state.value.organizationSettings
                 val secret = if (task.settings.mode == "companion") {
@@ -1503,7 +1585,7 @@ class AppController internal constructor(application: Application, databaseName:
             DiagnosticLog.record("task", "resume", mapOf("chunk_count" to chunks.size.toLong(),
                 "chunk_index" to chunks.count { it.completed }.toLong()))
             saveTask(task.copy(secretRef = secretRef, chunks = chunks, status = "queued", cancelRequested = false,
-                inFlight = false, uncertain = false, message = "继续已保存进度"))
+                inFlight = false, uncertain = false, personalKeyRejected = false, message = "继续已保存进度"))
             refresh()
         }
         launchTask(taskId)
@@ -1794,7 +1876,8 @@ class AppController internal constructor(application: Application, databaseName:
                 val task = dao.task(taskId)?.decodeTask() ?: return
                 val failures = (error as? TaskDispatchException)?.failures.orEmpty()
                 val primary = failures.firstOrNull()?.error ?: error
-                if (primary is SummaryFailure && primary.statusCode == 401 &&
+                val rejectedKey = task.settings.mode == "byok" && (primary as? SummaryFailure)?.statusCode == 401
+                if (task.settings.mode == "companion" && primary is SummaryFailure && primary.statusCode == 401 &&
                     currentAccount?.token == credentials.get(task.secretRef)) {
                     clearAccountLocked("账户登录已过期，请重新登录。")
                 }
@@ -1803,12 +1886,26 @@ class AppController internal constructor(application: Application, databaseName:
                     put("chunk_index", task.chunks.count { it.completed }.toLong())
                     if (primary is SummaryFailure) primary.statusCode?.let { put("http_status", it.toLong()) }
                 }, primary)
-                viewModelScope.launch { prepareDiagnosticsIdentity() }
                 if (!task.cancelRequested) {
-                    saveTask(if (failures.isNotEmpty()) task.afterDispatchFailures(failures)
+                    val summary = primary as? SummaryFailure
+                    val detail = when {
+                        summary?.statusCode == 401 -> "authentication_rejected"
+                        summary?.failureDetail != null -> summary.failureDetail
+                        summary?.statusCode != null -> "upstream_http"
+                        else -> "organization_local"
+                    }
+                    TechnicalDiagnostics.failure("organization",
+                        if (detail == "network_before_headers" || detail == "organization_local") "request" else "response",
+                        primary, detail = detail, serviceMode = if (task.settings.mode == "byok") "personal" else "managed")
+                }
+                if (!task.cancelRequested) {
+                    val paused = if (failures.isNotEmpty()) task.afterDispatchFailures(failures)
                         else task.withoutInFlight().copy(status = "paused", uncertain = task.uncertain ||
                             (if (primary is SummaryFailure) primary.ambiguous || primary.expired else task.hasUncertainRequest()),
-                            message = primary.message?.take(1500) ?: "整理暂停，请检查网络和服务设置"))
+                            message = primary.message?.take(1500) ?: "整理暂停，请检查网络和服务设置")
+                    saveTask(if (rejectedKey) paused.copy(personalKeyRejected = true,
+                        message = "个人 API 拒绝了请求（HTTP 401）。请到聊天 API 设置检查或更新 Key，保存后继续整理。")
+                        else paused)
                 }
                 refresh()
                 scheduleQuotaRefresh(task)

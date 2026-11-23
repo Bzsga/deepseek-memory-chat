@@ -31,6 +31,7 @@ import { closeMobileSider } from '../components/sider/mobileSiderState.js'
 import { MobileSider, Sider } from '../components/sider/Sider.js'
 import styles from './App.module.css'
 import { PendingShareContinuation } from '../components/session/ShareContinuation.js'
+import { DiagnosticConsentNotice, TechnicalDiagnosticsDialogHost, openTechnicalDiagnostics } from '../components/settings/TechnicalDiagnostics.js'
 
 export const App = () => {
   const t = useTranslate()
@@ -50,7 +51,8 @@ export const App = () => {
   const sessionLoadError = useChatStore((state) =>
     state.activeId === null ? false : state.sessionLoadErrors[state.activeId] === true
   )
-  const frameRef = useMobileViewport(isMobile)
+  // Old WebViews can resolve both absolute stretching and vh to zero on wide screens.
+  const frameRef = useMobileViewport(isMobile || !CSS.supports('inset', '0px'))
   const streaming = useChatStore((state) =>
     state.activeId === null ? false : Object.hasOwn(state.streaming, state.activeId)
   )
@@ -91,6 +93,7 @@ export const App = () => {
       <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : siderCollapsed ? null : <Sider />}
         <main className={styles.main}>
+          {ready ? <DiagnosticConsentNotice /> : null}
           {saveError ? (
             <div className={styles.saveError} role="alert">
               <span>{t('sessionSaveFailed')}</span>
@@ -101,6 +104,9 @@ export const App = () => {
                 onClick={retrySaveSessions}
               >
                 {t('retry')}
+              </Button>
+              <Button variant="outlined" size="s" onClick={openTechnicalDiagnostics}>
+                {t('diagnosticsView')}
               </Button>
             </div>
           ) : null}
@@ -148,6 +154,7 @@ export const App = () => {
       <SettingsDialog />
       <ChatProviderDialog />
       <GuestHistoryMigration />
+      <TechnicalDiagnosticsDialogHost />
       <Toast />
       {ready ? <PendingShareContinuation /> : null}
     </>

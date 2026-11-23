@@ -80,7 +80,6 @@ class AccountPersistenceTest {
             assertTrue(runCatching { controller.refreshQuota() }.isFailure)
             val ids = controller.state.value.conversations.single().branches.single().messages.map { it.id }.toSet()
             assertTrue(runCatching { controller.organize(archiveId, conversationId, branchId, ids) }.isFailure)
-            controller.prepareDiagnosticsIdentity()
             assertEquals(0, network.sessions.get())
             assertEquals(0, network.quotaReads.get())
             assertTrue(network.submissions.isEmpty())

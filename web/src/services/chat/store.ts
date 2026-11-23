@@ -2,22 +2,27 @@ import { activeImageProvider, imageConfigurationIdentity, requestPersonalImage }
 import { create } from 'zustand'
 import { createId } from '../../utils/id.js'
 import { openChatProviderForIssue, type ChatProviderIssue } from '../../components/settings/settingsDialogState.js'
-import { ApiError, streamMessage } from '../api/client.js'
+import { ApiError, cancelBackgroundChat, captureBackgroundChatTransport, streamBackgroundChat, streamMessage } from '../api/client.js'
+import { reportApiFailure } from '../api/serviceDiagnostics.js'
+import { recordDiagnostic } from '../technicalDiagnostics.js'
 import {
   cancelRemoteImageJob, createImageJob, getImageJob, getImageJobResult,
   imageJobIsTerminal, type ImageJob, type LocalImageJob,
 } from '../api/imageJobs.js'
-import type { ChatModel, CreateMessageRequest } from '../api/types.js'
-import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
-import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
-import { getChatProviderScope, isFileProviderScope } from '../chatProvider.js'
+import type { ChatModel, CreateMessageRequest, MessageStreamEvent } from '../api/types.js'
+import { ChatInputLimitError, extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
+import { cancelUpload, describeUploadError, getFileExt, uploadAttachment, useUploads } from '../attachments.js'
+import { captureChatProvider, getChatProviderScope, isFileProviderScope, useChatProvider } from '../chatProvider.js'
 import { IMAGE_EDIT_ACCEPT, MAX_IMAGE_EDIT_MB, resolveImageEditSources } from '../imageEditSource.js'
+import type { McpSettings } from '../personalMcp.js'
 import { modelParameters, replyStylePrompt } from '../replyPreferences.js'
 import { useSettings } from '../settings.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
+import { captureChatMcpSettings, initializeChatMcpTurn, loadChatMcpTools, moveChatMcpSelection,
+  runChatMcpInvocation, subscribeChatMcpSettings } from './chatMcp.js'
 import * as db from './db.js'
 import { validateSharedSource } from './sharedSource.js'
-import { filterImageActionEvent, finishImageActionText, imageActionPrompt, imageActionSystem, isDirectImageEditRequest,
+import { filterImageActionEvent, finishImageActionText, imageActionPrompt, imageActionReminder, imageActionSystem, isDirectImageEditRequest,
   imageActionTrace, newImageActionNonce, newImageActionStream } from './imageAction.js'
 import {
   clearAllDrafts,
@@ -48,6 +53,12 @@ import {
   releaseGeneratedImage,
 } from './imageGeneration.js'
 import { createLatestReminder } from './latestReminder.js'
+import { clearSavedReadingPositions } from './readingPosition.js'
+import { LargeTxtError, MAX_LARGE_TXT_BYTES, prepareLargeTxt, type LargeTxtEvidence } from './largeTxt.js'
+import { readWholeTxt, runLargeTxt } from './largeTxtRun.js'
+import { refreshWeeklyQuota, useWeeklyQuota } from '../weeklyQuota.js'
+import { streamMcpChat } from './mcpChatStream.js'
+import { normalizeMcpSources, type McpSource } from './mcpSources.js'
 import {
   applyEvent,
   canContinueReply,
@@ -61,6 +72,7 @@ import {
   toSessionSummary,
   type AssistantMessage,
   type FileAttachment,
+  type LocalChatJob,
   type Message,
   type Session,
   type SessionSummary,
@@ -95,6 +107,13 @@ const serverTools = (search: boolean): CreateMessageRequest['tools'] => {
 /** 允许自动补标题的请求；手动重命名后取消本轮标题写入，包含主动清空标题的情况。 */
 const titleRequests = new Set<AbortController>()
 
+type LargeTxtActivity = {
+  messageId: string
+  stage: 'prepare' | 'whole' | 'read' | 'combine'
+  completed: number
+  total: number
+}
+
 type ChatState = {
   ready: boolean
   initError: boolean
@@ -109,6 +128,7 @@ type ChatState = {
   activeId: string | null
   /** 正在生成回复的会话 */
   streaming: Record<string, AbortController>
+  largeTxtActivity: Record<string, LargeTxtActivity>
   memoryActivity: Record<string, MemoryActivity>
 }
 
@@ -122,6 +142,7 @@ export const useChatStore = create<ChatState>(() => ({
   sessionSaveErrors: {},
   activeId: null,
   streaming: {},
+  largeTxtActivity: {},
   memoryActivity: {},
 }))
 
@@ -140,16 +161,24 @@ const getStreamController = (id: string) => {
   return Object.hasOwn(streams, id) ? streams[id] : undefined
 }
 
-const sameSummary = (a: SessionSummary, b: SessionSummary) =>
-  a.title === b.title && a.createdAt === b.createdAt && a.updatedAt === b.updatedAt &&
-  toSessionSummary(a).pendingImageJob === toSessionSummary(b).pendingImageJob
+const sameSummary = (a: SessionSummary, b: SessionSummary) => {
+  if (a.title !== b.title || a.createdAt !== b.createdAt || a.updatedAt !== b.updatedAt) {return false}
+  const left = toSessionSummary(a)
+  const right = toSessionSummary(b)
+  return left.pendingImageJob === right.pendingImageJob && left.pendingChatJob === right.pendingChatJob
+}
 
 const sessionAccess = new Map<string, number>()
 const unsavedSessions = new Set<string>()
 const sessionVersions = new Map<string, number>()
-const saveLocalSession = async (session: Session, files: db.StoredFile[] = []): Promise<void> => {
-  const version = await db.saveSession(session, files, sessionVersions.get(session.id) ?? 0)
-  sessionVersions.set(session.id, version)
+const saveLocalSession = async (session: Session, files: db.StoredFile[] = [], firstChatCheckpoint = false) => {
+  const pending = firstChatCheckpoint ? undefined : session.messages.find((message): message is PendingChatReply =>
+    message.role === 'assistant' && Boolean(message.chatJob))
+  const version = await db.saveSession(session, files, sessionVersions.get(session.id) ?? 0,
+    pending ? { replyId: pending.id, jobId: pending.chatJob.id, requestCancel: pending.chatJob.cancelRequested,
+      eventsSeen: pending.chatJob.cancelRequested ? undefined : (pending.chatJob.eventsSeen ?? 0) } : undefined)
+  if (version) {sessionVersions.set(session.id, version)}
+  return version
 }
 /** 保存失败时保留原件，重试成功后才释放。 */
 const pendingFiles = new Map<string, db.StoredFile[]>()
@@ -161,6 +190,10 @@ const continuationTasks = new Map<string, Promise<void>>()
 const importedSessionTasks = new Map<string, Promise<string>>()
 const streamFlushes = new Map<string, () => void>()
 const imageWatches = new Map<string, { messageId: string; controller: AbortController; mode: 'create' | 'resume' | 'cancel' }>()
+type PendingChatReply = AssistantMessage & { chatJob: LocalChatJob }
+const pendingChatReply = (id: string): PendingChatReply | undefined => getSession(id)?.messages.find(
+  (message): message is PendingChatReply => message.role === 'assistant' && Boolean(message.chatJob)
+)
 let accessSequence = 0
 let historyEpoch = 0
 let initTask: Promise<void> | undefined
@@ -218,15 +251,28 @@ const updateSession = (id: string, update: (session: Session) => Session) =>
     }
   })
 
+const withReply = (session: Session, reply: AssistantMessage): Session => ({
+  ...session,
+  messages: session.messages.map((message) =>
+    message.id === reply.id
+      ? { ...reply, parentId: message.parentId, selectedChildId: message.selectedChildId }
+      : message
+  ),
+})
+
 const updateReply = (sessionId: string, reply: AssistantMessage) =>
-  updateSession(sessionId, (session) => ({
-    ...session,
-    messages: session.messages.map((message) =>
-      message.id === reply.id
-        ? { ...reply, parentId: message.parentId, selectedChildId: message.selectedChildId }
-        : message
-    ),
-  }))
+  updateSession(sessionId, (session) => withReply(session, reply))
+
+const restoreSavedChatReply = async (sessionId: string, replyId: string, live: () => boolean) => {
+  const saved = await db.loadSession(sessionId)
+  if (!saved || !live()) {return}
+  const reply = saved.messages.find((item) => item.id === replyId)
+  if (reply?.role === 'assistant') {
+    unsavedSessions.delete(sessionId)
+    sessionVersions.set(sessionId, db.storedSessionVersion(saved))
+    updateReply(sessionId, reply)
+  }
+}
 
 const persist = (sessionId: string) => {
   const session = getSession(sessionId)
@@ -238,8 +284,16 @@ const persist = (sessionId: string) => {
     const epoch = historyEpoch
     const files = pendingFiles.get(sessionId)
     void saveLocalSession(session, files)
-      .then(() => {
+      .then(async (version) => {
         if (epoch !== historyEpoch || !getSession(sessionId)) {
+          return
+        }
+        const pending = pendingChatReply(sessionId)
+        if (version === 0) {
+          const sameView = () => epoch === historyEpoch && !getStreamController(sessionId) && getSession(sessionId) === session
+          if (pending && sameView()) {
+            await restoreSavedChatReply(sessionId, pending.id, sameView)
+          }
           return
         }
         if (pendingFiles.get(sessionId) === files) {
@@ -259,7 +313,7 @@ const persist = (sessionId: string) => {
         }
       })
       .catch((error: unknown) => {
-        db.reportStorageError('save session')(error)
+        db.reportStorageError('save session', 'save')(error)
         if (epoch === historyEpoch && getSession(sessionId)) {
           set((state) => ({
             sessionSaveErrors: { ...state.sessionSaveErrors, [sessionId]: true },
@@ -277,9 +331,12 @@ export const retrySaveSessions = () => {
 
 /** 离开前先合并尚未绘制的增量；隐藏期间浏览器可能暂停动画帧。 */
 export const bindChatPersistence = () => {
-  const resumeImages = () => {
+  const resumeJobs = () => {
     if (document.visibilityState !== 'hidden' && isSessionActive()) {
-      for (const id of Object.keys(get().sessionCache)) {resumeSessionImageJobs(id)}
+      for (const id of Object.keys(get().sessionCache)) {resumeSessionJobs(id)}
+      for (const summary of get().sessions) {
+        if (summary.pendingChatJob && !getSession(summary.id)) {void ensureSessionLoaded(summary.id)}
+      }
     }
   }
   const save = () => {
@@ -300,20 +357,20 @@ export const bindChatPersistence = () => {
     if (document.visibilityState === 'hidden') {
       save()
     } else {
-      resumeImages()
+      resumeJobs()
     }
   }
   document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('pagehide', save)
-  window.addEventListener('focus', resumeImages)
-  window.addEventListener('online', resumeImages)
-  window.addEventListener('pageshow', resumeImages)
+  window.addEventListener('focus', resumeJobs)
+  window.addEventListener('online', resumeJobs)
+  window.addEventListener('pageshow', resumeJobs)
   return () => {
     document.removeEventListener('visibilitychange', onVisibilityChange)
     window.removeEventListener('pagehide', save)
-    window.removeEventListener('focus', resumeImages)
-    window.removeEventListener('online', resumeImages)
-    window.removeEventListener('pageshow', resumeImages)
+    window.removeEventListener('focus', resumeJobs)
+    window.removeEventListener('online', resumeJobs)
+    window.removeEventListener('pageshow', resumeJobs)
   }
 }
 
@@ -337,7 +394,7 @@ const createReply = (): AssistantMessage => {
 const settleInterrupted = (session: Session): Session => {
   if (
     !session.messages.some(
-      (m) => m.role === 'assistant' && !m.imageJob && (m.status === 'pending' || m.status === 'streaming')
+      (m) => m.role === 'assistant' && !m.imageJob && !m.chatJob && (m.status === 'pending' || m.status === 'streaming')
     )
   ) {
     return session
@@ -345,7 +402,7 @@ const settleInterrupted = (session: Session): Session => {
   return {
     ...session,
     messages: session.messages.map((m) =>
-      m.role === 'assistant' && !m.imageJob && (m.status === 'pending' || m.status === 'streaming')
+      m.role === 'assistant' && !m.imageJob && !m.chatJob && (m.status === 'pending' || m.status === 'streaming')
         ? settleReply(m, 'stopped', session.updatedAt)
         : m
     ),
@@ -366,7 +423,7 @@ export const initChat = (): Promise<void> => {
       const summaries = await db.loadSessionSummaries()
       if (epoch === historyEpoch) {
         const sorted = sortSessions(summaries)
-        const pending = sorted.filter((summary) => summary.pendingImageJob)
+        const pending = sorted.filter((summary) => summary.pendingImageJob || summary.pendingChatJob)
         set({ ready: true, sessions: sorted, ...(pending[0] ? { activeId: pending[0].id } : {}) })
         for (const summary of pending) {
           void ensureSessionLoaded(summary.id)
@@ -375,7 +432,7 @@ export const initChat = (): Promise<void> => {
     } catch (error) {
       if (epoch === historyEpoch) {
         set({ initError: true })
-        db.reportStorageError('read local sessions')(error)
+        db.reportStorageError('read local sessions', 'read')(error)
       }
     } finally {
       if (epoch === historyEpoch) {
@@ -389,7 +446,7 @@ export const initChat = (): Promise<void> => {
 /** 同一会话合并并发读取；切换只改变 activeId，旧请求不会把界面切回去。 */
 const ensureSessionLoaded = (id: string): Promise<void> => {
   if (getSession(id)) {
-    resumeSessionImageJobs(id)
+    resumeSessionJobs(id)
     return Promise.resolve()
   }
   const pending = sessionLoads.get(id)
@@ -425,12 +482,12 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
       if (session !== stored) {
         persist(id)
       }
-      resumeSessionImageJobs(id)
+      resumeSessionJobs(id)
       trimSessionCache()
     } catch (error) {
       if (epoch === historyEpoch && sessionLoads.get(id) === load) {
         set((state) => ({ sessionLoadErrors: { ...state.sessionLoadErrors, [id]: true } }))
-        db.reportStorageError('read session')(error)
+        db.reportStorageError('read session', 'read')(error)
       }
     } finally {
       if (sessionLoads.get(id) === load) {
@@ -487,7 +544,7 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
       await write()
       summaries = await db.commitStaging()
     } catch (error) {
-      await db.clearStaging().catch(db.reportStorageError('clear unfinished history replacement'))
+      await db.clearStaging().catch(db.reportStorageError('clear unfinished history replacement', 'save'))
       throw error
     }
     sessionAccess.clear()
@@ -498,6 +555,7 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     }
     pendingFiles.clear()
     clearAllDrafts()
+    clearSavedReadingPositions()
     set({
       ready: true,
       initError: false,
@@ -606,7 +664,7 @@ export const captureConversationSyncGuard = (sessionId?: string): (() => boolean
     get().ready && !get().importingHistory && (sessionId === undefined || (
       !deletingSessions.has(sessionId) && !unsavedSessions.has(sessionId) &&
       !sessionLoads.has(sessionId) && !Object.hasOwn(get().streaming, sessionId) &&
-      !get().sessions.find((summary) => summary.id === sessionId)?.pendingImageJob &&
+      !get().sessions.some((summary) => summary.id === sessionId && (summary.pendingChatJob || summary.pendingImageJob)) &&
       getSession(sessionId) === cached
     ))
 }
@@ -654,6 +712,26 @@ export const refreshConversationSyncCache = async (): Promise<void> => {
   })
 }
 
+/** Commit selected staged chats without cancelling streams, clearing drafts or replacing active state. */
+export const commitHistoryAppend = async (
+  sessions: readonly Session[],
+  files: readonly db.StoredFile[],
+  guard: () => boolean
+): Promise<{ added: number; skipped: number }> => {
+  await initChat()
+  const canWrite = () => guard() && get().ready && !get().importingHistory
+  const result = await db.appendHistory(sessions, files, canWrite, (id) =>
+    deletingSessions.has(id) || get().sessions.some((summary) => summary.id === id)
+  )
+  if (canWrite() && result.summaries.length) {
+    set(({ sessions }) => {
+      const existing = new Set(sessions.map(({ id }) => id))
+      return { sessions: sortSessions([...sessions, ...result.summaries.filter(({ id }) => !existing.has(id))]) }
+    })
+  }
+  return { added: result.summaries.length, skipped: result.skipped }
+}
+
 export const appendNativeArchiveChat = async (session: Session, live: () => boolean) => {
   await initChat()
   const guard = captureConversationSyncGuard()
@@ -668,14 +746,14 @@ export const branchToNewChat = async (sessionId: string, replyId: string, title:
   if (!source || !get().ready || get().activeId !== sessionId) {throw new Error('Conversation unavailable')}
   const inWorkspace = captureConversationDataGuard(getRuntime().user.id, sessionId)
   const canWrite = () => inWorkspace() && get().activeId === sessionId &&
-    getSession(sessionId) === source && !getStreamController(sessionId)
+    getSession(sessionId) === source && !getStreamController(sessionId) && !pendingChatReply(sessionId)
   const path = getVisibleMessages(source)
   const end = path.findIndex((message) => message.id === replyId && message.role === 'assistant' && message.status === 'done')
   if (end === -1 || !canWrite()) {throw new Error('Reply unavailable')}
 
   const messages = path.slice(0, end + 1).map((message): Message =>
-    message.role === 'assistant' && (message.imageJob || message.status === 'pending' || message.status === 'streaming')
-      ? { ...message, imageJob: undefined, prefix: false,
+    message.role === 'assistant' && (message.chatJob || message.imageJob || message.status === 'pending' || message.status === 'streaming')
+      ? { ...message, chatJob: undefined, imageJob: undefined, prefix: false,
           status: message.status === 'done' ? 'done' : 'stopped' }
       : message
   )
@@ -759,7 +837,7 @@ export const renameSession = (id: string, title: string) => {
         session.id === id ? { ...session, title } : session
       ),
     }))
-    void db.renameSession(id, title).catch(db.reportStorageError('rename session'))
+    void db.renameSession(id, title).catch(db.reportStorageError('rename session', 'save'))
   }
 }
 
@@ -785,6 +863,32 @@ const changeMemory = (id: string, change: (memory: NonNullable<Session['longMemo
 
 export const setMemoryEnabled = (id: string, enabled: boolean): boolean =>
   changeMemory(id, (memory) => ({ ...memory, enabled }))
+
+export const setConversationContextMode = (id: string, mode: 'full' | 'compact'): boolean =>
+  changeMemory(id, (memory) => ({ ...memory, contextMode: mode === 'compact' ? 'compact' : undefined }))
+
+/** Keep the original archive association and reject a late result for a changed conversation. */
+export const refreshContinuityBackground = async (
+  id: string,
+  expected: ContinuityContext,
+  read: () => Promise<unknown>,
+): Promise<boolean> => {
+  const session = getSession(id)
+  if (session?.continuity !== expected) {return false}
+  const live = captureConversationDataGuard(getRuntime().user.id, id)
+  const current = () =>
+    live() && get().activeId === id && getSession(id) === session && !getStreamController(id) && !pendingChatReply(id)
+  if (!current()) {return false}
+  const incoming = validateContinuationPayload(await read())
+  if (!current() || incoming.sourceArchiveId !== expected.sourceArchiveId) {return false}
+  if (incoming.title === expected.title && incoming.text === expected.text) {return true}
+  updateSession(id, (snapshot) => ({
+    ...snapshot,
+    continuity: { ...expected, title: incoming.title, text: incoming.text },
+  }))
+  persist(id)
+  return true
+}
 
 export const updateMemoryEntry = (
   id: string,
@@ -879,7 +983,7 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     }))
     return true
   } catch (error) {
-    db.reportStorageError('delete session')(error)
+    db.reportStorageError('delete session', 'save')(error)
     return false
   } finally {
     deletingSessions.delete(id)
@@ -903,12 +1007,86 @@ export const suspendChatReply = (sessionId: string) => {
   }
 }
 
+const backgroundCancels = new Set<string>()
+
+const saveFinishedChat = async (
+  sessionId: string, reply: AssistantMessage, job: LocalChatJob, live: () => boolean, cancelling = false
+): Promise<boolean> => {
+  const session = getSession(sessionId)
+  if (!session || !live()) {return false}
+  const saved = withReply(session, { ...reply, chatJob: undefined })
+  const files = pendingFiles.get(sessionId)
+  const version = await db.saveSession(saved, files, undefined,
+    { replyId: reply.id, jobId: job.id, cancelling, canWrite: live })
+  if (!live()) {return false}
+  if (!version) {
+    // Another page may already have advanced to a terminal reply or image job.
+    await restoreSavedChatReply(sessionId, reply.id, live)
+    return false
+  }
+  sessionVersions.set(sessionId, version)
+  if (pendingFiles.get(sessionId) === files) {
+    pendingFiles.delete(sessionId)
+    for (const file of files ?? []) {releaseGeneratedImage(file.id)}
+  }
+  if (getSession(sessionId) === session) {unsavedSessions.delete(sessionId)}
+  updateReply(sessionId, { ...reply, chatJob: undefined })
+  return true
+}
+
+const cancelStoredChat = async (sessionId: string, pending: PendingChatReply) => {
+  const { chatJob } = pending
+  if (backgroundCancels.has(chatJob.id)) {return}
+  const inWorkspace = captureConversationDataGuard(chatJob.ownerId, sessionId)
+  const current = () => {
+    const message = pendingChatReply(sessionId)
+    return inWorkspace() && message?.chatJob.id === chatJob.id && message.chatJob.cancelRequested ? message : undefined
+  }
+  backgroundCancels.add(chatJob.id)
+  try {
+    const snapshot = getSession(sessionId)
+    if (!snapshot || !current()) {return}
+    // A confirmed Stop remains pending across a page reload until the server acknowledges it.
+    if (!(await saveLocalSession(snapshot, pendingFiles.get(sessionId)))) {
+      await restoreSavedChatReply(sessionId, pending.id, () => Boolean(current()))
+      return
+    }
+    if (!current()) {return}
+    try {
+      await cancelBackgroundChat(chatJob.id, chatJob.transport)
+    } catch (error) {
+      if (!(error instanceof ApiError) ||
+          !['chat_job_not_found', 'chat_job_expired', 'personal_chat_not_found', 'personal_chat_expired'].includes(error.code ?? '')) {throw error}
+    }
+    const reply = current()
+    if (reply) {
+      await saveFinishedChat(sessionId, settleReply(reply, 'stopped', Date.now()),
+        chatJob, () => Boolean(current()), true)
+    }
+  } catch (error) {
+    if (current() && error instanceof ApiError) {reportApiFailure('chat', error)}
+  } finally {
+    backgroundCancels.delete(chatJob.id)
+  }
+}
+
+export const reconnectChatJob = (sessionId: string) => resumeSessionJobs(sessionId)
+
 export const stopReply = (sessionId: string) => {
   const watch = imageWatches.get(sessionId)
   if (watch) {
     cancelImageJob(sessionId, watch.messageId)
   } else {
-    getStreamController(sessionId)?.abort()
+    streamFlushes.get(sessionId)?.()
+    const controller = getStreamController(sessionId)
+    const pending = pendingChatReply(sessionId)
+    if (pending && isSessionActive() && pending.chatJob.ownerId === getRuntime().user.id) {
+      const requested = { ...pending, chatJob: { ...pending.chatJob, cancelRequested: true } }
+      updateReply(sessionId, requested)
+      persist(sessionId)
+      if (!controller) {void cancelStoredChat(sessionId, requested)}
+    }
+    controller?.abort()
   }
 }
 
@@ -916,9 +1094,18 @@ export const stopReply = (sessionId: string) => {
  * 提交指定会话的最新草稿；null 表示新建会话。
  * 同步接收成功才清空草稿，附件原件由会话接管；保存失败仍通过保存入口重试。
  */
-export const sendMessage = (targetSessionId: string | null) => {
+export const sendMessage = (targetSessionId: string | null, sources?: readonly McpSource[]) => {
   if (get().importingHistory || !get().ready) {
     return false
+  }
+  const mcpSources = normalizeMcpSources(sources)
+  if (sources !== undefined) {
+    if (mcpSources.length === 0) {return false}
+    try {
+      if (captureChatProvider().mode !== 'personal') {return false}
+    } catch {
+      return false
+    }
   }
   const prepared = prepareDraftMessage(getDraft(targetSessionId), useUploads.getState().tasks)
   if (!prepared) {
@@ -929,10 +1116,13 @@ export const sendMessage = (targetSessionId: string | null) => {
   let sessionId = targetSessionId
   if (
     sessionId !== null &&
-    (deletingSessions.has(sessionId) || getStreamController(sessionId) || !getSession(sessionId))
+    (deletingSessions.has(sessionId) || getStreamController(sessionId) || pendingChatReply(sessionId) || !getSession(sessionId))
   ) {
     return false
   }
+  const mcpSettings = sources === undefined && get().activeId === targetSessionId
+    ? captureChatMcpSettings(targetSessionId) : null
+  const mcp = mcpSettings ? { settings: mcpSettings, providerScope: getChatProviderScope() } : undefined
   if (sessionId === null) {
     const session: Session = {
       id: createId(),
@@ -949,6 +1139,7 @@ export const sendMessage = (targetSessionId: string | null) => {
       sessionCache: { ...state.sessionCache, [session.id]: session },
       activeId: session.id,
     }))
+    if (mcp) {moveChatMcpSelection(session.id)}
   }
   const current = getSession(sessionId)
   if (!current) {
@@ -959,6 +1150,7 @@ export const sendMessage = (targetSessionId: string | null) => {
     id: createId(),
     role: 'user',
     content: text,
+    ...(mcpSources.length > 0 ? { mcpSources } : {}),
     files: files.map(({ id, serverId, name, size, isImage, mimeType }) => ({
       id,
       serverId,
@@ -969,7 +1161,8 @@ export const sendMessage = (targetSessionId: string | null) => {
     })),
     createdAt: now,
   }
-  const reply = createReply()
+  // The wire-only MCP exchange is not available to resume as a model prefix.
+  const reply = mcp ? { ...createReply(), prefix: false } : createReply()
   updateSession(sessionId, (session) => ({
     ...appendBranch(session, history.at(-1)?.id ?? null, [question, reply]),
     updatedAt: now,
@@ -982,7 +1175,179 @@ export const sendMessage = (targetSessionId: string | null) => {
   }
   persist(sessionId)
   clearSentDraft(targetSessionId)
-  void streamReply(sessionId, reply, { history, question })
+  if (mcp) {initializeChatMcpTurn(sessionId, reply.id)}
+  void streamReply(sessionId, reply, { history, question, mcp })
+  return true
+}
+
+const largeTxtFiles = (question: UserMessage): boolean =>
+  question.files.length > 0 && !question.mcpSources?.length &&
+  question.files.every((file) => !file.isImage && getFileExt(file.name) === 'txt') &&
+  question.files.reduce((total, file) => total + file.size, 0) <= MAX_LARGE_TXT_BYTES
+
+const largeTxtHasOutput = (reply: AssistantMessage) => reply.blocks.some((block) =>
+  block.type === 'text' ? Boolean(block.text) : block.type === 'thinking' ? Boolean(block.thinking) : true)
+
+const largeTxtFileIds = (question: UserMessage, scope: string): string[] =>
+  largeTxtFiles(question) && question.files.every((file) => file.serverId && isFileProviderScope(file.serverScope, scope))
+    ? question.files.map((file) => file.serverId!) : []
+
+const recoverLargeTxt = (session: Session | undefined, messageId: string) => {
+  if (!session) {return undefined}
+  const path = getVisibleMessages(session)
+  const index = path.findIndex((message) => message.id === messageId)
+  const previous = path[index]
+  const question = path[index - 1]
+  if (previous?.role !== 'assistant' || previous.status !== 'error' ||
+      previous.error?.localMessage?.key !== 'replyContextInputTooLong' || largeTxtHasOutput(previous) ||
+      question?.role !== 'user') {return undefined}
+  try {
+    const provider = captureChatProvider()
+    const fileIds = largeTxtFileIds(question, provider.scope)
+    const offer = previous.largeTxtOffer
+    if (fileIds.length && (!offer || offer.providerScope === provider.scope)) {
+      return { provider, question, fileIds, previous, limit: offer ?? {} }
+    }
+  } catch {
+    // The original error stays visible while no matching provider is configured.
+  }
+  return undefined
+}
+
+export const hasLargeTxtRecovery = (session: Session | undefined, messageId: string) =>
+  Boolean(recoverLargeTxt(session, messageId))
+
+/** The batch is a new reply version. The original request and its attachments stay available. */
+export const requestLargeTxtReply = (sessionId: string, messageId: string): boolean => {
+  const session = getSession(sessionId)
+  if (!session || !isSessionActive() || get().importingHistory || deletingSessions.has(sessionId) ||
+      getStreamController(sessionId) || pendingChatReply(sessionId)) {return false}
+  const recovery = recoverLargeTxt(session, messageId)
+  if (!recovery) {return false}
+  const { provider, question, fileIds, previous } = recovery
+  const apiKey = useSettings.getState().apiKey ?? ''
+
+  const inWorkspace = captureConversationDataGuard(getRuntime().user.id, sessionId)
+  const controller = new AbortController()
+  const reply = { ...createReply(), thinking: false, search: false, prefix: false }
+  updateSession(sessionId, (current) => ({
+    ...appendBranch(current, question.id, [reply]),
+    updatedAt: Date.now(),
+  }))
+  const activity = { messageId: reply.id, stage: 'prepare' as const, completed: 0, total: 0 }
+  set((state) => ({
+    streaming: { ...state.streaming, [sessionId]: controller },
+    largeTxtActivity: { ...state.largeTxtActivity, [sessionId]: activity },
+  }))
+  persist(sessionId)
+
+  const ownsReply = () => inWorkspace() && getStreamController(sessionId) === controller &&
+    Boolean(getSession(sessionId)?.messages.some((message) => message.id === reply.id))
+  const requireActive = () => {
+    controller.signal.throwIfAborted()
+    if (!ownsReply() || getChatProviderScope(apiKey) !== provider.scope) {
+      throw new ApiError('protocol', { key: 'largeTxtUnavailable' })
+    }
+  }
+  const setProgress = (stage: LargeTxtActivity['stage'], completed: number, total: number) => {
+    if (ownsReply()) {
+      set((state) => ({
+        largeTxtActivity: { ...state.largeTxtActivity, [sessionId]: { messageId: reply.id, stage, completed, total } },
+      }))
+    }
+  }
+  const stream = async function* (body: CreateMessageRequest) {
+    requireActive()
+    const transport = captureBackgroundChatTransport(apiKey)
+    if (transport && transport !== 'managed') {
+      const id = createId()
+      try {
+        yield* streamBackgroundChat(apiKey, id, body, controller.signal, transport)
+      } finally {
+        if (controller.signal.aborted) {void cancelBackgroundChat(id, transport).catch(() => {})}
+      }
+    } else {
+      yield* streamMessage(apiKey, body, controller.signal)
+    }
+    requireActive()
+  }
+  const complete = (text: string): AssistantMessage => ({
+    ...reply, status: 'done', stopReason: 'end_turn', largeTxtProcessed: provider.scope,
+    blocks: [{ type: 'text', text }],
+  })
+  const run = async () => {
+    const evidence: LargeTxtEvidence[] = []
+    let total = 0
+    let outcome: AssistantMessage = reply
+    try {
+      const files = await Promise.all(question.files.map(async (file) => ({
+        name: file.name, blob: await loadMessageFile(sessionId, file.id),
+      }))).catch(() => {throw new ApiError('protocol', { key: 'largeTxtReadFailed' })})
+      requireActive()
+      const sources = files.filter((file): file is { name: string; blob: Blob } => Boolean(file.blob))
+      if (sources.length !== files.length) {
+        throw new ApiError('protocol', { key: 'largeTxtUnavailable' })
+      }
+      const prompt = question.content.trim() || 'Summarize the attached TXT in its original language.'
+      let limit = recovery.limit
+      if (provider.mode === 'managed' || previous.thinking || previous.search) {
+        setProgress('whole', 0, 0)
+        try {
+          const text = await readWholeTxt(prompt, fileIds, stream)
+          requireActive()
+          outcome = complete(text)
+          return
+        } catch (error) {
+          if (!(error instanceof ChatInputLimitError)) {throw error}
+          limit = { ...limit, ...error.reportedTokens }
+        }
+      }
+      const plan = await prepareLargeTxt(sources, limit, prompt)
+      if (provider.mode === 'managed') {
+        await refreshWeeklyQuota()
+        requireActive()
+        const remaining = useWeeklyQuota.getState().quota?.user_weekly_remaining
+        if (remaining !== undefined && remaining <= plan.chunks.length) {
+          throw new ApiError('protocol', { key: 'largeTxtManagedQuota', params: { count: plan.chunks.length + 1 } })
+        }
+      }
+      const text = await runLargeTxt(prompt, plan, stream, (stage, completed, count) => {
+        total = count
+        setProgress(stage, completed, count)
+      }, evidence, provider.mode === 'managed' ? 2 : 1)
+      requireActive()
+      outcome = complete(text)
+    } catch (error) {
+      if (evidence.length > 0) {
+        const text = evidence.map(({ range, text }) => `**${range.replace(/[*_`\n]/g, ' ')}**\n\n${text.trim()}`).join('\n\n')
+        outcome = settleReply({ ...reply, blocks: [{ type: 'text', text }] }, 'error', Date.now(), {
+          kind: 'interrupted', message: '',
+          localMessage: { key: 'largeTxtPartial', params: { completed: evidence.length, total } },
+        })
+      } else if (controller.signal.aborted) {
+        outcome = settleReply(reply, 'stopped', Date.now())
+      } else {
+        const specific = error instanceof ApiError ? error.localMessage : undefined
+        const localMessage = error instanceof LargeTxtError
+          ? { key: error.code === 'budget' ? 'largeTxtTooLarge' : 'largeTxtUnsupported' } as const
+          : specific && ['largeTxtUnavailable', 'largeTxtReadFailed', 'largeTxtManagedQuota'].includes(specific.key)
+            ? specific : { key: 'largeTxtFailed' } as const
+        outcome = settleReply(reply, 'error', Date.now(), { kind: 'protocol', message: '', localMessage })
+      }
+    } finally {
+      if (ownsReply()) {
+        updateReply(sessionId, outcome)
+        persist(sessionId)
+      }
+      set((state) => ({
+        streaming: Object.fromEntries(Object.entries(state.streaming)
+          .filter(([id, active]) => id !== sessionId || active !== controller)),
+        largeTxtActivity: Object.fromEntries(Object.entries(state.largeTxtActivity)
+          .filter(([id, value]) => id !== sessionId || value.messageId !== reply.id)),
+      }))
+    }
+  }
+  void run()
   return true
 }
 
@@ -1006,6 +1371,7 @@ export const sendImageMessage = (targetSessionId: string | null, count = 1, sour
     targetSessionId !== null &&
     (deletingSessions.has(targetSessionId) ||
       getStreamController(targetSessionId) ||
+      pendingChatReply(targetSessionId) ||
       !getSession(targetSessionId))
   ) {
     return false
@@ -1415,14 +1781,26 @@ const generateImageReply = async (
 }
 
 function resumeSessionImageJobs(sessionId: string): void {
-  if (!isSessionActive() || get().importingHistory || deletingSessions.has(sessionId) || getStreamController(sessionId)) {return}
+  if (!isSessionActive() || get().importingHistory || deletingSessions.has(sessionId) ||
+      getStreamController(sessionId) || pendingChatReply(sessionId)) {return}
   const pending = getSession(sessionId)?.messages.find(recoverableImage)
   if (pending) {void generateImageReply(sessionId, pending.id, 'resume')}
 }
 
+function resumeSessionJobs(sessionId: string): void {
+  if (!isSessionActive() || get().importingHistory || deletingSessions.has(sessionId) || getStreamController(sessionId)) {return}
+  const pending = pendingChatReply(sessionId)
+  if (!pending) {resumeSessionImageJobs(sessionId); return}
+  if (pending.chatJob.ownerId !== getRuntime().user.id) {return}
+  if (pending.chatJob.cancelRequested) {void cancelStoredChat(sessionId, pending); return}
+  const question = getSession(sessionId)?.messages.find(message => message.id === pending.parentId)
+  if (question?.role !== 'user') {return}
+  void streamReply(sessionId, pending, { history: [], question }, pending.chatJob)
+}
+
 export const drawFromReplyDescriptions = (sessionId: string, messageId: string): boolean => {
   const session = getSession(sessionId)
-  if (!session || !isSessionActive() || !activeImageProvider() || getStreamController(sessionId) ||
+  if (!session || !isSessionActive() || !activeImageProvider() || getStreamController(sessionId) || pendingChatReply(sessionId) ||
       deletingSessions.has(sessionId) || get().importingHistory) {return false}
   const reply = getVisibleMessages(session).find(message => message.id === messageId)
   if (reply?.role !== 'assistant') {return false}
@@ -1472,7 +1850,7 @@ export const regenerateReply = (sessionId: string, messageId?: string) => {
     return
   }
   const session = getSession(sessionId)
-  if (!session || getStreamController(sessionId)) {
+  if (!session || getStreamController(sessionId) || pendingChatReply(sessionId)) {
     return
   }
   const path = getVisibleMessages(session)
@@ -1512,7 +1890,7 @@ export const editMessage = (sessionId: string, messageId: string, content: strin
     return false
   }
   const session = getSession(sessionId)
-  if (!session || getStreamController(sessionId)) {
+  if (!session || getStreamController(sessionId) || pendingChatReply(sessionId)) {
     return false
   }
   const path = getVisibleMessages(session)
@@ -1559,7 +1937,7 @@ export const selectMessageVersion = (sessionId: string, messageId: string) => {
   if (get().importingHistory || deletingSessions.has(sessionId)) {
     return
   }
-  if (getStreamController(sessionId)) {
+  if (getStreamController(sessionId) || pendingChatReply(sessionId)) {
     return
   }
   updateSession(sessionId, (session) => selectVersion(session, messageId))
@@ -1572,7 +1950,7 @@ export const continueReply = (sessionId: string, messageId: string) => {
     return
   }
   const session = getSession(sessionId)
-  if (!session || getStreamController(sessionId)) {
+  if (!session || getStreamController(sessionId) || pendingChatReply(sessionId)) {
     return
   }
   const path = getVisibleMessages(session)
@@ -1596,6 +1974,8 @@ export const continueReply = (sessionId: string, messageId: string) => {
     status: 'pending',
     stopReason: undefined,
     stopDetails: undefined,
+    usage: undefined,
+    compactionUsage: undefined,
     error: undefined,
   }
   updateReply(sessionId, reply)
@@ -1610,7 +1990,7 @@ export const retryUpload = (sessionId: string, messageId: string) => {
     return
   }
   const session = getSession(sessionId)
-  if (!session || getStreamController(sessionId)) {
+  if (!session || getStreamController(sessionId) || pendingChatReply(sessionId)) {
     return
   }
   const path = getVisibleMessages(session)
@@ -1630,7 +2010,12 @@ export const retryUpload = (sessionId: string, messageId: string) => {
   void streamReply(sessionId, reply, { history: path.slice(0, index - 1), question })
 }
 
-type Request = { history: Message[]; question: UserMessage; prefix?: AssistantMessage }
+type Request = {
+  history: Message[]
+  question: UserMessage
+  prefix?: AssistantMessage
+  mcp?: { settings: McpSettings; providerScope: string }
+}
 
 /** 把补传得到的 serverId 写回会话里所有引用同一附件的消息（编辑、重新生成会共用附件） */
 const saveServerIds = (sessionId: string, serverIds: Map<string, string>, providerScope: string) => {
@@ -1692,8 +2077,16 @@ const refreshRequest = (sessionId: string, request: Request): Request => {
     return request
   }
   const byId = new Map(session.messages.map((message) => [message.id, message]))
-  const pick = <T extends Message>(message: T): T =>
-    (byId.get(message.id) as T | undefined) ?? message
+  const pick = <T extends Message>(message: T): T => {
+    const current = byId.get(message.id)
+    if (!current || current.role !== message.role) {return message}
+    if (message.role === 'user' && current.role === 'user') {
+      // Refresh file IDs without bringing back attachments excluded from this request.
+      const selectedFiles = new Set(message.files.map(({ id }) => id))
+      return { ...current, files: current.files.filter(({ id }) => selectedFiles.has(id)) } as T
+    }
+    return current as T
+  }
   return {
     history: request.history.map(pick),
     question: pick(request.question),
@@ -1715,6 +2108,9 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   const apiKey = useSettings.getState().apiKey ?? ''
   const providerScope = getChatProviderScope(apiKey)
   const serverIds = new Map<string, string>()
+  const segmentedHistory = new Set(getContextRounds(request.history)
+    .filter(([, reply]) => reply.largeTxtProcessed === providerScope)
+    .map(([user]) => user.id))
   // 停止生成立即生效；上传本身不取消（输入框与其他消息可能共用同一任务），完成后照常写回 serverId
   const aborted = new Promise<never>((_, reject) => {
     signal.addEventListener('abort', () => reject(signal.reason), { once: true })
@@ -1739,7 +2135,8 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   }
 
   const pending = new Map<string, FileAttachment>()
-  for (const [user] of getContextRounds(request.history).toReversed()) {
+  for (const [user] of getContextRounds(request.history).reverse()) {
+    if (segmentedHistory.has(user.id)) {continue}
     for (const file of user.files) {
       if (
         (!file.serverId || !isFileProviderScope(file.serverScope, providerScope)) &&
@@ -1763,24 +2160,29 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
     }
   }
 
-  // 用补齐后的会话重新取历史与提问，保证请求里都是 serverId
-  const session = getSession(sessionId)
+  // 读取补齐后的服务端 id，保留本轮选定的附件范围。
+  const resolved = refreshRequest(sessionId, request)
   const resolve = <T extends Message>(message: T): T => {
-    const current = (session?.messages.find((m) => m.id === message.id) as T | undefined) ?? message
-    return current.role === 'user'
+    if (message.role === 'user' && message.id !== request.question.id && segmentedHistory.has(message.id)) {
+      return {
+        ...message, files: [],
+        content: `${message.content}\n\n[Earlier TXT attachments were read in segments. This turn includes the answer derived from them.]`.trim(),
+      } as T
+    }
+    return message.role === 'user'
       ? {
-          ...current,
-          files: current.files.map((file) =>
+          ...message,
+          files: message.files.map((file) =>
             isFileProviderScope(file.serverScope, providerScope)
               ? file
               : { ...file, serverId: null, serverScope: undefined }
           ),
         } as T
-      : current
+      : message
   }
   return {
-    history: request.history.map(resolve),
-    question: resolve(request.question),
+    history: resolved.history.map(resolve),
+    question: resolve(resolved.question),
     prefix: request.prefix,
   }
 }
@@ -1869,6 +2271,9 @@ const prepareMemoryContext = async (
   request: Request,
   controller: AbortController,
   system: string,
+  includeMcpSources: boolean,
+  recordCompaction: (details: NonNullable<AssistantMessage['compactionUsage']>) => void,
+  currentUserSuffix?: string,
 ) => {
   const epoch = historyEpoch
   const owner = getRuntime().user.id
@@ -1876,11 +2281,11 @@ const prepareMemoryContext = async (
     !get().importingHistory && !deletingSessions.has(sessionId) && Boolean(getSession(sessionId))
   const session = getSession(sessionId)
   if (!session) {throw new Error('会话已不可用。')}
-  let plan = planContext(session, request.history, request.question, system, request.prefix)
+  let plan = planContext(session, request.history, request.question, system, request.prefix, currentUserSuffix, includeMcpSources)
   const activity = (value: MemoryActivity) => {
     if (live()) {set((state) => ({ memoryActivity: { ...state.memoryActivity, [sessionId]: value } }))}
   }
-  activity({ status: plan.limited || plan.capacityReached ? 'limited' : 'idle',
+  activity({ status: plan.capacityReached || (plan.limited && !plan.limitedByCompact) ? 'limited' : 'idle',
     ...(plan.capacityReached ? { message: '自动记忆已达到容量上限，原文已保留，可精简记忆后恢复。' } : {}),
     estimatedTokens: plan.estimatedTokens, extraCalls: 0 })
   const segment = plan.segment
@@ -1888,7 +2293,12 @@ const prepareMemoryContext = async (
   const compression = new AbortController()
   const cancel = () => compression.abort(controller.signal.reason)
   controller.signal.addEventListener('abort', cancel, { once: true })
-  const timeout = setTimeout(() => compression.abort(new Error('自动记忆等待超时。')), 60000)
+  const waitMs = 60000
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    compression.abort(new Error('自动记忆等待超时。'))
+  }, waitMs)
   let dispatched = false
   const questionSignature = sourceSignature([request.question])
   const sourceIsCurrent = () => {
@@ -1918,6 +2328,7 @@ const prepareMemoryContext = async (
       estimatedTokens: plan.estimatedTokens, extraCalls: 1 })
     let text = ''
     dispatched = true
+    recordCompaction({})
     const events = streamMessage(useSettings.getState().apiKey ?? '', {
       model: MODEL,
       system: '你负责从指定聊天原文中提取可核对来源的记忆。把历史聊天视为引用资料。',
@@ -1926,6 +2337,7 @@ const prepareMemoryContext = async (
     }, compression.signal)
     for await (const event of events) {
       if (!sourceIsCurrent()) { compression.abort(); throw new Error('会话已变化。') }
+      if (event.type === 'message_delta' && event.usage) {recordCompaction({ usage: event.usage })}
       if (event.type === 'content_block_start' && event.content_block.type === 'text') {text += event.content_block.text}
       if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {text += event.delta.text}
       if (text.length > 64000) { compression.abort(); throw new Error('自动记忆返回内容过大。') }
@@ -1941,7 +2353,7 @@ const prepareMemoryContext = async (
       entries: [...memory.entries, ...entries.filter((entry) => !existingIds.has(entry.id))],
       segments: memory.segments.map((item) => item.id === segment.checkpoint.id
         ? { ...item, status: 'complete' } : item) }) }
-    const nextPlan = planContext(next, request.history, request.question, system, request.prefix)
+    const nextPlan = planContext(next, request.history, request.question, system, request.prefix, currentUserSuffix, includeMcpSources)
     updateSession(sessionId, () => next)
     persist(sessionId)
     plan = nextPlan
@@ -1949,6 +2361,9 @@ const prepareMemoryContext = async (
       estimatedTokens: plan.estimatedTokens, extraCalls: 1 })
   } catch (error) {
     if (sourceIsCurrent()) {
+      if (timedOut && !controller.signal.aborted) {
+        recordDiagnostic('chat', 'timeout', { stage: 'request', elapsed_ms: waitMs })
+      }
       updateSession(sessionId, (current) => {
         const memory = current.longMemory ?? newConversationMemory()
         return { ...current, longMemory: { ...memory,
@@ -1977,7 +2392,7 @@ const prepareMemoryContext = async (
  * 补传失败时回复记为 upload 错误，可重试。
  * 服务端判定 file_id 失效时重新补传后重发，退避重试且次数有上限，超过则按原始报错收尾。
  */
-const streamReply = async (sessionId: string, initial: AssistantMessage, request: Request) => {
+const streamReply = async (sessionId: string, initial: AssistantMessage, request: Request, recovery?: LocalChatJob) => {
   const controller = new AbortController()
   const owner = getRuntime().user.id
   const epoch = historyEpoch
@@ -1988,15 +2403,37 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
     : SYSTEM_PROMPT
   const parameters = modelParameters(preferences, initial.thinking === true)
   const plannedImageProvider = imageConfigurationIdentity()
-  const allowImageAction = !!plannedImageProvider && !request.prefix
+  const allowImageAction = recovery ? !!recovery.imageNonce : !request.mcp && !!plannedImageProvider && !request.prefix
   const original = request.question.files.length === 1 ? request.question.files[0] : undefined
-  const canEditSource = allowImageAction && !!original?.isImage && original.size > 0 &&
+  const canEditSource = allowImageAction && (!recovery || recovery.canEditSource === true) && !!original?.isImage && original.size > 0 &&
     original.size <= MAX_IMAGE_EDIT_MB * 1024 * 1024 && IMAGE_EDIT_ACCEPT.split(',').includes(original.mimeType) &&
     isDirectImageEditRequest(request.question.content)
-  const planningNonce = newImageActionNonce()
   const questionSignature = sourceSignature([request.question])
   let imageHandoff: string | undefined
   let providerIssue: ChatProviderIssue | undefined
+  let backgroundJob = recovery
+  let watchInterrupted = false
+  let eventsSeen = 0
+  const caughtUp = () => !recovery || eventsSeen >= Math.max(1, recovery.eventsSeen ?? 0)
+  const inWorkspace = captureConversationDataGuard(owner, sessionId)
+  const mcp = request.mcp
+  const subscribeStore = (notify: () => void) => useChatStore.subscribe(notify)
+  let lastMcpSession: Session | undefined
+  let visibleMcpTurn = false
+  const mcpLive = () => {
+    if (!mcp || controller.signal.aborted || !inWorkspace() || get().activeId !== sessionId ||
+        getStreamController(sessionId) !== controller || captureChatMcpSettings(sessionId) !== mcp.settings ||
+        getChatProviderScope() !== mcp.providerScope) {return false}
+    const session = getSession(sessionId)
+    if (session && session !== lastMcpSession) {
+      lastMcpSession = session
+      const path = getVisibleMessages(session)
+      const question = path.at(-2)
+      visibleMcpTurn = question?.role === 'user' && question.id === request.question.id &&
+        question.content === request.question.content && path.at(-1)?.id === initial.id
+    }
+    return visibleMcpTurn
+  }
   if (!getSession(sessionId)?.title) {
     titleRequests.add(controller)
   }
@@ -2006,17 +2443,37 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   const flush = () => {
     cancelAnimationFrame(frame)
     frame = 0
-    updateReply(sessionId, reply)
+    if (streamFlushes.get(sessionId) === flush && inWorkspace() && caughtUp() && !controller.signal.aborted) {
+      updateReply(sessionId, reply)
+    }
   }
   streamFlushes.set(sessionId, flush)
+  const invalidateMcp = () => {if (!mcpLive()) {controller.abort()}}
+  const unsubscribeChat = mcp ? subscribeStore(invalidateMcp) : undefined
+  const unsubscribeMcp = mcp ? subscribeChatMcpSettings(invalidateMcp) : undefined
 
   try {
-    let context
+    if (mcp) {invalidateMcp()}
+    let context: Awaited<ReturnType<typeof prepareMemoryContext>> | undefined
+    const includeMcpSources = !recovery && useChatProvider.getState().mode === 'personal' &&
+      (Boolean(request.question.mcpSources?.length) || request.history.some(
+        (message) => message.role === 'user' && message.mcpSources?.length
+      ))
     try {
-      context = await prepareMemoryContext(sessionId, request, controller,
-        allowImageAction ? imageActionSystem(baseSystem, planningNonce, canEditSource) : baseSystem)
-      controller.signal.throwIfAborted()
-      request = { ...request, history: context.history }
+      if (!recovery) {
+        context = await prepareMemoryContext(sessionId, request, controller,
+          allowImageAction ? imageActionSystem(baseSystem) : baseSystem,
+          includeMcpSources,
+          (compactionUsage) => {
+            if (!inWorkspace()) {return}
+            reply = { ...reply, compactionUsage }
+            updateReply(sessionId, reply)
+            persist(sessionId)
+          },
+          allowImageAction ? imageActionReminder(newImageActionNonce(), canEditSource) : undefined)
+        controller.signal.throwIfAborted()
+        request = { ...request, history: context.history }
+      }
     } catch (error) {
       reply = controller.signal.aborted
         ? settleReply(reply, 'stopped', Date.now())
@@ -2027,9 +2484,9 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
     }
     for (let attempt = 0; ; attempt += 1) {
       /** 附件补齐前出错属于上传失败，请求还没有发出 */
-      let preparing = true
+      let preparing = !recovery
       let receivedContent = false
-      const imageActions = newImageActionStream()
+      const imageActions = newImageActionStream(recovery?.imageNonce)
       const textIndexes = new Map<number, number>()
       const thinkingIndexes = new Map<number, number>()
       const appendFiltered = (filtered: ReturnType<typeof finishImageActionText>) => {
@@ -2055,41 +2512,77 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         if (trace) {reply = { ...reply, imageAction: trace, prefix: false }}
       }
       try {
-        const prepared = await prepareFiles(sessionId, request, controller.signal)
-        preparing = false
-        // 附件就绪后获取本轮信息；续写沿用原回答快照，重新生成的快照独立保存。
-        const latestReminder = prepared.prefix
-          ? prepared.prefix.latestReminder
-          : createLatestReminder(useSettings.getState())
-        reply = { ...reply, latestReminder }
-        updateReply(sessionId, reply)
-        persist(sessionId)
-        const messages = toRequestMessages(
-          prepared.history,
-          prepared.question,
-          prepared.prefix,
-          initial.thinking ?? false,
-          latestReminder
-        )
-        const events = streamMessage(
-          useSettings.getState().apiKey ?? '',
-          {
+        const apiKey = useSettings.getState().apiKey ?? ''
+        let body: CreateMessageRequest | undefined
+        if (context) {
+          const prepared = await prepareFiles(sessionId, request, controller.signal)
+          preparing = false
+          const latestReminder = prepared.prefix
+            ? prepared.prefix.latestReminder
+            : createLatestReminder(useSettings.getState())
+          reply = { ...reply, latestReminder }
+          const messages = toRequestMessages(
+            prepared.history, prepared.question, prepared.prefix, initial.thinking ?? false, latestReminder,
+            allowImageAction ? imageActionReminder(imageActions.nonce, canEditSource) : undefined,
+            includeMcpSources && captureChatProvider(apiKey).mode === 'personal'
+          )
+          body = {
             model: initial.model ?? MODEL,
             ...parameters,
-            // Planning budgets the same-length protocol. Each actual request,
-            // including an attachment retry, receives a fresh nonce.
-            system: allowImageAction ? context.system.replaceAll(planningNonce, imageActions.nonce) : context.system,
+            system: context.system,
             messages,
             thinking: { type: initial.thinking ? 'enabled' : 'disabled' },
             safety_check: SAFETY_CHECK,
             tools: serverTools(initial.search ?? false),
             ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
-          },
-          controller.signal
-        )
+          }
+          const transport = mcp ? undefined : captureBackgroundChatTransport(apiKey)
+          if (transport) {
+            const provider = transport === 'personal-completions' ? captureChatProvider(apiKey) : undefined
+            const job: LocalChatJob = {
+              id: createId(), ownerId: owner, startedAt: Date.now(),
+              transport, ...(provider?.mode === 'personal' ? { model: provider.model } : {}),
+              baseBlockCount: reply.blocks.length, basePrefix: reply.prefix,
+              ...(allowImageAction ? { imageNonce: imageActions.nonce,
+                imageProvider: plannedImageProvider === 'managed' ? 'managed' : 'personal', canEditSource } : {}),
+            }
+            // Never submit before the same job ID is durable with its original reply.
+            reply = { ...reply, chatJob: job }
+            updateReply(sessionId, reply)
+            const snapshot = getSession(sessionId)
+            if (!snapshot || !inWorkspace()) {return}
+            await saveLocalSession(snapshot, pendingFiles.get(sessionId), true)
+            backgroundJob = job
+          } else {
+            updateReply(sessionId, reply)
+            persist(sessionId)
+          }
+        }
+        controller.signal.throwIfAborted()
+        if (!inWorkspace()) {return}
+        const open = (next: CreateMessageRequest) => streamMessage(apiKey, next, controller.signal)
+        let events: AsyncIterable<MessageStreamEvent> | undefined
+        if (backgroundJob) {
+          events = streamBackgroundChat(apiKey, backgroundJob.id, body, controller.signal,
+            backgroundJob.transport, backgroundJob.model)
+        } else if (body && mcp) {
+          const tools = await loadChatMcpTools(mcp.settings, controller.signal)
+          events = streamMcpChat({ body, tools, signal: controller.signal, live: mcpLive, open,
+            run: (call) => runChatMcpInvocation({ sessionId, messageId: initial.id, settings: mcp.settings,
+              call, signal: controller.signal, live: mcpLive, subscribeInvalidation: subscribeStore }) })
+        } else if (body) {
+          events = open(body)
+        }
+        if (!events) {throw new Error('Missing chat request body')}
         const blockIndexes = new Map<number, number>()
         for await (const event of events) {
-          receivedContent ||= event.type === 'content_block_start'
+          if (recovery && eventsSeen === 0) {
+            reply = { ...initial, status: 'pending', blocks: initial.blocks.slice(0, recovery.baseBlockCount),
+              prefix: recovery.basePrefix, imageAction: undefined, stopReason: undefined, stopDetails: undefined,
+              error: undefined, usage: undefined }
+          }
+          eventsSeen += 1
+          receivedContent ||= event.type === 'content_block_start' || event.type === 'content_block_delta'
           if (
             event.type === 'message_delta' &&
             (event.delta.stop_reason === 'end_turn' || event.delta.stop_reason === 'max_tokens') &&
@@ -2113,6 +2606,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           }
           appendFiltered(filtered)
           saveActionEvidence()
+          if (backgroundJob) {reply = { ...reply, chatJob: { ...backgroundJob, eventsSeen } }}
           if (document.visibilityState === 'hidden') {
             flush()
           } else {
@@ -2121,8 +2615,11 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         }
         controller.signal.throwIfAborted()
         reply = settleReply(reply, 'done', Date.now())
+        const imageConfigMatches = recovery
+          ? recovery.imageProvider === 'managed' && imageConfigurationIdentity() === 'managed'
+          : plannedImageProvider === imageConfigurationIdentity()
         const prompt = imageActionPrompt(
-          imageActions, allowImageAction && plannedImageProvider === imageConfigurationIdentity(), canEditSource
+          imageActions, allowImageAction && (imageConfigMatches || !!recovery), canEditSource
         )
         saveActionEvidence()
         // Older histories used receipt-like prose. Repeating that prose cannot create an image job.
@@ -2143,10 +2640,12 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
               path[questionIndex + 1]?.id !== initial.id) {
             throw new Error('会话或账号状态已变化，请在当前会话重新发送绘图要求。')
           }
+          const imageJob = newLocalImageJob(imageActions.prompts)
           reply = { ...reply, imageGeneration: true, imageOrigin: imageActions.editSource ? 'edit' : 'chat',
-            imageJob: newLocalImageJob(imageActions.prompts), imagePrompt: prompt,
-            status: 'pending', prefix: false }
-          imageHandoff = prompt
+            imageJob: imageConfigMatches ? imageJob : { ...imageJob, state: 'failed', error: {
+              code: 'image_confirmation_required', message: '聊天已恢复。请确认当前生图服务后重新生成图片。',
+            } }, imagePrompt: prompt, status: imageConfigMatches ? 'pending' : 'error', prefix: false }
+          if (imageConfigMatches) {imageHandoff = prompt}
           if (!current?.title) {
             updateSession(sessionId, session => ({ ...session, title: request.question.content.trim().slice(0, 32) || '图片生成' }))
           }
@@ -2155,8 +2654,9 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       } catch (error) {
         appendFiltered(finishImageActionText(imageActions))
         saveActionEvidence()
+        if (!caughtUp()) {reply = initial}
         if (controller.signal.aborted) {
-          reply = settleReply(reply, 'stopped', Date.now())
+          if (!backgroundJob) {reply = settleReply(reply, 'stopped', Date.now())}
           break
         }
         if (preparing) {
@@ -2175,6 +2675,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         }
         // 配套附件失效：重新补传后重发。收到过内容块后不自动重发。
         if (
+          !backgroundJob &&
+          !mcp &&
           !personalFailure &&
           attempt < FILE_RETRY_LIMIT &&
           !receivedContent &&
@@ -2187,7 +2689,12 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           }
           continue
         }
-        if (error instanceof ApiError && error.kind === 'interrupted' && reply.stopReason && reply.stopReason !== 'tool_use' && !reply.imageAction?.raw) {
+        if (backgroundJob && error instanceof ApiError && error.code === 'chat_job_watch_interrupted') {
+          watchInterrupted = true
+        } else if (backgroundJob && error instanceof ApiError &&
+            ['chat_job_cancelled', 'personal_chat_cancelled'].includes(error.code ?? '')) {
+          reply = settleReply(reply, 'stopped', Date.now())
+        } else if (!backgroundJob && error instanceof ApiError && error.kind === 'interrupted' && reply.stopReason && reply.stopReason !== 'tool_use' && !reply.imageAction?.raw) {
           // 已收到 message_delta 的结束原因，只是缺了结尾的 message_stop
           reply = settleReply(reply, 'done', Date.now())
         } else if (error instanceof ApiError && error.kind === 'interrupted' && reply.imageAction?.raw) {
@@ -2195,6 +2702,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             kind: 'protocol', message: '绘图请求中断，图片尚未开始生成。请重新发送绘图要求。',
           })
         } else if (error instanceof ApiError) {
+          reportApiFailure('chat', error)
           if (error.code === 'personal_auth') {
             providerIssue = 'chatProviderPersonalAuth'
           } else if (error.code === 'managed_chat_unavailable') {
@@ -2206,7 +2714,19 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             status: error.status,
             localMessage: providerIssue ? { key: providerIssue } : error.localMessage,
           })
+          if (error instanceof ChatInputLimitError && !request.prefix && !largeTxtHasOutput(reply) && inWorkspace()) {
+            try {
+              const providerScope = getChatProviderScope()
+              const source = getSession(sessionId)?.messages.find((message) => message.id === request.question.id)
+              if (source?.role === 'user' && largeTxtFileIds(source, providerScope).length) {
+                reply = { ...reply, largeTxtOffer: { providerScope, ...error.reportedTokens } }
+              }
+            } catch {
+              // A stale provider cannot bind a retry to the original file IDs.
+            }
+          }
         } else {
+          recordDiagnostic('chat', 'unexpected_error', { stage: 'response' })
           reply = settleReply(reply, 'error', Date.now(), {
             kind: 'protocol',
             message: error instanceof Error ? error.message : String(error),
@@ -2216,27 +2736,52 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       }
     }
   } finally {
+    unsubscribeChat?.()
+    unsubscribeMcp?.()
     titleRequests.delete(controller)
     streamFlushes.delete(sessionId)
     cancelAnimationFrame(frame)
-    updateReply(sessionId, reply)
+    const pending = pendingChatReply(sessionId)
+    let completed = false
+    const ownsJob = () => inWorkspace() && pendingChatReply(sessionId)?.chatJob.id === backgroundJob?.id
+    if (backgroundJob && ownsJob()) {
+      if (pending?.chatJob.cancelRequested || controller.signal.aborted || watchInterrupted) {
+        updateReply(sessionId, pending?.chatJob.cancelRequested || !caughtUp() ? pending ?? initial : reply)
+        persist(sessionId)
+      } else {
+        try {
+          completed = await saveFinishedChat(sessionId, reply, backgroundJob,
+            () => ownsJob() && !pendingChatReply(sessionId)?.chatJob.cancelRequested)
+        } catch (error) {
+          db.reportStorageError('save background chat reply', 'save')(error)
+          if (ownsJob()) {set((state) => ({ sessionSaveErrors: { ...state.sessionSaveErrors, [sessionId]: true } }))}
+        }
+      }
+    } else if (!backgroundJob && inWorkspace()) {
+      // A failed pre-dispatch save cannot be recovered from the server.
+      updateReply(sessionId, { ...reply, chatJob: undefined })
+      persist(sessionId)
+    }
     set((state) => ({
       streaming: Object.fromEntries(
         Object.entries(state.streaming).filter(([id, active]) => id !== sessionId || active !== controller)
       ),
     }))
-    persist(sessionId)
+    const currentPending = pendingChatReply(sessionId)
+    if (currentPending?.chatJob.cancelRequested && currentPending.chatJob.ownerId === owner && inWorkspace()) {
+      void cancelStoredChat(sessionId, currentPending)
+    }
     if (providerIssue && !controller.signal.aborted && epoch === historyEpoch && isSessionActive() &&
         getRuntime().user.id === owner && get().activeId === sessionId && !get().importingHistory &&
         !deletingSessions.has(sessionId)) {
       openChatProviderForIssue(providerIssue)
     }
-    if (imageHandoff !== undefined && !controller.signal.aborted && epoch === historyEpoch &&
+    if (imageHandoff !== undefined && (!backgroundJob || completed) && !controller.signal.aborted && epoch === historyEpoch &&
         isSessionActive() && getRuntime().user.id === owner && !get().importingHistory && !deletingSessions.has(sessionId)) {
       void generateImageReply(sessionId, reply.id, 'create', imageHandoff)
     } else {
       resumeSessionImageJobs(sessionId)
-      if (useSettings.getState().autoReadAloud && reply.status === 'done' && reply.stopReason !== 'refusal') {
+      if ((!backgroundJob || completed) && useSettings.getState().autoReadAloud && reply.status === 'done' && reply.stopReason !== 'refusal') {
         const stillCurrent = () => {
           const session = getSession(sessionId)
           return !controller.signal.aborted && epoch === historyEpoch && isSessionActive() &&

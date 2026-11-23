@@ -54,23 +54,16 @@
   h6 + ol {
     margin-top: 4px;
   }
-  h3:has(+ ul),
-  h4:has(+ ul),
-  h5:has(+ ul),
-  h6:has(+ ul),
-  h3:has(+ ol),
-  h4:has(+ ol),
-  h5:has(+ ol),
-  h6:has(+ ol) {
+  h3[data-before-list],
+  h4[data-before-list],
+  h5[data-before-list],
+  h6[data-before-list],
+  .ds-markdown-paragraph[data-before-list] {
     margin-bottom: 4px;
   }
   .ds-markdown-paragraph + ul,
   .ds-markdown-paragraph + ol {
     margin-top: 4px;
-  }
-  .ds-markdown-paragraph:has(+ ol),
-  .ds-markdown-paragraph:has(+ ol) {
-    margin-bottom: 4px;
   }
 
   li > ul,

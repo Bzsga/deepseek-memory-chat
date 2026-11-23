@@ -1,4 +1,4 @@
-import type { Node as MdAstNode, Nodes, Parent, RootContent, Root, Text } from 'mdast'
+import type { Node as MdAstNode, Nodes, Parent, PhrasingContent, RootContent, Root, Text } from 'mdast'
 import { findAndReplace } from 'mdast-util-find-and-replace'
 import { fromMarkdown } from 'mdast-util-from-markdown'
 import { gfmFromMarkdown } from 'mdast-util-gfm'
@@ -25,6 +25,39 @@ declare module 'mdast' {
 
 const text = (value: string): Text => ({ type: 'text', value })
 
+// CommonMark leaves the closing stars literal between Chinese punctuation and a Han character.
+const chineseStrong = /\*\*([^\s*][^*\r\n]*?[。！？…][”’」』】）》〉]*)\*\*(?=\p{Script=Han})/gu
+
+const restoreChineseStrong = (node: Nodes, input: string): void => {
+  if (node.type === 'paragraph' || node.type === 'heading' || node.type === 'tableCell') {
+    // Inline HTML tags and the text between them can be sibling nodes.
+    if (node.children.some((child) => child.type === 'html')) {return}
+    node.children = node.children.flatMap((child): PhrasingContent[] => {
+      if (child.type !== 'text' || !child.value.includes('**')) {return [child]}
+      const offset = child.position?.start.offset
+      const end = child.position?.end.offset
+      // Escapes and entities can decode to literal stars, so require exact source text.
+      if (offset === undefined || end === undefined || input.slice(offset, end) !== child.value) {return [child]}
+      const parts: PhrasingContent[] = []
+      let start = 0
+      for (const match of child.value.matchAll(chineseStrong)) {
+        const index = match.index
+        if (input[offset + index - 1] === '*') {continue}
+        if (index > start) {parts.push(text(child.value.slice(start, index)))}
+        parts.push({ type: 'strong', children: [text(match[1])] })
+        start = index + match[0].length
+      }
+      if (!parts.length) {return [child]}
+      if (start < child.value.length) {parts.push(text(child.value.slice(start)))}
+      return parts
+    })
+    return
+  }
+  if ('children' in node) {
+    node.children.forEach((child) => restoreChineseStrong(child, input))
+  }
+}
+
 /**
  * 解析正文，并把渲染器不单独处理的节点提前换掉，渲染时无需再读原文：
  * - 传入 sources 时，[citation:N] 换成角标节点，找不到来源的直接去掉
@@ -43,6 +76,7 @@ export function toMdAst(
     ],
     mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()],
   })
+  restoreChineseStrong(ast, input)
   if (sources) {
     const sourcesByIndex = new Map(sources.map((source) => [source.index, source]))
     findAndReplace(

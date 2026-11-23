@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -31,10 +31,10 @@ if (process.argv[2] === '--case') {
     replaceChildren(...children) { this.children = children }
   }
   const rootElement = new Element()
-  const body = new Element()
+  const status = new Element()
   globalThis.document = Object.assign(new EventTarget(), {
-    visibilityState: 'visible', body,
-    getElementById: () => rootElement,
+    visibilityState: 'visible',
+    getElementById: id => id === 'session-bootstrap' ? status : rootElement,
     createElement: () => new Element(),
   })
   const location = { origin: 'https://digimonlegend.com', pathname: '/deepseek/', href: 'https://digimonlegend.com/deepseek/',
@@ -58,7 +58,6 @@ if (process.argv[2] === '--case') {
     return new Promise((resolveRequest, reject) => waiting.push({ resolve: resolveRequest, reject }))
   }
   await import(pathToFileURL(join(directory, 'src/main.js')))
-  const status = body.children[0]
   if (scenario === 'guest') {
     await until(() => state.starts === 1)
     const { isGuestWorkspace, accountStorageKey } = await import(pathToFileURL(join(directory, 'src/services/runtime.js')))
@@ -147,10 +146,8 @@ if (process.argv[2] === '--case') {
       '--project', join(root, 'tsconfig.json'), '--noEmit', 'false', '--outDir', output],
     { cwd: root, encoding: 'utf8' })
     assert.equal(compiled.status, 0, compiled.stdout + compiled.stderr)
-    const entry = join(output, 'src/main.js')
-    writeFileSync(entry, readFileSync(entry, 'utf8').replace("import './app/bootstrap.css';", ''))
     writeFileSync(join(output, 'src/app/start.js'), `
-      export const startApp = () => { globalThis.__sessionRefreshTest.starts += 1 };
+      export const startApp = onReady => { globalThis.__sessionRefreshTest.starts += 1; onReady(); };
       export const stopAppSession = () => {
         globalThis.__sessionRefreshTest.stops += 1;
         globalThis.__sessionRefreshTest.activeRequest?.abort();

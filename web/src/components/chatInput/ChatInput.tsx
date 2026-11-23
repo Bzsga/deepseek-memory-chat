@@ -1,22 +1,32 @@
 import { activeImageProvider, useActiveImageProvider } from '../../services/imageProvider.js'
 import { getRuntime, isSessionActive, subscribeRuntimeUser } from '../../services/runtime.js'
 import clsx from 'clsx'
-import { memo, useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import {
   IconGlobeLanguageOutline14,
   IconCloseOutline16,
+  IconDataOutline16,
+  IconSearchOutline16,
   IconSendOutline16,
   IconStopFill16,
   IconThinkOutline14,
 } from '../base/icons.js'
 import { setSearch, setThinking, useSettings } from '../../services/settings.js'
 import { useIsMobile } from '../../app/viewport.js'
+import { isNativeConnected } from '../../services/nativeBridge.js'
 import {
+  captureConversationDataGuard,
   sendMessage,
   sendImageMessage,
   stopReply,
   useChatStore,
 } from '../../services/chat/store.js'
+import { setChatMcpEnabled, useChatMcpAvailability } from '../../services/chat/chatMcp.js'
+import { captureChatProvider, useChatProvider } from '../../services/chatProvider.js'
+import {
+  getPersonalMcpSettings, lookupPersonalMcp, MAX_MCP_QUESTION_LENGTH, refreshPersonalMcpSettings,
+  usePersonalMcpActionsSupported, usePersonalMcpChannel, usePersonalMcpSettings, type McpSettings,
+} from '../../services/personalMcp.js'
 import {
   addDraftFiles,
   EMPTY_DRAFT,
@@ -58,6 +68,14 @@ type ImageReference = { file: File; url: string }
 
 /** 输入框：自适应高度的文本框 + 文件 + 深度思考与智能搜索开关 + 语音输入 + 发送 / 停止 */
 export const ChatInput = memo(function ChatInput({ sessionId }: { sessionId: string | null }) {
+  const channel = usePersonalMcpChannel()
+  const personal = useChatProvider((state) => state.mode === 'personal')
+  const mcpActionsSupported = usePersonalMcpActionsSupported()
+  useEffect(() => {
+    if (channel && (personal || mcpActionsSupported) && !getPersonalMcpSettings()) {
+      void refreshPersonalMcpSettings().catch(() => {})
+    }
+  }, [channel, personal, mcpActionsSupported])
   // 切换目标时释放录音、转写和 DOM 状态；文字与附件由草稿服务保留。
   return <Input key={sessionId === null ? 'new' : `session:${sessionId}`} sessionId={sessionId} />
 })
@@ -68,6 +86,13 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const locale = useSettings(state => state.locale)
   const needsConfiguration = useSettings(state => !state.apiKey)
   const canRedeemInvite = useSyncExternalStore(subscribeRuntimeUser, () => getRuntime().user.invite_redeemable)
+  const personalReady = useChatProvider((state) => state.mode === 'personal' && state.keyConfigured && !state.loading && !state.error)
+  const mcpSettings = usePersonalMcpSettings()
+  const chatMcp = useChatMcpAvailability(sessionId)
+  const [mcpEnabled, setMcpEnabled] = useState(false)
+  const [mcpLookingUp, setMcpLookingUp] = useState(false)
+  const [mcpError, setMcpError] = useState('')
+  const pendingLookup = useRef<{ draft: ReturnType<typeof getDraft>; settings: McpSettings; target: unknown } | null>(null)
   const [imageCount, setImageCount] = useState(1)
   const [imageSelected, setImageMode] = useState(false)
   const [imageReferences, setImageReferences] = useState<ImageReference[]>([])
@@ -78,12 +103,20 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const imageMode = imageSelected
   const editMode = imageMode && imageReferences.length > 0
   const draft = useDrafts((state) => state.drafts.get(sessionId) ?? EMPTY_DRAFT)
+  const lookupTarget = useChatStore((state) => sessionId !== null && state.sessionCache[sessionId])
+  const mcpAvailable = personalReady && Boolean(mcpSettings?.toolName) && !imageMode && !chatMcp.enabled
+  const chatMcpAvailable = chatMcp.available && !imageMode
+  const chinese = locale === 'zh-CN'
+  const hasComposerTools = mcpAvailable || chatMcpAvailable
+  const menuLabel = hasComposerTools ? chinese ? '添加附件或使用工具' : 'Add attachments or use tools' : t('addAttachments')
   const { text, attachments } = draft
   const setText = (value: string) => setDraftText(sessionId, value)
   const draftReady = useUploads((state) => prepareDraftMessage(draft, state.tasks) !== null)
   const streaming = useChatStore(
     (state) => sessionId !== null && Object.hasOwn(state.streaming, sessionId)
   )
+  const pendingChat = useChatStore((state) => sessionId !== null &&
+    state.sessions.some((summary) => summary.id === sessionId && summary.pendingChatJob))
   const thinking = useSettings((state) => state.thinking)
   const importingHistory = useChatStore((state) => state.importingHistory)
   const isMobile = useIsMobile()
@@ -209,6 +242,11 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     }
     const input =
       kind === 'camera' ? cameraInputRef : kind === 'image' ? imageInputRef : fileInputRef
+    // The legacy Android picker treats extension tokens as MIME types. Validate
+    // the selected files in acceptFiles just as we do for drag and drop.
+    if (kind === 'file' && isNativeConnected() && !CSS.supports('inset', '0px')) {
+      input.current?.removeAttribute('accept')
+    }
     input.current?.click()
   }
   const changeMode = (next: boolean) => {
@@ -249,15 +287,83 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   // 移动端录音时用频谱替代输入框内容
   const recording = voice.status === 'recording'
 
+  const cancelLookup = useCallback(() => {
+    pendingLookup.current = null
+    setMcpLookingUp(false)
+  }, [])
+  useLayoutEffect(() => () => { pendingLookup.current = null }, [])
+  useLayoutEffect(() => {
+    if (pendingLookup.current && (pendingLookup.current.draft !== draft ||
+        pendingLookup.current.target !== lookupTarget || pendingLookup.current.settings !== mcpSettings ||
+        !mcpAvailable || importingHistory || voice.status !== 'idle')) {
+      cancelLookup()
+    }
+  }, [draft, lookupTarget, mcpAvailable, mcpSettings, importingHistory, voice.status, cancelLookup])
+  useLayoutEffect(() => {
+    if (!mcpAvailable) {
+      setMcpEnabled(false)
+      setMcpError('')
+    }
+  }, [mcpAvailable])
+
   // 排队、上传中或上传失败的附件都留在输入框，全部上传成功后才能发送
   const canSend =
     !importingHistory &&
+    !mcpLookingUp &&
     !streaming &&
+    !pendingChat &&
     voice.status === 'idle' &&
     (imageMode ? imageAvailable && !!text.trim() && attachments.length === 0 && text.length <= 8000 : draftReady)
 
+  function finishSend() {
+    setMcpEnabled(false)
+    setMcpError('')
+    stopReadAloud()
+    if (isMobile) {
+      textareaRef.current?.blur()
+    } else {
+      textareaRef.current?.focus()
+    }
+  }
+
+  async function queryAndSend(currentDraft: ReturnType<typeof getDraft>) {
+    if (!mcpSettings?.toolName) {return}
+    const query = currentDraft.text.trim()
+    if (!query || query.length > MAX_MCP_QUESTION_LENGTH) {
+      setMcpError(chinese ? '查资料需要 1–2,000 字的文字问题。' : 'Lookup needs a text question of 1–2,000 characters.')
+      return
+    }
+    const target = () => sessionId !== null && useChatStore.getState().sessionCache[sessionId]
+    const attempt = { draft: currentDraft, settings: mcpSettings, target: target() }
+    const workspaceIsCurrent = captureConversationDataGuard(getRuntime().user.id, sessionId ?? undefined)
+    const current = () => pendingLookup.current === attempt && workspaceIsCurrent() &&
+      useChatStore.getState().activeId === sessionId && target() === attempt.target && getDraft(sessionId) === currentDraft &&
+      getPersonalMcpSettings() === mcpSettings
+    pendingLookup.current = attempt
+    setMcpLookingUp(true)
+    setMcpError('')
+    if (isMobile) {textareaRef.current?.blur()}
+    try {
+      const provider = captureChatProvider()
+      if (provider.mode !== 'personal' || !current()) {return}
+      const sources = await lookupPersonalMcp(query)
+      if (!current()) {return}
+      if (captureChatProvider().scope !== provider.scope || !sendMessage(sessionId, sources)) {
+        setMcpError(chinese ? '聊天状态已变化，请重新发送。' : 'Chat has changed. Please send again.')
+        return
+      }
+      finishSend()
+    } catch (cause) {
+      if (current()) {
+        setMcpError(cause instanceof Error ? cause.message : chinese ? '资料库查询失败。' : 'Library lookup failed.')
+      }
+    } finally {
+      if (pendingLookup.current === attempt) {cancelLookup()}
+    }
+  }
+
   const send = () => {
-    if (useChatStore.getState().importingHistory || streaming || voice.status !== 'idle') {
+    if (pendingLookup.current || useChatStore.getState().importingHistory || streaming || pendingChat || voice.status !== 'idle') {
       return
     }
     // 文本与上传完成态由提交动作读取最新快照，不使用上一次渲染的草稿。
@@ -280,6 +386,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
         }
         return
       }
+      if (mcpEnabled) {
+        void queryAndSend(currentDraft)
+        return
+      }
     }
     const references = imageReferencesRef.current
     const sources = references.length > 0 ? references.map((reference) => reference.file) : undefined
@@ -292,12 +402,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     if (imageMode) {
       updateImageReferences([])
     }
-    stopReadAloud()
-    if (isMobile) {
-      textareaRef.current?.blur()
-    } else {
-      textareaRef.current?.focus()
-    }
+    finishSend()
   }
 
   const placeholder = t(editMode ? 'imageEditPromptPlaceholder' : imageMode ? 'imagePromptPlaceholder' : 'chatInputPlaceholderChat')
@@ -395,6 +500,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           placeholder={placeholder}
           aria-label={placeholder}
           rows={2}
+          enterKeyHint="enter"
           // 移动端不自动聚焦，避免一打开就弹出键盘
           autoFocus={!isMobile}
           disabled={importingHistory}
@@ -406,12 +512,6 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             if (isMobile && event.button === 0 && document.activeElement !== event.currentTarget) {
               event.preventDefault()
               event.currentTarget.focus({ preventScroll: true })
-            }
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-              event.preventDefault()
-              send()
             }
           }}
           onPaste={(event) => {
@@ -427,6 +527,34 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           {`${text}\n`}
         </div>
       </div>
+      {(chatMcp.enabled && !imageMode) || (mcpAvailable && (mcpEnabled || mcpLookingUp || mcpError)) ? (
+        <div className={styles.mcpPanel}>
+          <div className={styles.mcpRow}>
+            {chatMcp.enabled ? (
+              <button type="button" className={clsx(styles.toggle, styles.selected)}
+                aria-label={chinese ? '关闭本对话的 MCP' : 'Turn off MCP for this conversation'}
+                disabled={streaming || importingHistory || pendingChat} onClick={() => setChatMcpEnabled(sessionId, false)}>
+                {chinese ? '本对话已启用 MCP' : 'MCP enabled for this chat'}<IconCloseOutline16 />
+              </button>
+            ) : mcpLookingUp ? (
+              <>
+                <span role="status">{chinese ? '正在查资料…' : 'Searching…'}</span>
+                <button type="button" className={styles.modeTab} onClick={cancelLookup}>
+                  {chinese ? '取消发送' : 'Cancel send'}
+                </button>
+              </>
+            ) : mcpEnabled ? (
+              <button type="button" className={clsx(styles.toggle, styles.selected)}
+                aria-label={chinese ? '关闭本条查资料' : 'Turn off library lookup for this message'}
+                title={chinese ? '本条问题将发给资料库' : 'Send this question to the library'}
+                onClick={() => { setMcpEnabled(false); setMcpError(''); setUploadOpen(false) }}>
+                {chinese ? '查资料' : 'Search library'}<IconCloseOutline16 />
+              </button>
+            ) : null}
+          </div>
+          {mcpError ? <div className={styles.mcpError} role="alert">{mcpError}</div> : null}
+        </div>
+      ) : null}
       <div className={styles.functionRow}>
         {!imageMode ? (
           <IconButton
@@ -434,7 +562,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             tone="primary"
             className={clsx(styles.addButton, uploadOpen && styles.addActive)}
             icon={uploadOpen ? <IconCloseOutline16 /> : <AddIcon />}
-            aria-label={t(uploadOpen ? 'closeUploadPanel' : 'addAttachments')}
+            aria-label={uploadOpen ? t('closeUploadPanel') : menuLabel}
             aria-expanded={uploadOpen}
             aria-controls={uploadPanelId}
             disabled={importingHistory}
@@ -532,7 +660,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           id={uploadPanelId}
           className={styles.uploadPanel}
           role="group"
-          aria-label={t('addAttachments')}
+          aria-label={menuLabel}
         >
           <button type="button" onClick={() => chooseFile('camera')}>
             <CameraIcon />
@@ -546,6 +674,18 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             <FileIcon />
             <span>{t('chooseFiles')}</span>
           </button>
+          {hasComposerTools ? <div className={styles.composerToolChoices}>
+            {mcpAvailable ? <button type="button" className={clsx(styles.toggle, mcpEnabled && styles.selected)}
+              aria-pressed={mcpEnabled} disabled={mcpLookingUp || importingHistory || streaming || pendingChat}
+              onClick={() => { setMcpEnabled(!mcpEnabled); setMcpError(''); setUploadOpen(false) }}>
+              <IconSearchOutline16 />{chinese ? '查资料' : 'Search library'}
+            </button> : null}
+            {chatMcpAvailable ? <button type="button" className={clsx(styles.toggle, chatMcp.enabled && styles.selected)}
+              aria-pressed={chatMcp.enabled} disabled={mcpLookingUp || importingHistory || streaming || pendingChat}
+              onClick={() => { setChatMcpEnabled(sessionId, !chatMcp.enabled); setUploadOpen(false) }}>
+              <IconDataOutline16 />{chinese ? '使用 MCP' : 'Use MCP'}
+            </button> : null}
+          </div> : null}
         </div>
       ) : null}
       {imageMode ? (

@@ -21,6 +21,7 @@ internal fun readIncomingImport(context: Context, uriText: String, mimeType: Str
                 "elapsed_ms" to (System.nanoTime() - started) / 1_000_000))
         }
     } catch (error: Throwable) {
+        TechnicalDiagnostics.failure("import", "read", error)
         DiagnosticLog.record("import", "failed", mapOf("elapsed_ms" to (System.nanoTime() - started) / 1_000_000), error)
         throw error
     }

@@ -1,7 +1,12 @@
-@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@file:OptIn(
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
+)
 
 package app.banzhan.deepseekcontinuation.ui
 
+import android.view.autofill.AutofillManager
+import android.view.autofill.AutofillValue
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
@@ -12,6 +17,15 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.autofill.Autofill
+import androidx.compose.ui.autofill.AutofillNode
+import androidx.compose.ui.autofill.AutofillType
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalAutofill
+import androidx.compose.ui.platform.LocalAutofillTree
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -60,11 +74,41 @@ internal fun AccountScreenContent(
     var invitationCode by remember { mutableStateOf("") }
     var revealPassword by remember { mutableStateOf(false) }
     var pending by remember { mutableStateOf(false) }
+    var submittingCredentials by remember { mutableStateOf(false) }
+    var showingRecovery by rememberSaveable { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
     var hideAccountError by remember(state.account.error) { mutableStateOf(false) }
     val working = busy || pending || state.account.loading
+    val currentWorking by rememberUpdatedState(working)
     val user = state.account.currentUser
+    val showCredentials = user == null || submittingCredentials
     val service = state.settings.companionUrl
+    val autofill = LocalAutofill.current
+    val autofillTree = LocalAutofillTree.current
+    val hostView = LocalView.current
+    val autofillManager = remember(hostView) { hostView.context.getSystemService(AutofillManager::class.java) }
+    val usernameNode = remember(registering) {
+        AutofillNode(
+            autofillTypes = listOf(if (registering) AutofillType.NewUsername else AutofillType.Username),
+            onFill = { if (!currentWorking) username = it },
+        )
+    }
+    val passwordNode = remember(registering) {
+        AutofillNode(
+            autofillTypes = listOf(if (registering) AutofillType.NewPassword else AutofillType.Password),
+            onFill = { if (!currentWorking) password = it },
+        )
+    }
+    if (showCredentials && autofill != null) {
+        DisposableEffect(autofillTree, usernameNode, passwordNode) {
+            autofillTree += usernameNode
+            autofillTree += passwordNode
+            onDispose {
+                autofillTree.children.remove(usernameNode.id)
+                autofillTree.children.remove(passwordNode.id)
+            }
+        }
+    }
     var selfService by remember(service) { mutableStateOf(false) }
     LaunchedEffect(service, user?.id) {
         if (user == null) {
@@ -99,7 +143,7 @@ internal fun AccountScreenContent(
         contentPadding = PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        if (user != null) {
+        if (user != null && !showCredentials) {
             item { SectionTitle(user.username, "已登录") }
             item { FreeQuotaCard(state) { execute(onRefresh) } }
             (problem ?: state.account.error.takeUnless { hideAccountError })?.let {
@@ -134,6 +178,7 @@ internal fun AccountScreenContent(
                         FilterChip(
                             selected = registering == register,
                             onClick = {
+                                autofillManager?.cancel()
                                 registering = register
                                 password = ""
                                 invitationCode = ""
@@ -151,7 +196,7 @@ internal fun AccountScreenContent(
             item {
                 OutlinedTextField(
                     username, { username = it },
-                    modifier = Modifier.fillMaxWidth().testTag("account-username"),
+                    modifier = Modifier.fillMaxWidth().testTag("account-username").credentialAutofill(usernameNode, autofill),
                     label = { Text("用户名") },
                     supportingText = if (registering) ({ Text("3–32位字母、数字、_ 或 -，可用中文。") }) else null,
                     singleLine = true,
@@ -162,7 +207,7 @@ internal fun AccountScreenContent(
             item {
                 OutlinedTextField(
                     password, { password = it },
-                    modifier = Modifier.fillMaxWidth().testTag("account-password"),
+                    modifier = Modifier.fillMaxWidth().testTag("account-password").credentialAutofill(passwordNode, autofill),
                     label = { Text("密码") },
                     supportingText = if (registering) ({ Text("8–128个字符。") }) else null,
                     singleLine = true,
@@ -196,27 +241,58 @@ internal fun AccountScreenContent(
                 item { NoticeCard(it) }
             }
             item {
-                Button(
-                    onClick = {
-                        val register = registering
-                        val suppliedUsername = username.trim()
-                        val suppliedPassword = password
-                        val suppliedInvitationCode = invitationCode.trim()
-                        password = ""
-                        revealPassword = false
-                        execute {
-                            if (register) {
-                                onRegister(suppliedUsername, suppliedPassword, suppliedInvitationCode)
-                                invitationCode = ""
-                            } else onLogin(suppliedUsername, suppliedPassword)
-                            onSignedIn()
-                        }
-                    },
-                    enabled = !working && username.isNotBlank() && password.isNotEmpty() &&
-                        (!registering || password.codePointCount(0, password.length) in 8..128 &&
-                            (selfService || invitationCode.isNotBlank())),
-                    modifier = Modifier.testTag("account-submit"),
-                ) { Text(if (working) "请稍候…" else if (registering) "注册并登录" else "登录账户") }
+                ActionRow {
+                    Button(
+                        onClick = {
+                            val register = registering
+                            val suppliedUsername = username.trim()
+                            val suppliedPassword = password
+                            val suppliedInvitationCode = invitationCode.trim()
+                            password = ""
+                            revealPassword = false
+                            submittingCredentials = true
+                            execute {
+                                try {
+                                    if (register) {
+                                        onRegister(suppliedUsername, suppliedPassword, suppliedInvitationCode)
+                                        invitationCode = ""
+                                    } else onLogin(suppliedUsername, suppliedPassword)
+                                    // Compose 1.7's virtual nodes expose hints and bounds; send values only
+                                    // once the server has accepted them, before the form is removed.
+                                    runCatching {
+                                        if (autofill != null && autofillManager?.isEnabled == true) {
+                                            autofillManager.notifyValueChanged(hostView, usernameNode.id, AutofillValue.forText(suppliedUsername))
+                                            autofillManager.notifyValueChanged(hostView, passwordNode.id, AutofillValue.forText(suppliedPassword))
+                                            autofillManager.commit()
+                                        }
+                                    }
+                                    onSignedIn()
+                                } catch (error: Exception) {
+                                    autofillManager?.cancel()
+                                    throw error
+                                } finally {
+                                    submittingCredentials = false
+                                }
+                            }
+                        },
+                        enabled = !working && username.isNotBlank() && password.isNotEmpty() &&
+                            (!registering || password.codePointCount(0, password.length) in 8..128 &&
+                                (selfService || invitationCode.isNotBlank())),
+                        modifier = Modifier.testTag("account-submit"),
+                    ) { Text(if (working) "请稍候…" else if (registering) "注册并登录" else "登录账户") }
+                    if (!registering) {
+                        TextButton(
+                            onClick = {
+                                autofillManager?.cancel()
+                                password = ""
+                                revealPassword = false
+                                showingRecovery = true
+                            },
+                            enabled = !working,
+                            modifier = Modifier.testTag("account-forgot-password"),
+                        ) { Text("忘记密码") }
+                    }
+                }
                 Text(
                     "本机聊天和个人 API 可以直接使用。",
                     style = MaterialTheme.typography.bodySmall,
@@ -225,4 +301,30 @@ internal fun AccountScreenContent(
             }
         }
     }
+    if (showingRecovery && user == null) {
+        AlertDialog(
+            onDismissRequest = { showingRecovery = false },
+            title = { Text("找回原账号") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    username.trim().takeIf(String::isNotBlank)?.let { Text("当前用户名：$it") }
+                    Text("请联系管理员（作者 QQ：1076755135），提供原用户名。核实归属后，管理员会发给你一次性链接，由你设置新密码。")
+                    Text("设置后请用原账号重新登录，以继续使用该账号下的会话和权限。")
+                }
+            },
+            confirmButton = { TextButton(onClick = { showingRecovery = false }) { Text("知道了") } },
+        )
+    }
+}
+
+private fun Modifier.credentialAutofill(node: AutofillNode, autofill: Autofill?): Modifier {
+    if (autofill == null) return this
+    return onGloballyPositioned { node.boundingBox = it.boundsInWindow() }
+        .onFocusChanged { focus ->
+            if (focus.isFocused && node.boundingBox != null) {
+                autofill.requestAutofillForNode(node)
+            } else if (!focus.isFocused) {
+                autofill.cancelAutofillForNode(node)
+            }
+        }
 }

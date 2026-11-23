@@ -37,7 +37,7 @@ def test_native_chat_images_and_large_file_share_one_weekly_ledger(tmp_path, mon
         account = managed_account(application.state.store, "shared_case")
         headers = {'Authorization': 'Bearer ' + account['token'], 'X-Chat-User-Id': account['user']['id'],
                    'Origin': 'https://digimonlegend.com'}
-        assert client.get('/admin').status_code == 200
+        assert client.get('/admin').status_code == 410
         assert client.get('/chat/api/runtime', headers=headers).json()['weekly_quota']['user_weekly_remaining'] == 5
         assert client.post('/chat/anthropic/v1/messages', headers=headers,
             json={'messages': [{'role': 'user', 'content': 'synthetic'}], 'stream': True}).status_code == 200

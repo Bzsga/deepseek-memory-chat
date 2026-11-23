@@ -1,6 +1,5 @@
 package app.banzhan.deepseekcontinuation.data
 
-import android.content.pm.PackageManager
 import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -20,18 +19,15 @@ class AppUpdateVerifierDeviceTest {
     @Test
     fun platformPackageInspectionPreservesCurrentSignaturesAndRejectsTheInstalledVersion() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else {
-            @Suppress("DEPRECATION")
-            PackageManager.GET_SIGNATURES
-        }
+        val sdk = Build.VERSION.SDK_INT
         @Suppress("DEPRECATION")
-        val installed = appUpdatePackageIdentity(context.packageManager.getPackageInfo(context.packageName, flags))
+        val installed = appUpdatePackageIdentity(context.packageManager.getPackageInfo(context.packageName, appUpdateSigningFlags(sdk)))
         assertTrue(installed.signerSha256.isNotEmpty())
         val directory = File(context.cacheDir, "app-updates").apply { mkdirs() }
         val file = File(directory, "verification-${UUID.randomUUID()}.apk")
         try {
             File(context.applicationInfo.sourceDir).copyTo(file)
-            val archive = requireNotNull(context.packageManager.getPackageArchiveInfo(file.path, flags))
+            val archive = requireNotNull(context.packageManager.getPackageArchiveInfo(file.path, appUpdateSigningFlags(sdk, archive = true)))
             assertEquals(installed, appUpdatePackageIdentity(archive))
             val digest = MessageDigest.getInstance("SHA-256")
             file.inputStream().use { input ->

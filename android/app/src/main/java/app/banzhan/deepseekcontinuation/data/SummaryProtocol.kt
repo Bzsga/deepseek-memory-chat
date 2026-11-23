@@ -192,20 +192,24 @@ object SummaryProtocol {
         contextMessages: List<ChatMessage> = emptyList()): List<ArchiveEntry> {
         require(byteLength(payload) <= MAX_RESPONSE_BYTES) { "整理响应过大" }
         val root = json.parseToJsonElement(payload) as? JsonObject ?: error("整理响应须为 JSON 对象")
-        return validateEntries(parseEntries(root["entries"]), messages, contextMessages)
+        // The app derives stable IDs after validating the model's source references.
+        return validateEntries(parseEntries(root["entries"], requireEntryId = false), messages, contextMessages)
     }
 
     /** Parses an envelope before its original message set is available during polling. */
-    internal fun parseEntries(element: JsonElement?): List<ArchiveEntry> {
+    internal fun parseEntries(element: JsonElement?, requireEntryId: Boolean = true): List<ArchiveEntry> {
         val values = element as? JsonArray ?: error("整理响应缺少 entries 数组")
         require(values.size <= MAX_ENTRIES) { "整理响应条目过多" }
         return values.map { value ->
             val entry = value as? JsonObject ?: error("整理条目格式错误")
             val sources = entry["sourceIds"] as? JsonArray ?: error("条目缺少来源编号")
             require(sources.size in 1..128) { "条目来源数量无效" }
+            val id = if (requireEntryId) {
+                entry.string("id").takeIf { it.isNotBlank() && it.length <= 256 }
+                    ?: error("条目编号无效")
+            } else ""
             ArchiveEntry(
-                id = entry.string("id").takeIf { it.isNotBlank() && it.length <= 256 }
-                    ?: error("条目编号无效"),
+                id = id,
                 category = enumValueOf<EntryCategory>(entry.string("category")),
                 text = entry.string("text").trim(),
                 sourceIds = sources.map { it.strictString() }.distinct(),

@@ -1,0 +1,23 @@
+declare const styles: {
+  readonly "dialog": string;
+  readonly "body": string;
+  readonly "result": string;
+  readonly "toolList": string;
+  readonly "toolRow": string;
+  readonly "toolTitle": string;
+  readonly "toolDescription": string;
+  readonly "field": string;
+  readonly "input": string;
+  readonly "tool": string;
+  readonly "toolHeading": string;
+  readonly "arguments": string;
+  readonly "actions": string;
+  readonly "status": string;
+  readonly "error": string;
+  readonly "preview": string;
+  readonly "schema": string;
+  readonly "more": string;
+  readonly "optionalFields": string;
+  readonly "details": string;
+};
+export = styles;

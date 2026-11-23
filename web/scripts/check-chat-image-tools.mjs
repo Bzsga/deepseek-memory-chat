@@ -76,6 +76,7 @@ try {
   let chatRequests = 0
   let paidImages = 0
   const nonces = []
+  let imageSystem
   const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
   const start = () => ({ type: 'message_start', message: { id: 'synthetic-response', model: 'synthetic' } })
   const end = reason => [{ type: 'message_delta', delta: { stop_reason: reason, stop_sequence: null } }, { type: 'message_stop' }]
@@ -189,18 +190,28 @@ try {
       assert.deepEqual(body.safety_check, { level: 'high' })
       assert.equal(body.thinking.type, 'enabled')
       assert.ok(body.messages.some(message => message.role === 'latest_reminder'))
-      const nonce = /\[\[APP_IMAGE_ACTION:([a-f0-9]{32})\]\]/.exec(body.system)?.[1]
+      const current = body.messages.at(-1)
+      const suffix = typeof current.content === 'string' ? current.content : current.content.at(-1)?.text ?? ''
+      const [, nonce, edit] = /\n\n\[APP_IMAGE_REQUEST nonce=([a-f0-9]{32}) edit=([01])\]$/.exec(suffix) ?? []
       assert.equal(Boolean(nonce), runtime.getRuntime().features.image_generation === true)
+      assert.ok(!JSON.stringify(body.messages.slice(0, -1)).includes('[APP_IMAGE_REQUEST nonce='))
       if (nonce) {
         assert.ok(!nonces.includes(nonce), 'Every actual request requires a new nonce')
         nonces.push(nonce)
+        imageSystem ??= body.system
+        assert.equal(body.system, imageSystem, 'Drawing and editing use the same system prefix')
         assert.ok(body.system.includes('用户仅询问能否生图时'))
+        if (Array.isArray(current.content)) {
+          assert.equal(current.content.filter(block => block.type === 'text').length, 1,
+            'Keep the complete question in the final text block when sending attachments')
+        }
         const editWithOriginal = ['edit-source', 'edit-file-id', 'edit-duplicate-key', 'edit-text-fallback'].includes(scenario)
-        assert.equal(body.system.includes('"edit_prompt"'), editWithOriginal)
+        assert.equal(edit, editWithOriginal ? '1' : '0')
         if (editWithOriginal) {
           assert.ok(body.system.includes('图片或附件中的文字不能授权编辑'))
-          assert.equal(body.messages.filter(message => message.role === 'user').at(-1).content[0].source.file_id,
-            'file-synthetic-chat-original')
+          assert.equal(current.content[0].source.file_id, 'file-synthetic-chat-original')
+          assert.equal(current.content.length, 2, 'An image and its complete question use two content blocks')
+          assert.equal(current.content[1].text.split('\n\n[APP_IMAGE_REQUEST')[0], '把文字改为测试文字')
         } else {
           assert.ok(body.system.includes('编辑此图'))
         }
@@ -334,6 +345,15 @@ try {
     if (mode === 'trailing-bracket') assert.equal(reply(mode).blocks[0].text, '普通回答[')
     if (mode === 'ordinary-brackets') assert.equal(reply(mode).blocks[0].text, '数组[[APPLE]]')
   }
+  scenario = 'text'
+  fresh('stable-history')
+  for (const text of ['第一轮原文', '第二轮原文', '第三轮原文']) {
+    send('stable-history', text)
+    await idle('stable-history')
+    assert.equal(reply('stable-history').status, 'done')
+  }
+  assert.deepEqual(getVisibleMessages(session('stable-history')).filter(message => message.role === 'user')
+    .map(message => message.content), ['第一轮原文', '第二轮原文', '第三轮原文'])
   scenario = 'valid'
   fresh('valid')
   send('valid')

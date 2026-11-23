@@ -5,6 +5,7 @@ import { useTranslate } from '../../i18n/index.js'
 import type { Session } from '../../services/chat/types.js'
 import { ChatInput } from '../chatInput/ChatInput.js'
 import { MessageList } from '../messages/MessageList.js'
+import { ChatFind } from './ChatFind.js'
 import { MobileHeader } from './MobileHeader.js'
 import styles from './SessionView.module.css'
 
@@ -26,7 +27,10 @@ export const SessionView = ({
       {isMobile ? (
         <MobileHeader
           title={title}
-          action={<MemoryActions session={session} disabled={streaming} />}
+          action={<>
+            <ChatFind key={session.id} session={session} />
+            <MemoryActions session={session} disabled={streaming} />
+          </>}
         />
       ) : (
         <div className={styles.header}>
@@ -36,6 +40,7 @@ export const SessionView = ({
           >
             {title}
           </div>
+          <ChatFind key={session.id} session={session} />
           <MemoryActions session={session} disabled={streaming} />
         </div>
       )}

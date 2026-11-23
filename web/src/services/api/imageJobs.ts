@@ -1,4 +1,6 @@
 import { request, API_ORIGIN } from './client.js'
+import { managedRequestId } from './serviceDiagnostics.js'
+import { recordDiagnostic } from '../technicalDiagnostics.js'
 
 export type ImageJobState =
   | 'queued'
@@ -124,10 +126,25 @@ const exchange = async <T>(
   if (signal.aborted) {
     abort()
   }
-  const timer = setTimeout(() => controller.abort(new Error('图片任务连接暂时超时。')), timeout)
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new Error('图片任务连接暂时超时。'))
+  }, timeout)
+  let response: Response | undefined
   try {
-    const response = await request(path, { ...init, signal: controller.signal })
+    response = await request(path, { ...init, signal: controller.signal })
     return read(await readJson(response, maximum))
+  } catch (error) {
+    if (!signal.aborted) {
+      const requestId = response && managedRequestId(response)
+      if (timedOut) {
+        recordDiagnostic('image', 'timeout', { stage: response ? 'response' : 'request', elapsed_ms: timeout, request_id: requestId })
+      } else if (response) {
+        recordDiagnostic('image', 'invalid_response', { stage: 'parse', request_id: requestId })
+      }
+    }
+    throw error
   } finally {
     clearTimeout(timer)
     signal.removeEventListener('abort', abort)

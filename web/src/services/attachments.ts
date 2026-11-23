@@ -5,6 +5,7 @@ import { classifyApiError, getUploadErrorInfo, isRetryableApiError } from './api
 import type { FilePurpose } from './api/types.js'
 import { ACCEPT_FILE_EXTS } from './uploadExts.js'
 import { CHAT_PROVIDER_CHANGED, getChatProviderScope } from './chatProvider.js'
+import { recordDiagnostic } from './technicalDiagnostics.js'
 
 /** 允许上传的扩展名，按扩展名白名单过滤，清单见 uploadExts.ts */
 export const ACCEPTED_EXTS = ACCEPT_FILE_EXTS
@@ -138,10 +139,17 @@ const enqueueUpload = (
         reject(signal.reason)
         return
       }
+      let body: File
       try {
-        const body = normalizeUploadFiles([
+        body = normalizeUploadFiles([
           file instanceof File ? file : new File([file], name, { type: file.type }),
         ])[0]
+      } catch (error) {
+        recordDiagnostic('attachment', 'operation_failed', { stage: 'upload' })
+        reject(error)
+        return
+      }
+      try {
         resolve((await uploadFile(apiKey, body, getUploadPurpose(name, isImage), signal)).id)
       } catch (error) {
         reject(error)

@@ -34,6 +34,16 @@ internal interface AppUpdateDownloads {
     fun remove(download: AppUpdateDownload)
 }
 
+/** Retire the rejected task so process recreation cannot repeatedly verify the same invalid file. */
+internal inline fun AppUpdateDownloads.verifyCompleted(download: AppUpdateDownload, verify: () -> Unit) {
+    try {
+        verify()
+    } catch (error: AppUpdateVerificationException) {
+        if (error.failure?.rejectsDownload == true) runCatching { remove(download) }
+        throw error
+    }
+}
+
 /** The system owns network work; this object only observes and verifies a particular request identity. */
 internal class SystemAppUpdateDownloads(context: Context) : AppUpdateDownloads {
     private val app = context.applicationContext

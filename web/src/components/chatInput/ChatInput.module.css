@@ -460,6 +460,42 @@
   color: var(--dsw-alias-brand-text);
 }
 
+.mcpPanel {
+  padding: 4px 12px 0;
+  cursor: default;
+}
+
+.mcpRow,
+.composerToolChoices {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcpRow,
+.mcpError {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.mcpRow .toggle svg {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+.mcpError {
+  margin-top: 4px;
+  color: var(--dsw-alias-state-error-primary);
+  overflow-wrap: anywhere;
+}
+
+.composerToolChoices {
+  grid-column: 1 / -1;
+}
+
 .uploadPanel {
   display: grid;
   flex-shrink: 0;
@@ -468,7 +504,7 @@
   padding: 12px;
   border-top: 1px solid var(--dsw-alias-border-l1);
 
-  button {
+  > button {
     display: flex;
     flex-direction: column;
     align-items: center;

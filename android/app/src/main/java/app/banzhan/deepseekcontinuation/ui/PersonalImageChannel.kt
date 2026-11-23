@@ -4,6 +4,7 @@ import android.util.Base64
 import app.banzhan.deepseekcontinuation.data.PersonalImageException
 import app.banzhan.deepseekcontinuation.data.PersonalImageFile
 import app.banzhan.deepseekcontinuation.data.PersonalImageNetwork
+import app.banzhan.deepseekcontinuation.data.TechnicalDiagnostics
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -141,7 +142,12 @@ internal class PersonalImageChannel(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
-                val message = (failure as? PersonalImageException)?.message ?: "个人生图请求未完成，请检查服务状态后重试。"
+                val providerFailure = failure as? PersonalImageException
+                providerFailure?.diagnosticCode?.let { TechnicalDiagnostics.record(
+                    "image", it, providerFailure.diagnosticStage, providerFailure.httpStatus)
+                }
+                if (providerFailure == null) TechnicalDiagnostics.failure("image", "response", failure)
+                val message = providerFailure?.message ?: "个人生图请求未完成，请检查服务状态后重试。"
                 reply("image.error", id) { put("message", message.take(200)) }
             } finally {
                 if (requests[id] === request) requests.remove(id)

@@ -3,7 +3,9 @@ import asyncio
 import base64
 import json
 import struct
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -13,6 +15,7 @@ from starlette.requests import ClientDisconnect
 
 from account_fixtures import legacy_personal_account, managed_account
 from app.chat import ChatProvider, ImageProvider, MAX_BODY, build_chat_router, load_image_provider
+from app.chat_jobs import ChatJobs, _LiveJob
 from app.config import Settings
 from app.store import Store
 
@@ -158,6 +161,25 @@ def test_browser_self_service_signup_without_code_gets_sync_access(environment):
     account = store.accounts.me(store.accounts.authenticate(token))
     assert account["user"]["permissions"] == {"chat_api": False, "image_api": False, "cloud_sync": True}
     assert account["user"]["invite_redeemable"] and account["quota"]["user_weekly_remaining"] == 0
+    assert not calls
+
+
+def test_browser_login_explains_administrator_assisted_password_recovery(environment):
+    store, _first, _second, calls, client = environment
+    login = client.get("/chat/login")
+    assert login.status_code == 200
+    assert "<summary>忘记密码？</summary>" in login.text
+    assert "QQ 1076755135" in login.text and "一次性重置链接" in login.text
+    assert 'autocomplete="current-password"' in login.text
+    register = client.get("/chat/register")
+    assert "忘记密码" not in register.text and 'autocomplete="new-password"' in register.text
+
+    fork_origin = "https://self-hosted.example.invalid"
+    app = FastAPI()
+    app.include_router(build_chat_router(store, public_origin=fork_origin))
+    with TestClient(app, base_url=fork_origin) as fork:
+        recovery = fork.get("/chat/login")
+    assert "联系本站管理员" in recovery.text and "1076755135" not in recovery.text
     assert not calls
 
 
@@ -385,6 +407,70 @@ def test_only_managed_chat_upstream_auth_rejection_has_setup_code(environment, u
     assert len(dispatches) == 2 and models.status_code == status and models.json()["error"].get("code") is None
     assert [(row["kind"], row["status"]) for row in records(store)] == [("chat", "failed")]
     assert store.quota(first["user"]["id"])["user_weekly_remaining"] == 19
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("provider_error,expected_code,expected_counts", [
+    ({"message": "user input too long, 643317 tokens exceeds max 32768 tokens (synthetic-private-echo)"},
+     "chat_input_too_long", {"input_tokens": 643317, "max_input_tokens": 32768}),
+    ({"code": "context_length_exceeded", "message": "synthetic-private-echo"}, "chat_input_too_long", {}),
+    ({"code": "context_length_exceeded", "input_tokens": 2**60, "max_input_tokens": True,
+      "message": "synthetic-private-echo"}, "chat_input_too_long", {}),
+    ({"message": "synthetic-private-echo"}, None, {}),
+])
+def test_chat_input_limit_rejection_maps_only_known_errors(environment, background, provider_error, expected_code,
+                                                          expected_counts):
+    store, first, _second, _calls, _client = environment
+    calls = []
+    jobs = ChatJobs(store)
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(400, json={"error": provider_error})
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        await jobs.start()
+        try:
+            yield
+        finally:
+            await jobs.stop()
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(build_chat_router(store, chat_jobs=jobs,
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        provider_loader=lambda: ChatProvider("https://api.deepseek.com", "deepseek-flash", "synthetic-private-key")))
+    with TestClient(app, base_url=ORIGIN) as isolated:
+        if background:
+            path = f"/chat/api/chat-jobs/{uuid4()}"
+            assert isolated.post(path, json=message(), headers=identity(first)).status_code == 202
+            response = isolated.get(path + "/events", headers=identity(first))
+            assert response.status_code == 200
+            event = next(line for line in response.text.splitlines() if line.startswith("data: "))
+            error = json.loads(event.removeprefix("data: "))["error"]
+            assert error["status"] == 400
+            assert error["code"] == (expected_code or "chat_job_upstream_error")
+        else:
+            response = isolated.post("/chat/anthropic/v1/messages", json=message(), headers=identity(first))
+            assert response.status_code == 400
+            error = response.json()["error"]
+            assert error.get("code") == expected_code
+    assert {key: error[key] for key in ("input_tokens", "max_input_tokens") if key in error} == expected_counts
+    assert "synthetic-private-echo" not in response.text and "user input too long" not in response.text
+    assert len(calls) == 1
+    assert [(row["kind"], row["status"]) for row in records(store)] == [("chat", "failed")]
+
+
+def test_background_chat_input_limit_sse_is_sanitized_before_replay():
+    jobs, job = ChatJobs(None), _LiveJob()
+    raw = b'event: error\ndata: {"type":"error","error":{"code":"context_length_exceeded","input_tokens":643317,' \
+          b'"max_input_tokens":32768,"message":"synthetic-private-echo"}}\n\n'
+    assert jobs._publish(job, raw) == "failed"
+    frame = bytes(job.data)
+    error = json.loads(frame.splitlines()[1].removeprefix(b"data: "))["error"]
+    assert error["code"] == "chat_input_too_long" and error["status"] == 400
+    assert error["input_tokens"] == 643317 and error["max_input_tokens"] == 32768
+    assert b"synthetic-private-echo" not in frame
 
 
 def test_upstream_redirect_is_not_followed_and_sent_call_stays_counted(environment):
